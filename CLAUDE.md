@@ -29,7 +29,7 @@ python3 -m pytest tests/
 - `workflows/issue-to-pr/prompts/` -- frozen prompt templates per phase
 - `schemas.py` -- ALL phase I/O Pydantic contracts (triage, plan, test-plan, execute, review)
 - `engine/orchestrator.py` -- CLI entry point, phase dispatch, context assembly
-- `engine/agent.py` -- claude -p wrapper, stdin prompt piping, output capture
+- `engine/agent.py` -- Anthropic SDK wrapper, single-turn message calls, token/cost tracking
 - `engine/gates.py` -- validation gates and post-phase checks
 - `engine/worktree.py` -- git worktree lifecycle management
 - `engine/waves.py` -- wave planner execution and parallel dispatch

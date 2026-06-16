@@ -29,6 +29,12 @@ Your output is the foundation. Every downstream phase trusts your file paths and
 - If tasks touch the same file, declare the dependency.
 - Set `escalate: true` if more than 5 tasks are needed.
 
+**Granularity rules (prefer fewer, larger tasks):**
+- Prefer FEWER, LARGER tasks. Each task must have VERIFIED file paths.
+- Deletion/cleanup issues are typically 1-2 tasks: "delete files" + "update references". Do NOT split by individual file or module.
+- Group work by operation type (delete, modify, add), not by file or module.
+- A task that touches 15 files with the same operation (e.g., delete) is ONE task, not 15.
+
 ### Stage 4: Proof Type Selection
 - Classify the proof type for the entire issue:
   - `test_passes` -- new/changed behavior verifiable by automated tests
@@ -134,6 +140,34 @@ Issue: "Build full scheduling module: shifts CRUD, worker assignment, notificati
   "proof_type": "test_passes",
   "escalate": true,
   "escalate_reason": "5+ independent deliverables spanning schema, backend, UI, and notifications -- exceeds 5-task cap"
+}}
+```
+
+### Example:
+
+Issue: "Remove deprecated analytics module — delete all analytics files and remove imports/routes that reference them"
+
+```json
+{{
+  "tasks": [
+    {{
+      "id": 1,
+      "title": "Delete all analytics module files",
+      "description": "Remove src/analytics/, src/utils/analytics-helpers.ts, and tests/analytics/. Done when all 15 analytics files are deleted.",
+      "target_files": ["src/analytics/", "src/utils/analytics-helpers.ts", "tests/analytics/"],
+      "depends_on": []
+    }},
+    {{
+      "id": 2,
+      "title": "Remove analytics references from remaining code",
+      "description": "Remove import statements, route registrations, and config entries that reference the deleted analytics module. Done when grep finds zero references to analytics module.",
+      "target_files": ["src/routes/index.ts", "src/app.ts", "src/config/modules.ts"],
+      "depends_on": [1]
+    }}
+  ],
+  "proof_type": "check_passes",
+  "escalate": false,
+  "escalate_reason": ""
 }}
 ```
 

@@ -3,6 +3,7 @@
 Usage:
     python3 -m engine.orchestrator owner/repo#123 [--budget 2.00] [--model sonnet]
     python3 -m engine.orchestrator owner/repo#123 --workflow issue-to-pr --workflow-dir path
+    python3 -m engine.orchestrator owner/repo#123 --gitlab   # force GitLab mode
 """
 
 from __future__ import annotations
@@ -32,6 +33,9 @@ import schemas
 
 log = logging.getLogger(__name__)
 
+PLATFORM_GITHUB = "github"
+PLATFORM_GITLAB = "gitlab"
+
 KNOWLEDGE_TOKEN_CAP = 8000  # 8K tokens ~= 32K chars / 4
 KNOWLEDGE_FILES = {
     "context.md": {"phases": None},  # all phases
@@ -49,15 +53,76 @@ def parse_issue_ref(ref: str) -> tuple[str, str, int]:
     return repo_part.split("/")[0], repo_part.split("/")[1], int(number_str)
 
 
-def fetch_issue(owner: str, repo: str, number: int) -> str:
-    result = subprocess.run(
-        ["gh", "issue", "view", str(number), "--repo", f"{owner}/{repo}",
-         "--json", "body", "--jq", ".body"],
-        capture_output=True, text=True, timeout=30,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"gh issue view failed: {result.stderr.strip()}")
-    return result.stdout.strip()
+def detect_platform(repo_path: str) -> str:
+    """Auto-detect GitHub vs GitLab from the git remote URL."""
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True, text=True, cwd=repo_path, timeout=10,
+        )
+        url = result.stdout.strip().lower()
+        if "gitlab.com" in url or "gitlab" in url:
+            return PLATFORM_GITLAB
+    except Exception:
+        pass
+    return PLATFORM_GITHUB
+
+
+def _gitlab_project_from_remote(target_repo: str) -> str | None:
+    """Extract the GitLab project path (owner/project) from the git remote URL."""
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True, text=True, cwd=target_repo, timeout=10,
+        )
+        url = result.stdout.strip()
+        # git@gitlab.com:owner/project.git
+        if url.startswith("git@"):
+            path = url.split(":", 1)[1]
+            return path.removesuffix(".git")
+        # https://gitlab.com/owner/project.git
+        if "gitlab.com" in url:
+            # strip scheme + host, take the path
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            return parsed.path.lstrip("/").removesuffix(".git")
+    except Exception:
+        pass
+    return None
+
+
+def fetch_issue(
+    owner: str, repo: str, number: int,
+    *, platform: str = PLATFORM_GITHUB, target_repo: str = "",
+) -> str:
+    if platform == PLATFORM_GITLAB:
+        # When target_repo is available, read the actual GitLab project path
+        # from the git remote (the local dir name may differ from the remote).
+        project = f"{owner}/{repo}"
+        if target_repo:
+            remote_project = _gitlab_project_from_remote(target_repo)
+            if remote_project:
+                project = remote_project
+        result = subprocess.run(
+            ["glab", "issue", "view", str(number),
+             "-R", project, "--output", "json"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"glab issue view failed: {result.stderr.strip()}")
+        data = json.loads(result.stdout)
+        title = data.get("title", "")
+        description = data.get("description", "")
+        return f"# {title}\n\n{description}"
+    else:
+        result = subprocess.run(
+            ["gh", "issue", "view", str(number), "--repo", f"{owner}/{repo}",
+             "--json", "body", "--jq", ".body"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"gh issue view failed: {result.stderr.strip()}")
+        return result.stdout.strip()
 
 
 def load_workflow(workflow_dir: Path) -> dict:
@@ -189,6 +254,7 @@ def run_pipeline(
     model: str = "sonnet",
     workflow_name: str = "issue-to-pr",
     workflow_dir: Path | None = None,
+    platform: str | None = None,
 ) -> dict[str, Any]:
     repo_root = Path(__file__).resolve().parent.parent
     if workflow_dir is None:
@@ -210,7 +276,6 @@ def run_pipeline(
     run_dir.mkdir(parents=True, exist_ok=True)
     run_dir_str = str(run_dir)
 
-    issue_body = fetch_issue(owner, repo, issue_number)
     prior_phases: dict[str, Any] = {}
     spent_usd = 0.0
     pr_url = ""
@@ -219,6 +284,13 @@ def run_pipeline(
     # For now: clone or locate it. Assumes repo is already cloned locally.
     # Use the worktree_path as the target repo root for git operations.
     target_repo = _find_target_repo(owner, repo)
+
+    # Auto-detect platform if not explicitly set
+    if platform is None:
+        platform = detect_platform(target_repo)
+    print(f"  platform: {platform}")
+
+    issue_body = fetch_issue(owner, repo, issue_number, platform=platform, target_repo=target_repo)
 
     branch_name = f"issue-{issue_number}-{run_id[:8]}"
     worktree_path = ""
@@ -447,14 +519,26 @@ def run_pipeline(
             )
             pr_body += f"\n\n### Review Findings\n{findings_text}"
 
-        pr_proc = subprocess.run(
-            ["gh", "pr", "create",
-             "--repo", f"{owner}/{repo}",
-             "--head", f"sw/{branch_name}",
-             "--title", f"fix: resolve #{issue_number}",
-             "--body", pr_body],
-            capture_output=True, text=True, cwd=worktree_path, timeout=30,
-        )
+        if platform == PLATFORM_GITLAB:
+            pr_proc = subprocess.run(
+                ["glab", "mr", "create",
+                 "-R", f"{owner}/{repo}",
+                 "--source-branch", f"sw/{branch_name}",
+                 "--target-branch", "main",
+                 "--title", f"fix: resolve #{issue_number}",
+                 "--description", pr_body,
+                 "--yes"],
+                capture_output=True, text=True, cwd=worktree_path, timeout=30,
+            )
+        else:
+            pr_proc = subprocess.run(
+                ["gh", "pr", "create",
+                 "--repo", f"{owner}/{repo}",
+                 "--head", f"sw/{branch_name}",
+                 "--title", f"fix: resolve #{issue_number}",
+                 "--body", pr_body],
+                capture_output=True, text=True, cwd=worktree_path, timeout=30,
+            )
         if pr_proc.returncode == 0:
             pr_url = pr_proc.stdout.strip()
 
@@ -578,6 +662,8 @@ def main() -> None:
                         help="Workflow name (default: issue-to-pr)")
     parser.add_argument("--workflow-dir", default=None,
                         help="Path to workflow directory (overrides --workflow)")
+    parser.add_argument("--gitlab", action="store_true", default=False,
+                        help="Force GitLab mode (glab CLI). Auto-detected from remote URL if omitted.")
     args = parser.parse_args()
 
     owner, repo, issue_number = parse_issue_ref(args.issue)
@@ -585,6 +671,8 @@ def main() -> None:
     workflow_dir = None
     if args.workflow_dir:
         workflow_dir = Path(args.workflow_dir)
+
+    platform = PLATFORM_GITLAB if args.gitlab else None  # None = auto-detect
 
     print(f"simple_workflow: {owner}/{repo}#{issue_number}")
     print(f"  budget: ${args.budget:.2f}  model: {args.model}  workflow: {args.workflow}")
@@ -595,6 +683,7 @@ def main() -> None:
         model=args.model,
         workflow_name=args.workflow,
         workflow_dir=workflow_dir,
+        platform=platform,
     )
 
     print(f"\n{'='*60}")
