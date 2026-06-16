@@ -1,0 +1,68 @@
+name: issue-to-pr
+description: Transform a GitHub issue into a tested, reviewed PR
+
+budget:
+  max_per_run_usd: 1.00
+
+max_parallel_workers: 5
+
+models:
+  haiku:
+    name: claude-haiku-4-5
+    max_tokens: 8192
+    cost: {input_per_mtok: 0.80, output_per_mtok: 4.00}
+  sonnet:
+    name: claude-sonnet-4-6
+    max_tokens: 16384
+    cost: {input_per_mtok: 3.00, output_per_mtok: 15.00}
+  opus:
+    name: claude-opus-4-6
+    max_tokens: 16384
+    cost: {input_per_mtok: 15.00, output_per_mtok: 75.00}
+
+phases:
+  - name: triage
+    model: haiku
+    max_turns: 5
+  - name: plan
+    model: sonnet
+    max_turns: 10
+    parallel: per_task
+  - name: test-plan
+    model: sonnet
+    max_turns: 10
+    parallel: per_task
+  - name: wave-planner
+    model: sonnet
+    max_turns: 5
+  - name: execute
+    model: sonnet
+    max_turns: 30
+    parallel: per_wave
+  - name: review
+    model: haiku
+    max_turns: 5
+
+review:
+  enabled: true
+  model: haiku
+  level: per_run
+
+gates:
+  triage:
+    - file_existence_check
+    - task_count_max_5
+  plan:
+    - dag_acyclic
+    - file_path_plausible
+  test-plan:
+    - test_file_specified
+    - test_command_specified
+  wave-planner:
+    - all_tasks_assigned
+    - no_duplicate_tasks
+    - wave_size_within_limit
+  execute:
+    - red_gate
+    - green_gate
+    - commit_exists
