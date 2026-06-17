@@ -7,5 +7,8 @@ dependencies = [
     "pyyaml>=6.0",
 ]
 
+[tool.setuptools.packages.find]
+include = ["engines*"]
+
 [project.scripts]
 sw = "engines.github_claude.orchestrator:main"

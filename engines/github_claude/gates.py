@@ -140,7 +140,7 @@ def validate_wave_plan(
 
     seen: set[int] = set()
     for i, wave in enumerate(waves):
-        tasks = wave.get("tasks", [])
+        tasks = wave if isinstance(wave, list) else wave.get("tasks", [])
         if len(tasks) > max_parallel:
             errors.append(
                 f"wave {i} has {len(tasks)} tasks, exceeds max_parallel={max_parallel}"

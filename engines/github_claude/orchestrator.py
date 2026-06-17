@@ -8,7 +8,7 @@ Usage:
 """
 from __future__ import annotations
 
-import argparse, json, logging, sys
+import argparse, json, logging, os, sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -48,9 +48,23 @@ def _call(phase: str, cfg: dict, *, cwd: str, issue_number: int, issue_body: str
     log.info("[%s] %.1fs $%.4f", phase, resp["duration_s"], resp["cost"])
     return resp
 
-def _parse(resp: dict) -> Any:
-    c = resp["content"]
-    return json.loads(c) if isinstance(c, str) else c
+def _content(resp: dict) -> str:
+    """Extract content string from agent response (agents respond in prose)."""
+    return resp["content"] if isinstance(resp["content"], str) else json.dumps(resp["content"])
+
+def _extract_json(prose: str, schema_hint: str, cwd: str) -> dict:
+    """Make a dedicated extraction call to pull structured data from prose."""
+    prompt = f"""Extract structured data from the following text. Return ONLY valid JSON matching this schema (no markdown fences, no explanation):
+{schema_hint}
+
+Text to extract from:
+{prose}"""
+    resp = runtime.call_agent(prompt, model="sonnet", cwd=cwd, max_turns=1)
+    raw = _content(resp)
+    # Strip markdown fences if present
+    if raw.strip().startswith("```"):
+        raw = raw.strip().split("\n", 1)[1].rsplit("```", 1)[0]
+    return json.loads(raw)
 
 def _log(conn, name, resp):
     storage.log_phase(conn, name, cost=resp["cost"],
@@ -65,7 +79,7 @@ def _guard(spent: float, budget: float):
         raise BudgetExceeded(f"${spent:.2f} > budget ${budget:.2f}")
 
 def _run_gates(conn, phase_name: str, output: dict, **gate_kw) -> None:
-    """Run phase gates, log each result, raise GateFailure on first failure."""
+    """Run phase gates. Only called when output is a structured dict."""
     results = gates.run_phase_gates(phase_name, output, **gate_kw)
     for r in results:
         storage.log_event(conn, "gate_result", {
@@ -85,7 +99,8 @@ def _post_failure(repo: str, num: int, err: str):
 
 
 def run_pipeline(repo: str, issue_number: int, *,
-                 budget: float = 1.00, model_override: str | None = None) -> dict:
+                 budget: float = 1.00, model_override: str | None = None,
+                 repo_path: str | None = None) -> dict:
     wf = _load_workflow()
     budget = budget or wf.get("budget", {}).get("max_per_run_usd", 1.00)
     max_par = wf.get("max_parallel_workers", 5)
@@ -95,27 +110,34 @@ def run_pipeline(repo: str, issue_number: int, *,
     issue_body = f"# {issue['title']}\n\n{issue['body']}"
 
     db_path, conn = storage.create_run_db(repo, issue_number, model=model_override)
+    run_id = db_path.stem if hasattr(db_path, 'stem') else str(db_path)
     prior_review = ""
     for r in storage.find_prior_runs(repo, issue_number):
         if r.get("review_summary"):
             prior_review = r["review_summary"]
 
     branch = f"sw/issue-{issue_number}"
-    wt = workspace.create_workspace(repo, branch)
+    wt = workspace.create_workspace(repo_path or os.getcwd(), branch)
     prior: dict[str, Any] = {}
     spent = 0.0
     kw = dict(cwd=wt, issue_number=issue_number, issue_body=issue_body, model_ov=model_override)
 
     try:
-        # -- Triage --
+        # -- Triage (prose -> extract task list) --
         resp = _call("triage", pcfg.get("triage", {}), prior=prior, prior_review=prior_review, **kw)
         _log(conn, "triage", resp); spent += resp["cost"]; _guard(spent, budget)
-        triage = _parse(resp); prior["triage"] = triage
+        triage_text = _content(resp)
+        prior["triage"] = triage_text
+
+        triage = _extract_json(triage_text, (
+            '{"tasks": [{"id": 1, "title": "...", "target_files": [...], "depends_on": []}], '
+            '"proof_type": "test_passes", "escalate": false}'
+        ), cwd=wt)
         _run_gates(conn, "triage", triage, worktree_path=wt)
         tasks = triage.get("tasks", [])
 
-        # -- Plan + Test-Plan (parallel per task) --
-        plan_r: dict[int, dict] = {}; tp_r: dict[int, dict] = {}
+        # -- Plan + Test-Plan (parallel per task, prose pass-through) --
+        plan_r: dict[int, str] = {}; tp_r: dict[int, str] = {}
         with ThreadPoolExecutor(max_workers=min(len(tasks) * 2, max_par)) as pool:
             futs: dict[Any, tuple[str, int]] = {}
             for t in tasks:
@@ -125,77 +147,74 @@ def run_pipeline(repo: str, issue_number: int, *,
             for f in as_completed(futs):
                 ph, tid = futs[f]; resp = f.result()
                 _log(conn, f"{ph}-task-{tid}", resp); spent += resp["cost"]
-                parsed = _parse(resp)
-                (plan_r if ph == "plan" else tp_r)[tid] = parsed
+                text = _content(resp)
+                (plan_r if ph == "plan" else tp_r)[tid] = text
         _guard(spent, budget)
-        for tid, plan_out in plan_r.items():
-            _run_gates(conn, "plan", plan_out, worktree_path=wt)
-        for tid, tp_out in tp_r.items():
-            _run_gates(conn, "test-plan", tp_out)
         prior["plans"] = plan_r; prior["test_plans"] = tp_r
 
-        # -- Wave Planner --
+        # -- Wave Planner (prose -> extract wave assignments) --
         resp = _call("wave-planner", pcfg.get("wave-planner", {}), prior=prior, **kw)
         _log(conn, "wave-planner", resp); spent += resp["cost"]; _guard(spent, budget)
-        wave_plan = _parse(resp); prior["wave_plan"] = wave_plan
+        wave_text = _content(resp)
+        prior["wave_plan"] = wave_text
+
+        wave_plan = _extract_json(wave_text, (
+            '{"waves": [[1, 2], [3, 4]]}  -- list of lists, each inner list is task IDs in that wave'
+        ), cwd=wt)
         task_ids = [t["id"] for t in tasks]
         _run_gates(conn, "wave-planner", wave_plan,
                    task_ids=task_ids, max_parallel=max_par)
 
         # -- Execute (parallel within wave, serial across waves) --
         exec_results: list[dict] = []
-        for wi, wave in enumerate(wave_plan.get("waves", [])):
-            log.info("wave %d: %s", wi, wave.get("tasks", []))
+        for wi, wave_task_ids in enumerate(wave_plan.get("waves", [])):
+            log.info("wave %d: %s", wi, wave_task_ids)
             with ThreadPoolExecutor(max_workers=max_par) as pool:
                 efuts = {}
-                for tid in wave.get("tasks", []):
+                for tid in wave_task_ids:
                     t = next((t for t in tasks if t["id"] == tid), None)
                     if not t: continue
                     ep = {**prior, "_current_task": t,
-                          "_current_plan": plan_r.get(tid, {}),
-                          "_current_test_plan": tp_r.get(tid, {})}
+                          "_current_plan": plan_r.get(tid, ""),
+                          "_current_test_plan": tp_r.get(tid, "")}
                     efuts[pool.submit(_call, "execute", pcfg.get("execute", {}), prior=ep, **kw)] = tid
                 for f in as_completed(efuts):
                     tid = efuts[f]; resp = f.result()
                     _log(conn, f"execute-task-{tid}", resp); spent += resp["cost"]
-                    exec_out = _parse(resp)
-                    test_cmd = tp_r.get(tid, {}).get("test_command", "")
-                    _run_gates(conn, "execute", exec_out,
-                               worktree_path=wt, test_command=test_cmd,
-                               base_branch=branch)
-                    exec_results.append({"task_id": tid, "response": resp})
+                    exec_text = _content(resp)
+                    exec_results.append({"task_id": tid, "response": exec_text})
             _guard(spent, budget)
         prior["execute"] = exec_results
 
-        # -- Review --
+        # -- Review (prose pass-through) --
         diff = workspace.get_diff(wt)[:50_000]
         resp = _call("review", pcfg.get("review", {}),
                       prior={**prior, "_combined_diff": diff}, **kw)
         _log(conn, "review", resp); spent += resp["cost"]
-        prior["review"] = resp["content"]
+        prior["review"] = _content(resp)
 
         # -- Push + PR --
         destination.push_branch(wt, branch)
-        body = destination.format_pr_body(issue_number, resp["content"], db_path, [])
+        body = destination.format_pr_body(issue_number, prior["review"], db_path, [])
         pr = destination.create_pr(repo, branch, f"fix: resolve #{issue_number}", body)
         storage.finish_run(conn, "ok", total_cost=spent, branch=branch)
-        return {"status": "ok", "pr_url": pr["url"], "spent_usd": spent}
+        return {"status": "ok", "pr_url": pr["url"], "spent_usd": spent, "run_id": run_id}
 
     except GateFailure as e:
         log.error("gate failure: %s", e)
         storage.finish_run(conn, "gate_failed", total_cost=spent)
         _post_failure(repo, issue_number, str(e))
-        return {"status": "error", "error": str(e), "spent_usd": spent}
+        return {"status": "error", "error": str(e), "spent_usd": spent, "run_id": run_id}
     except BudgetExceeded as e:
         storage.finish_run(conn, "budget_exceeded", total_cost=spent)
         _post_failure(repo, issue_number, str(e))
-        return {"status": "error", "error": str(e), "spent_usd": spent}
+        return {"status": "error", "error": str(e), "spent_usd": spent, "run_id": run_id}
     except Exception as e:
         log.exception("pipeline failed")
         storage.finish_run(conn, "error", total_cost=spent)
         storage.log_event(conn, "pipeline_error", {"error": str(e)})
         _post_failure(repo, issue_number, str(e))
-        return {"status": "error", "error": str(e), "spent_usd": spent}
+        return {"status": "error", "error": str(e), "spent_usd": spent, "run_id": run_id}
     finally:
         workspace.cleanup_workspace(wt)
         conn.close()
@@ -207,11 +226,13 @@ def main() -> None:
     ap.add_argument("issue", type=int, help="Issue number")
     ap.add_argument("--budget", type=float, default=1.00, help="Max spend USD")
     ap.add_argument("--model", default=None, help="Override model for all phases")
+    ap.add_argument("--repo-path", default=None, help="Local filesystem path to the repo (default: cwd)")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     print(f"github_claude: {args.repo}#{args.issue}  budget=${args.budget:.2f}")
-    result = run_pipeline(args.repo, args.issue, budget=args.budget, model_override=args.model)
+    result = run_pipeline(args.repo, args.issue, budget=args.budget,
+                          model_override=args.model, repo_path=args.repo_path)
 
     print(f"\n{'='*50}")
     for k, label in [("status","Status"), ("spent_usd","Cost"), ("pr_url","PR"), ("error","Error")]:

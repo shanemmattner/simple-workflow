@@ -25,6 +25,12 @@ _RETRYABLE_PATTERNS = re.compile(
 # Public API
 # ---------------------------------------------------------------------------
 
+_DEFAULT_SYSTEM_PROMPT = (
+    "You are a coding agent. Focus on the task in your prompt. "
+    "Do not delegate work."
+)
+
+
 def call_agent(
     prompt: str,
     *,
@@ -32,6 +38,7 @@ def call_agent(
     cwd: str,
     max_turns: int = 30,
     timeout: int | None = None,
+    system_prompt: str | None = None,
 ) -> dict:
     """Run Claude CLI and return a parsed response dict.
 
@@ -46,6 +53,9 @@ def call_agent(
     Never raises on CLI / parse failures — returns a dict with
     finish_reason="error" and content set to the error description.
     """
+    effective_system_prompt = (
+        system_prompt if system_prompt is not None else _DEFAULT_SYSTEM_PROMPT
+    )
     cmd = [
         "claude",
         prompt,
@@ -53,6 +63,7 @@ def call_agent(
         "--model", model,
         "--permission-mode", "auto",
         "--max-turns", str(max_turns),
+        "--system-prompt", effective_system_prompt,
     ]
 
     effective_timeout = timeout if timeout is not None else 600

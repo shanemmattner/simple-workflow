@@ -21,6 +21,8 @@ def main() -> None:
                         help="Max spend in USD (default: 1.00)")
     parser.add_argument("--model", default="sonnet",
                         help="Default model (default: sonnet)")
+    parser.add_argument("--repo-path", default=None,
+                        help="Local filesystem path to the repo (default: cwd)")
     parser.add_argument("--workflow", default=None,
                         help="Path to workflow dir (default: workflows/issue-to-pr)")
     args = parser.parse_args()
@@ -48,10 +50,10 @@ def main() -> None:
     print(f"  budget: ${args.budget:.2f}  model: {args.model}")
 
     result = run_pipeline(
-        owner, repo, issue_number,
+        f"{owner}/{repo}", issue_number,
         budget=args.budget,
-        model=args.model,
-        workflow_dir=workflow_dir,
+        model_override=args.model,
+        repo_path=args.repo_path,
     )
 
     print(f"\n{'=' * 60}")
