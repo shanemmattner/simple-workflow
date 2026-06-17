@@ -8,4 +8,4 @@ dependencies = [
 ]
 
 [project.scripts]
-sw = "engine.orchestrator:main"
+sw = "engines.github_claude.orchestrator:main"

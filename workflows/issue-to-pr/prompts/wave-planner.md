@@ -35,92 +35,37 @@ You receive all plan outputs and all test-plan outputs from the parallel fan-out
 - Provide a `reason` for each wave explaining why those tasks are grouped together.
 - Add `warnings[]` for any risky groupings or implicit overlaps you detected but did not serialize.
 
-## Output schema
+## Output format
 
-Your final message must be exactly one JSON object. No prose before or after.
-
-```json
-{{
-  "waves": [
-    {{
-      "wave": 1,
-      "tasks": [1, 3],
-      "reason": "Tasks 1 and 3 have no file overlap and no dependencies"
-    }},
-    {{
-      "wave": 2,
-      "tasks": [2],
-      "reason": "Task 2 depends on task 1 (writes to file read by task 2)"
-    }}
-  ],
-  "warnings": [
-    "Tasks 1 and 3 both modify files in src/utils/ -- no direct file overlap but monitor for implicit conflicts"
-  ]
-}}
-```
-
-Field definitions:
-- **waves** (array) -- ordered list of waves:
-  - `wave` (int) -- wave number, sequential starting at 1
-  - `tasks` (array of ints) -- task IDs to execute in this wave (max {max_parallel_workers})
-  - `reason` (string) -- why these tasks are grouped/ordered this way
-- **warnings** (array of strings) -- risky groupings, implicit overlaps, or scheduling concerns
+Describe the wave schedule: which tasks go in each wave, why they're grouped that way, and any warnings about risky groupings. Each wave runs serially (wave 1 finishes before wave 2 starts). Tasks within a wave run in parallel.
 
 ### Example:
 
 3 tasks, no overlap, no dependencies:
 
-```json
-{{
-  "waves": [
-    {{
-      "wave": 1,
-      "tasks": [1, 2, 3],
-      "reason": "All tasks have independent file targets and no dependencies"
-    }}
-  ],
-  "warnings": []
-}}
-```
+Wave 1: Tasks 1, 2, 3
+Reason: All tasks have independent file targets and no dependencies.
+Warnings: none.
 
 ### Example:
 
 3 tasks, task 2 depends on 1, task 3 writes same file as task 1:
 
-```json
-{{
-  "waves": [
-    {{
-      "wave": 1,
-      "tasks": [1],
-      "reason": "Task 1 runs first -- task 2 depends on it, task 3 conflicts on src/config.ts"
-    }},
-    {{
-      "wave": 2,
-      "tasks": [2, 3],
-      "reason": "Task 2 dependency on task 1 satisfied. Task 3 no longer conflicts since task 1 is complete."
-    }}
-  ],
-  "warnings": []
-}}
-```
+Wave 1: Task 1
+Reason: Task 1 runs first -- task 2 depends on it, task 3 conflicts on src/config.ts.
+
+Wave 2: Tasks 2, 3
+Reason: Task 2 dependency on task 1 satisfied. Task 3 no longer conflicts since task 1 is complete.
+
+Warnings: none.
 
 ### Example:
 
 Single task:
 
-```json
-{{
-  "waves": [
-    {{
-      "wave": 1,
-      "tasks": [1],
-      "reason": "Single task, no scheduling needed"
-    }}
-  ],
-  "warnings": []
-}}
-```
+Wave 1: Task 1
+Reason: Single task, no scheduling needed.
+Warnings: none.
 
 ## Escalation ladder
 

@@ -37,102 +37,36 @@ You are reviewing the COMBINED diff of all tasks. Focus on integration issues --
 - **warning** -- should fix. Dead code, missing test, hardcoded value, scope creep.
 - **info** -- nit. Style, naming, minor improvements.
 
-## Output schema
+## Output format
 
-Your final message must be exactly one JSON object. No prose before or after.
+State your verdict (pass, warn, or fail) and list your findings. For each finding, state the severity (critical, warning, info), category, what the issue is with file path and line reference, and how to fix it.
 
-```json
-{{
-  "verdict": "pass",
-  "score": 0.92,
-  "findings": [
-    {{
-      "severity": "warning",
-      "category": "dead_code",
-      "description": "Unused import 'os' in src/handlers/auth.py line 3",
-      "suggestion": "Remove the unused import"
-    }}
-  ]
-}}
-```
-
-Field definitions:
-- **verdict** (string) -- one of: `pass`, `warn`, `fail`
-  - `fail` = any critical finding
-  - `warn` = warning findings, no critical
-  - `pass` = only info findings or clean
-- **score** (float, 0.0-1.0) -- overall quality score. 1.0 = perfect, 0.0 = completely broken.
-  - 0.9-1.0: clean, minor nits at most
-  - 0.7-0.89: warnings that should be addressed
-  - 0.5-0.69: significant issues
-  - below 0.5: critical problems
-- **findings** (array) -- each finding:
-  - `severity` (string) -- one of: `critical`, `warning`, `info`
-  - `category` (string) -- one of: `plan_deviation`, `missing_step`, `dead_code`, `security`, `hardcoded_value`, `scope_creep`, `test_quality`, `integration`, `style`
-  - `description` (string) -- what the issue is, with file path and line reference
-  - `suggestion` (string) -- how to fix it
+Verdict meanings:
+- **fail** = any critical finding (blocks merge)
+- **warn** = warning findings, no critical
+- **pass** = only info findings or clean
 
 ### Example:
 
-Warning with dead code:
+Verdict: warn
 
-```json
-{{
-  "verdict": "warn",
-  "score": 0.78,
-  "findings": [
-    {{
-      "severity": "warning",
-      "category": "dead_code",
-      "description": "Unused import 'os' in src/handlers/auth.py line 3, left over from debugging",
-      "suggestion": "Remove the unused import"
-    }},
-    {{
-      "severity": "warning",
-      "category": "hardcoded_value",
-      "description": "API timeout hardcoded to 5000ms in src/api/client.ts:28",
-      "suggestion": "Move to config or environment variable"
-    }}
-  ]
-}}
-```
+Findings:
+1. [warning / dead_code] Unused import 'os' in src/handlers/auth.py line 3, left over from debugging. Remove the unused import.
+2. [warning / hardcoded_value] API timeout hardcoded to 5000ms in src/api/client.ts:28. Move to config or environment variable.
 
 ### Example:
 
-Fail with missing plan step:
+Verdict: fail
 
-```json
-{{
-  "verdict": "fail",
-  "score": 0.35,
-  "findings": [
-    {{
-      "severity": "critical",
-      "category": "missing_step",
-      "description": "Plan step 3 for task 2 required input validation on user_id but no validation was added -- raw user input passed directly to SQL query",
-      "suggestion": "Add input validation for user_id parameter before the database query"
-    }},
-    {{
-      "severity": "critical",
-      "category": "integration",
-      "description": "Task 1 exports inviteWorker() but task 2 imports it as createInvite() -- import will fail at runtime",
-      "suggestion": "Align the import name with the exported function name"
-    }}
-  ]
-}}
-```
+Findings:
+1. [critical / missing_step] Plan step 3 for task 2 required input validation on user_id but no validation was added -- raw user input passed directly to SQL query. Add input validation for user_id parameter before the database query.
+2. [critical / integration] Task 1 exports inviteWorker() but task 2 imports it as createInvite() -- import will fail at runtime. Align the import name with the exported function name.
 
 ### Example:
 
-Clean pass:
+Verdict: pass
 
-```json
-{{
-  "verdict": "pass",
-  "score": 0.95,
-  "findings": []
-}}
-```
+No findings. All plan steps implemented correctly, tests verify requirements, no integration issues.
 
 ## Mandatory checklist
 
@@ -148,8 +82,6 @@ Unsupported claims are findings against YOUR review, not the code.
 1. Ambiguous whether a change matches the plan -- check the plan's acceptance_test condition
 2. Cannot determine if tasks integrate correctly -- run both test commands
 3. Diff is too large to review in detail -- focus on files that appear in multiple tasks' writes[]
-
-Output JSON only. No prose, no markdown fences.
 
 ## Prior phases
 

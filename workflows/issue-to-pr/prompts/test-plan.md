@@ -37,83 +37,39 @@ You receive the issue body, the triage task, and the plan output. Use them to un
 - One test file, one clear assertion. Do not over-engineer fixtures.
 - Do not write production code. Test files only.
 
-## Output schema
+## Output format
 
-Your final message must be exactly one JSON object. No prose before or after.
-
-```json
-{{
-  "test_file": "tests/test_feature.py",
-  "test_command": "pytest tests/test_feature.py -v",
-  "test_description": "Imports new_function from module and asserts it returns expected value",
-  "assertions": [
-    "new_function('input') returns {{'status': 'ok'}}",
-    "Return type is dict with 'status' key"
-  ],
-  "skip": false,
-  "skip_reason": ""
-}}
-```
-
-Field definitions:
-- **test_file** (string) -- path to the test file to create
-- **test_command** (string) -- exact command to run the test
-- **test_description** (string) -- what the test does and why it fails before implementation
-- **assertions** (array of strings) -- what the test checks, in plain language
-- **skip** (bool) -- true only for changes with no testable behavior (docs, CI config)
-- **skip_reason** (string) -- why this change cannot be tested (empty when skip is false)
+Describe the test you'd write: where the test file goes, the command to run it, what it asserts, and why it fails before implementation. If the change has no testable behavior, say so and explain why.
 
 ### Example:
 
 Task: "Add inviteWorker server action"
-Plan writes: `src/actions/workers.ts`, `src/db/schema/worker_invites.ts`
+Plan writes: src/actions/workers.ts, src/db/schema/worker_invites.ts
 
-```json
-{{
-  "test_file": "src/__tests__/invite-worker.test.ts",
-  "test_command": "pnpm test -- src/__tests__/invite-worker.test.ts",
-  "test_description": "Imports inviteWorker from actions/workers and asserts it returns success with invite object. Fails because inviteWorker does not exist yet.",
-  "assertions": [
-    "inviteWorker({{ workerId: 'test-123' }}) returns {{ success: true }}",
-    "result.invite.id is defined"
-  ],
-  "skip": false,
-  "skip_reason": ""
-}}
-```
+Test file: src/__tests__/invite-worker.test.ts
+Run command: pnpm test -- src/__tests__/invite-worker.test.ts
+What it does: Imports inviteWorker from actions/workers and asserts it returns success with invite object. Fails because inviteWorker does not exist yet.
+Assertions:
+- inviteWorker({ workerId: 'test-123' }) returns { success: true }
+- result.invite.id is defined
 
 ### Example:
 
 Task: "Fix off-by-one in paginate()"
-Plan writes: `src/utils/paginate.ts`
+Plan writes: src/utils/paginate.ts
 
-```json
-{{
-  "test_file": "src/__tests__/paginate-boundary.test.ts",
-  "test_command": "pnpm test -- src/__tests__/paginate-boundary.test.ts",
-  "test_description": "Calls paginate with 30 items, perPage=10, page=3 and asserts exactly 10 items returned. Fails because the bug returns 9.",
-  "assertions": [
-    "paginate(items, {{ page: 3, perPage: 10, total: 30 }}).items has length 10"
-  ],
-  "skip": false,
-  "skip_reason": ""
-}}
-```
+Test file: src/__tests__/paginate-boundary.test.ts
+Run command: pnpm test -- src/__tests__/paginate-boundary.test.ts
+What it does: Calls paginate with 30 items, perPage=10, page=3 and asserts exactly 10 items returned. Fails because the bug returns 9.
+Assertions:
+- paginate(items, { page: 3, perPage: 10, total: 30 }).items has length 10
 
 ### Example:
 
 Task: "Update README with install instructions"
 
-```json
-{{
-  "test_file": "",
-  "test_command": "",
-  "test_description": "",
-  "assertions": [],
-  "skip": true,
-  "skip_reason": "Documentation-only change with no testable behavior"
-}}
-```
+Skip: yes
+Reason: Documentation-only change with no testable behavior.
 
 ## Escalation ladder
 
@@ -121,8 +77,6 @@ Task: "Update README with install instructions"
 2. Test framework unclear -- read project test config (jest.config, pytest.ini, pyproject.toml)
 3. Test would pass before implementation -- make the assertion more specific, or skip if feature already exists
 4. Change needs an artifact you cannot generate (WAV file, screenshot) -- note in skip_reason as blocked
-
-Output JSON only. No prose, no markdown fences.
 
 ## Task from Issue #{issue_number}
 
