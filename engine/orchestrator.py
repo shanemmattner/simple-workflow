@@ -277,6 +277,15 @@ def run_pipeline(
     run_dir.mkdir(parents=True, exist_ok=True)
     run_dir_str = str(run_dir)
 
+    if dry_run:
+        for p in workflow.get("phases", []):
+            name = p["name"]
+            template = _load_prompt(workflow_dir, name)
+            print(f"[DRY-RUN] phase={name} model={phase_models.get(name, model)} prompt_chars={len(template)}")
+        db_mod.finish_run(conn, run_id, status="dry-run")
+        conn.close()
+        return {"run_id": run_id, "status": "dry-run", "spent_usd": 0.0, "pr_url": ""}
+
     prior_phases: dict[str, Any] = {}
     spent_usd = 0.0
     pr_url = ""
