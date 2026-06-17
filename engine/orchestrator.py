@@ -255,6 +255,7 @@ def run_pipeline(
     workflow_name: str = "issue-to-pr",
     workflow_dir: Path | None = None,
     platform: str | None = None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     repo_root = Path(__file__).resolve().parent.parent
     if workflow_dir is None:
@@ -671,6 +672,8 @@ def main() -> None:
                         help="Path to workflow directory (overrides --workflow)")
     parser.add_argument("--gitlab", action="store_true", default=False,
                         help="Force GitLab mode (glab CLI). Auto-detected from remote URL if omitted.")
+    parser.add_argument("--dry-run", action="store_true", default=False,
+                        help="Print what would run without calling Claude or creating a PR.")
     args = parser.parse_args()
 
     owner, repo, issue_number = parse_issue_ref(args.issue)
@@ -683,6 +686,8 @@ def main() -> None:
 
     print(f"simple_workflow: {owner}/{repo}#{issue_number}")
     print(f"  budget: ${args.budget:.2f}  model: {args.model}  workflow: {args.workflow}")
+    if args.dry_run:
+        print("  dry-run: True")
 
     result = run_pipeline(
         owner, repo, issue_number,
@@ -691,6 +696,7 @@ def main() -> None:
         workflow_name=args.workflow,
         workflow_dir=workflow_dir,
         platform=platform,
+        dry_run=args.dry_run,
     )
 
     print(f"\n{'='*60}")
