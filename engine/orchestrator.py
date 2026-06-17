@@ -280,22 +280,21 @@ def run_pipeline(
     spent_usd = 0.0
     pr_url = ""
 
-    # Resolve target repo path — the repo we're creating a worktree for.
-    # For now: clone or locate it. Assumes repo is already cloned locally.
-    # Use the worktree_path as the target repo root for git operations.
-    target_repo = _find_target_repo(owner, repo)
-
-    # Auto-detect platform if not explicitly set
-    if platform is None:
-        platform = detect_platform(target_repo)
-    print(f"  platform: {platform}")
-
-    issue_body = fetch_issue(owner, repo, issue_number, platform=platform, target_repo=target_repo)
-
     branch_name = f"issue-{issue_number}-{run_id[:8]}"
     worktree_path = ""
 
     try:
+        # Resolve target repo path — the repo we're creating a worktree for.
+        # For now: clone or locate it. Assumes repo is already cloned locally.
+        # Use the worktree_path as the target repo root for git operations.
+        target_repo = _find_target_repo(owner, repo)
+
+        # Auto-detect platform if not explicitly set
+        if platform is None:
+            platform = detect_platform(target_repo)
+        print(f"  platform: {platform}")
+
+        issue_body = fetch_issue(owner, repo, issue_number, platform=platform, target_repo=target_repo)
         worktree_path = _create_worktree(target_repo, branch_name)
         print(f"[run {run_id[:8]}] worktree: {worktree_path}")
 
@@ -560,6 +559,7 @@ def run_pipeline(
                 "spent_usd": spent_usd}
 
     except ValidationKill as exc:
+        db_mod.update_spent(conn, run_id, spent_usd)
         db_mod.finish_run(conn, run_id, status="error", error=str(exc))
         return {"run_id": run_id, "status": "error", "error": str(exc),
                 "spent_usd": spent_usd}

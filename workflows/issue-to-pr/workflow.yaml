@@ -22,8 +22,8 @@ models:
 
 phases:
   - name: triage
-    model: haiku
-    max_turns: 5
+    model: sonnet
+    max_turns: 10
   - name: plan
     model: sonnet
     max_turns: 10
