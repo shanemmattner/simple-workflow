@@ -22,7 +22,7 @@ from typing import Any
 import yaml
 from pydantic import ValidationError
 
-from engine.agent import AgentResult, run_agent
+from engine.agent import AgentResult, run_agent, save_error
 from engine import gates
 from engine import waves
 from engine.worktree import worktree as worktree_ctx, cleanup_worktree
@@ -565,7 +565,14 @@ def run_pipeline(
                 "spent_usd": spent_usd}
 
     except Exception as exc:
+        import traceback as tb_mod
         log.exception("pipeline failed")
+        save_error(
+            run_dir_str, "pipeline",
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+            traceback_str=tb_mod.format_exc(),
+        )
         db_mod.finish_run(conn, run_id, status="error", error=str(exc))
         return {"run_id": run_id, "status": "error", "error": str(exc),
                 "spent_usd": spent_usd}

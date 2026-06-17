@@ -272,6 +272,30 @@ def run_agent(
     return result
 
 
+def save_error(
+    run_dir: str,
+    phase: str,
+    error_type: str,
+    error_message: str,
+    traceback_str: str = "",
+) -> None:
+    """Write structured error info to {run_dir}/error.json."""
+    if not run_dir:
+        return
+    run_path = Path(run_dir)
+    run_path.mkdir(parents=True, exist_ok=True)
+    error_data = {
+        "phase": phase,
+        "error_type": error_type,
+        "error_message": error_message,
+        "traceback": traceback_str,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    (run_path / "error.json").write_text(
+        json.dumps(error_data, indent=2), encoding="utf-8"
+    )
+
+
 def _save_response(run_dir: str, phase_label: str, result: AgentResult) -> None:
     if not run_dir or not phase_label:
         return
