@@ -66,9 +66,19 @@ Text to extract from:
         raw = raw.strip().split("\n", 1)[1].rsplit("```", 1)[0]
     return json.loads(raw)
 
-def _log(conn, name, resp):
-    storage.log_phase(conn, name, cost=resp["cost"],
-                      tokens_in=resp["tokens_in"], tokens_out=resp["tokens_out"])
+def _start_phase(conn, name):
+    """Create a phase record at the START of execution. Returns phase_id."""
+    return storage.log_phase(conn, name)
+
+def _finish_phase(conn, phase_id, resp, failed=False):
+    """Update the phase record AFTER execution completes."""
+    storage.finish_phase(
+        conn, phase_id,
+        status="failed" if failed else "completed",
+        cost=resp.get("cost", 0) if resp else 0,
+        tokens_in=resp.get("tokens_in", 0) if resp else 0,
+        tokens_out=resp.get("tokens_out", 0) if resp else 0,
+    )
 
 
 class BudgetExceeded(RuntimeError): pass
@@ -124,8 +134,9 @@ def run_pipeline(repo: str, issue_number: int, *,
 
     try:
         # -- Triage (prose -> extract task list) --
+        pid = _start_phase(conn, "triage")
         resp = _call("triage", pcfg.get("triage", {}), prior=prior, prior_review=prior_review, **kw)
-        _log(conn, "triage", resp); spent += resp["cost"]; _guard(spent, budget)
+        _finish_phase(conn, pid, resp); spent += resp["cost"]; _guard(spent, budget)
         triage_text = _content(resp)
         prior["triage"] = triage_text
 
@@ -139,22 +150,30 @@ def run_pipeline(repo: str, issue_number: int, *,
         # -- Plan + Test-Plan (parallel per task, prose pass-through) --
         plan_r: dict[int, str] = {}; tp_r: dict[int, str] = {}
         with ThreadPoolExecutor(max_workers=min(len(tasks) * 2, max_par)) as pool:
-            futs: dict[Any, tuple[str, int]] = {}
+            futs: dict[Any, tuple[str, int, int]] = {}
             for t in tasks:
                 tp = {**prior, "_current_task": t}
                 for ph in ("plan", "test-plan"):
-                    futs[pool.submit(_call, ph, pcfg.get(ph, {}), prior=tp, **kw)] = (ph, t["id"])
+                    pid = _start_phase(conn, f"{ph}-task-{t['id']}")
+                    futs[pool.submit(_call, ph, pcfg.get(ph, {}), prior=tp, **kw)] = (ph, t["id"], pid)
             for f in as_completed(futs):
-                ph, tid = futs[f]; resp = f.result()
-                _log(conn, f"{ph}-task-{tid}", resp); spent += resp["cost"]
+                ph, tid, pid = futs[f]
+                try:
+                    resp = f.result()
+                    _finish_phase(conn, pid, resp)
+                except Exception:
+                    _finish_phase(conn, pid, None, failed=True)
+                    raise
+                spent += resp["cost"]
                 text = _content(resp)
                 (plan_r if ph == "plan" else tp_r)[tid] = text
         _guard(spent, budget)
         prior["plans"] = plan_r; prior["test_plans"] = tp_r
 
         # -- Wave Planner (prose -> extract wave assignments) --
+        pid = _start_phase(conn, "wave-planner")
         resp = _call("wave-planner", pcfg.get("wave-planner", {}), prior=prior, **kw)
-        _log(conn, "wave-planner", resp); spent += resp["cost"]; _guard(spent, budget)
+        _finish_phase(conn, pid, resp); spent += resp["cost"]; _guard(spent, budget)
         wave_text = _content(resp)
         prior["wave_plan"] = wave_text
 
@@ -170,17 +189,24 @@ def run_pipeline(repo: str, issue_number: int, *,
         for wi, wave_task_ids in enumerate(wave_plan.get("waves", [])):
             log.info("wave %d: %s", wi, wave_task_ids)
             with ThreadPoolExecutor(max_workers=max_par) as pool:
-                efuts = {}
+                efuts: dict[Any, tuple[int, int]] = {}
                 for tid in wave_task_ids:
                     t = next((t for t in tasks if t["id"] == tid), None)
                     if not t: continue
                     ep = {**prior, "_current_task": t,
                           "_current_plan": plan_r.get(tid, ""),
                           "_current_test_plan": tp_r.get(tid, "")}
-                    efuts[pool.submit(_call, "execute", pcfg.get("execute", {}), prior=ep, **kw)] = tid
+                    pid = _start_phase(conn, f"execute-task-{tid}")
+                    efuts[pool.submit(_call, "execute", pcfg.get("execute", {}), prior=ep, **kw)] = (tid, pid)
                 for f in as_completed(efuts):
-                    tid = efuts[f]; resp = f.result()
-                    _log(conn, f"execute-task-{tid}", resp); spent += resp["cost"]
+                    tid, pid = efuts[f]
+                    try:
+                        resp = f.result()
+                        _finish_phase(conn, pid, resp)
+                    except Exception:
+                        _finish_phase(conn, pid, None, failed=True)
+                        raise
+                    spent += resp["cost"]
                     exec_text = _content(resp)
                     exec_results.append({"task_id": tid, "response": exec_text})
             _guard(spent, budget)
@@ -188,9 +214,10 @@ def run_pipeline(repo: str, issue_number: int, *,
 
         # -- Review (prose pass-through) --
         diff = workspace.get_diff(wt)[:50_000]
+        pid = _start_phase(conn, "review")
         resp = _call("review", pcfg.get("review", {}),
                       prior={**prior, "_combined_diff": diff}, **kw)
-        _log(conn, "review", resp); spent += resp["cost"]
+        _finish_phase(conn, pid, resp); spent += resp["cost"]
         prior["review"] = _content(resp)
 
         # -- Push + PR --
