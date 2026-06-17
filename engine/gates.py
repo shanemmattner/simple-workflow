@@ -34,6 +34,17 @@ def _validate_test_command(command: str) -> str | None:
     return f"test command not on allowlist: {command!r}"
 
 
+def _file_exists_fuzzy(filepath: str, worktree: Path) -> bool:
+    """Check if a file exists, falling back to filename search for abbreviated paths."""
+    # Exact match first
+    if (worktree / filepath).exists():
+        return True
+    # Fuzzy fallback: search for the filename anywhere in the worktree
+    filename = Path(filepath).name
+    matches = list(worktree.rglob(filename))
+    return len(matches) > 0
+
+
 def validate_triage(output: dict, worktree_path: str) -> list[str]:
     errors: list[str] = []
     tasks = output.get("tasks", [])
@@ -46,8 +57,9 @@ def validate_triage(output: dict, worktree_path: str) -> list[str]:
         all_files.extend(task.get("target_files", []))
 
     if all_files:
+        worktree = Path(worktree_path)
         existing = sum(
-            1 for f in all_files if Path(worktree_path, f).exists()
+            1 for f in all_files if _file_exists_fuzzy(f, worktree)
         )
         ratio = existing / len(all_files)
         if ratio < 0.5:

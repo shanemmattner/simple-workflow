@@ -79,7 +79,7 @@ Field definitions:
   - `id` (int) -- sequential starting at 1
   - `title` (string) -- short imperative label
   - `description` (string) -- what to change + measurable exit condition
-  - `target_files` (array of strings) -- file paths from the issue body or repo context
+  - `target_files` (array of strings) -- full paths from the repository root (e.g., `apps/mac_os/TunedVoice/Sources/TunedVoice/Services/Transcription/CTCBoostGate.swift`), not abbreviated paths
   - `depends_on` (array of ints) -- ids of prerequisite tasks (empty if independent)
 - **proof_type** (string) -- one of: `test_passes`, `check_passes`, `output_matches`, `manual_verify`
 - **escalate** (bool) -- true if issue exceeds 5 tasks or requires human judgment
