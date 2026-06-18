@@ -5,9 +5,15 @@ Pipeline that transforms GitHub issues into tested, reviewed PRs. Reads an issue
 ## Run
 
 ```bash
+# Claude engine (default)
 ./scripts/run.sh owner/repo#123
 ./scripts/run.sh owner/repo#123 --budget 2.00 --model opus
 python -m engines.github_claude owner/repo#123
+
+# OpenHands engine (DeepSeek V4 Flash via OpenRouter)
+./scripts/run.sh owner/repo#123 --engine openhands
+./scripts/run.sh owner/repo#123 --engine openhands --budget 2.00
+python -m engines.github_openhands owner/repo#123
 ```
 
 ## Stats
@@ -35,8 +41,10 @@ python3 -m pytest tests/
 - `engines/github_claude/gates.py` -- validation gates and post-phase checks
 - `engines/github_claude/eval.py` -- LLM-as-judge scoring, failure categorization (stubs)
 - `engines/github_claude/__main__.py` -- package entry point for `python -m engines.github_claude`
+- `engines/github_openhands/runtime.py` -- OpenHands SDK runtime (DeepSeek V4 Flash via OpenRouter, no Docker)
+- `engines/github_openhands/__main__.py` -- package entry point for `python -m engines.github_openhands`
 - `workflows/issue-to-pr/workflow.yaml` -- phase definitions, model config, gates, budget
-- `workflows/issue-to-pr/prompts/` -- frozen prompt templates per phase (triage, plan, test-plan, wave-planner, execute, review)
+- `workflows/issue-to-pr/prompts/` -- frozen prompt templates per phase (triage, verify, plan, test-plan, wave-planner, execute, review, improve)
 - `scripts/run.sh` -- shell entry point
 - `scripts/stats.sh` -- SQLite dashboard queries
 

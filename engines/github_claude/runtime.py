@@ -40,7 +40,15 @@ def call_agent(
     timeout: int | None = None,
     system_prompt: str | None = None,
 ) -> dict:
-    """Run Claude CLI and return a parsed response dict.
+    """Run Claude CLI in non-interactive mode and return a parsed response dict.
+
+    Uses ``claude -p`` (print mode) with ``--dangerously-skip-permissions``
+    so the agent can read/write files and run terminal commands in a
+    multi-turn tool-use loop without prompting.
+
+    Args:
+        max_turns: Retained for API compatibility; the CLI has no
+            ``--max-turns`` flag.  Use *timeout* to bound execution.
 
     Returns a dict with keys:
         content       - text body of the assistant response
@@ -58,11 +66,11 @@ def call_agent(
     )
     cmd = [
         "claude",
+        "-p",
         prompt,
         "--output-format", "json",
         "--model", model,
-        "--permission-mode", "auto",
-        "--max-turns", str(max_turns),
+        "--dangerously-skip-permissions",
         "--system-prompt", effective_system_prompt,
     ]
 

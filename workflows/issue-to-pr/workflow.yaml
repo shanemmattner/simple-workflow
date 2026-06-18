@@ -24,6 +24,9 @@ phases:
   - name: triage
     model: sonnet
     max_turns: 10
+  - name: verify
+    model: sonnet
+    max_turns: 10
   - name: plan
     model: sonnet
     max_turns: 10
@@ -34,12 +37,15 @@ phases:
     parallel: per_task
   - name: wave-planner
     model: sonnet
-    max_turns: 5
+    max_turns: 15
   - name: execute
     model: sonnet
     max_turns: 30
     parallel: per_wave
   - name: review
+    model: haiku
+    max_turns: 5
+  - name: improve
     model: haiku
     max_turns: 5
 
@@ -52,6 +58,9 @@ gates:
   triage:
     - file_existence_check
     - task_count_max_5
+  verify:
+    - verified_tasks_present
+    - valid_statuses
   plan:
     - dag_acyclic
     - file_path_plausible
