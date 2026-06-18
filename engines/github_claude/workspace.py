@@ -1,8 +1,11 @@
 """Git worktree workspace management for the github_claude engine."""
 
+import logging
 import shutil
 import subprocess
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 
 def create_workspace(repo_path: str, branch: str, base: str = "main") -> str:
@@ -53,7 +56,7 @@ def create_workspace(repo_path: str, branch: str, base: str = "main") -> str:
     # Fetch latest base branch
     subprocess.run(
         ["git", "-C", str(repo), "fetch", "origin", base, "--quiet"],
-        capture_output=True, timeout=60,
+        capture_output=True, timeout=60, check=True,
     )
 
     # Create worktree with new branch off base
@@ -78,16 +81,16 @@ def get_diff(workspace_path: str, base: str = "main") -> str:
 
     result = subprocess.run(
         ["git", "diff", f"{base}..HEAD"],
-        capture_output=True, text=True, cwd=workspace_path, timeout=30,
+        capture_output=True, text=True, cwd=workspace_path, timeout=30, check=True,
     )
     # Also include unstaged/staged changes not yet committed
     staged = subprocess.run(
         ["git", "diff", "--cached"],
-        capture_output=True, text=True, cwd=workspace_path, timeout=30,
+        capture_output=True, text=True, cwd=workspace_path, timeout=30, check=True,
     )
     unstaged = subprocess.run(
         ["git", "diff"],
-        capture_output=True, text=True, cwd=workspace_path, timeout=30,
+        capture_output=True, text=True, cwd=workspace_path, timeout=30, check=True,
     )
 
     parts = [result.stdout]
@@ -160,10 +163,12 @@ def cleanup_workspace(workspace_path: str) -> None:
 
     # Remove worktree via git
     if repo_root:
-        subprocess.run(
+        result = subprocess.run(
             ["git", "-C", repo_root, "worktree", "remove", "--force", workspace_path],
             capture_output=True, timeout=30,
         )
+        if result.returncode != 0:
+            log.warning("git worktree remove failed for %s: %s", workspace_path, result.stderr.strip())
 
     # Force-remove directory if still present
     if wt.exists():
@@ -176,7 +181,9 @@ def cleanup_workspace(workspace_path: str) -> None:
             capture_output=True, timeout=30,
         )
         # Delete the branch
-        subprocess.run(
+        result = subprocess.run(
             ["git", "-C", repo_root, "branch", "-D", branch],
             capture_output=True, timeout=30,
         )
+        if result.returncode != 0:
+            log.warning("git branch -D failed for %s: %s", branch, result.stderr.strip())

@@ -159,11 +159,11 @@ def _read_total_cost(db_path: str) -> float | None:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "SELECT spent_usd FROM pipeline_runs ORDER BY rowid DESC LIMIT 1"
+            "SELECT total_cost FROM run ORDER BY rowid DESC LIMIT 1"
         ).fetchone()
         conn.close()
         if row:
-            return float(row["spent_usd"])
+            return float(row["total_cost"])
     except Exception:
         log.debug("could not read cost from %s", db_path, exc_info=True)
     return None

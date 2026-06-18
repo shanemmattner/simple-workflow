@@ -9,7 +9,7 @@ Usage:
 from __future__ import annotations
 
 import argparse, json, logging, os, sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_EXCEPTION
 from pathlib import Path
 from typing import Any
 
@@ -59,7 +59,7 @@ def _extract_json(prose: str, schema_hint: str, cwd: str) -> dict:
 
 Text to extract from:
 {prose}"""
-    resp = runtime.call_agent(prompt, model="sonnet", cwd=cwd, max_turns=1)
+    resp = runtime.call_agent(prompt, model="haiku", cwd=cwd, max_turns=1)
     raw = _content(resp)
     # Strip markdown fences if present
     if raw.strip().startswith("```"):
@@ -156,7 +156,8 @@ def run_pipeline(repo: str, issue_number: int, *,
                 for ph in ("plan", "test-plan"):
                     pid = _start_phase(conn, f"{ph}-task-{t['id']}")
                     futs[pool.submit(_call, ph, pcfg.get(ph, {}), prior=tp, **kw)] = (ph, t["id"], pid)
-            for f in as_completed(futs):
+            done, _ = wait(futs, return_when=FIRST_EXCEPTION)
+            for f in done:
                 ph, tid, pid = futs[f]
                 try:
                     resp = f.result()
