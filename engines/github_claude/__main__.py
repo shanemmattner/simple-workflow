@@ -25,6 +25,8 @@ def main() -> None:
                         help="Local filesystem path to the repo (default: cwd)")
     parser.add_argument("--workflow", default=None,
                         help="Path to workflow dir (default: workflows/issue-to-pr)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Simulate pipeline without calling Claude or creating PRs")
     args = parser.parse_args()
 
     # Parse repo#issue format
@@ -48,12 +50,15 @@ def main() -> None:
 
     print(f"github_claude: {owner}/{repo}#{issue_number}")
     print(f"  budget: ${args.budget:.2f}  model: {args.model}")
+    if args.dry_run:
+        print("  [DRY RUN] No LLM calls or PRs will be made")
 
     result = run_pipeline(
         f"{owner}/{repo}", issue_number,
         budget=args.budget,
         model_override=args.model,
         repo_path=args.repo_path,
+        dry_run=args.dry_run,
     )
 
     print(f"\n{'=' * 60}")
