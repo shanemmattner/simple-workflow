@@ -71,6 +71,7 @@ def call_agent(
         "--output-format", "json",
         "--model", model,
         "--dangerously-skip-permissions",
+        "--bare",
         "--system-prompt", effective_system_prompt,
     ]
 
