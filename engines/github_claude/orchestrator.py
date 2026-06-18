@@ -65,8 +65,12 @@ def _content(resp: dict) -> str:
     """Extract content string from agent response (agents respond in prose)."""
     return resp["content"] if isinstance(resp["content"], str) else json.dumps(resp["content"])
 
-def _extract_json(prose: str, schema_hint: str, cwd: str) -> dict:
+def _extract_json(prose: str, schema_hint: str, cwd: str, *, dry_run: bool = False) -> dict:
     """Make a dedicated extraction call to pull structured data from prose."""
+    if dry_run:
+        log.info("[DRY-RUN] _extract_json would extract JSON from prose (skipping)")
+        # Return a minimal dict that satisfies the schema validation
+        return {}
     prompt = f"""Extract structured data from the following text. Return ONLY valid JSON matching this schema (no markdown fences, no explanation):
 {schema_hint}
 
@@ -156,7 +160,7 @@ def run_pipeline(repo: str, issue_number: int, *,
         triage = _extract_json(triage_text, (
             '{"tasks": [{"id": 1, "title": "...", "target_files": [...], "depends_on": []}], '
             '"proof_type": "test_passes", "escalate": false}'
-        ), cwd=wt)
+        ), cwd=wt, dry_run=dry_run)
         _run_gates(conn, "triage", triage, worktree_path=wt)
         tasks = triage.get("tasks", [])
 
@@ -192,7 +196,7 @@ def run_pipeline(repo: str, issue_number: int, *,
 
         wave_plan = _extract_json(wave_text, (
             '{"waves": [[1, 2], [3, 4]]}  -- list of lists, each inner list is task IDs in that wave'
-        ), cwd=wt)
+        ), cwd=wt, dry_run=dry_run)
         task_ids = [t["id"] for t in tasks]
         _run_gates(conn, "wave-planner", wave_plan,
                    task_ids=task_ids, max_parallel=max_par)
@@ -234,9 +238,9 @@ def run_pipeline(repo: str, issue_number: int, *,
         prior["review"] = _content(resp)
 
         # -- Push + PR --
-        destination.push_branch(wt, branch)
+        destination.push_branch(wt, branch, dry_run=dry_run)
         body = destination.format_pr_body(issue_number, prior["review"], db_path, [])
-        pr = destination.create_pr(repo, branch, f"fix: resolve #{issue_number}", body)
+        pr = destination.create_pr(repo, branch, f"fix: resolve #{issue_number}", body, dry_run=dry_run)
         storage.finish_run(conn, "ok", total_cost=spent, branch=branch)
         return {"status": "ok", "pr_url": pr["url"], "spent_usd": spent, "run_id": run_id}
 
