@@ -71,7 +71,6 @@ def call_agent(
         "--output-format", "json",
         "--model", model,
         "--dangerously-skip-permissions",
-        "--bare",
         "--system-prompt", effective_system_prompt,
     ]
 
@@ -106,7 +105,14 @@ def call_agent(
 
                 return _error_response(stderr, elapsed)
 
-            return parse_response(proc.stdout, _elapsed=elapsed)
+            result = parse_response(proc.stdout, _elapsed=elapsed)
+            # Log stderr and empty responses for debugging
+            if proc.stderr.strip():
+                log.warning("claude stderr: %s", proc.stderr.strip()[:500])
+            if result.get("cost", 0) == 0 and result.get("finish_reason") != "error":
+                log.warning("zero-cost response (possible auth/CLI issue): content=%s",
+                           str(result.get("content", ""))[:300])
+            return result
 
         except subprocess.TimeoutExpired:
             elapsed = time.monotonic() - start
