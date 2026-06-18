@@ -130,6 +130,7 @@ If verdict is REQUEST_CHANGES, explain what needs to change.
 import adapters
 
 FALLBACK_MODEL = "deepseek-pro"
+PHASE_BUDGET = {"investigate": 1.50, "implement": 2.50, "review": 0.50}
 
 _RATE_LIMIT_INDICATORS = ("429", "rate limit", "quota", "exhausted", "too many requests")
 
@@ -279,8 +280,10 @@ def run_pipeline(
     wt = workspace.create_workspace(repo_path, branch)
     spent = 0.0
 
+    current_phase = "init"
     try:
         # ---- Phase 1: Investigate ----
+        current_phase = "investigate"
         log.info("[investigate] starting (max_turns=25, model=%s)", model)
         pid = _start_phase(conn, "investigate")
         prompt = INVESTIGATE_PROMPT.format(
@@ -293,9 +296,19 @@ def run_pipeline(
                       failed=(resp.get("finish_reason") == "error"))
         _guard(spent, budget)
 
+        phase_cost = resp["cost"]
+        if phase_cost > PHASE_BUDGET["investigate"]:
+            log.warning("[investigate] phase cost $%.2f exceeded cap $%.2f", phase_cost, PHASE_BUDGET["investigate"])
+
         investigation_report = _content(resp)
         log.info("[investigate] done (%.1fs, $%.4f, %d chars)",
                  resp["duration_s"], resp["cost"], len(investigation_report))
+
+        log.info("[investigate] report quality: %d chars, %d sections found",
+                 len(investigation_report),
+                 investigation_report.count("**"))
+        if len(investigation_report) < 500:
+            log.warning("[investigate] thin report (%d chars) — implement phase may re-investigate", len(investigation_report))
 
         if resp.get("finish_reason") == "error" and len(investigation_report) < 200:
             raise RuntimeError(f"Investigate phase failed: {investigation_report[:500]}")
@@ -304,6 +317,7 @@ def run_pipeline(
                         resp.get("finish_reason"), len(investigation_report))
 
         # ---- Phase 2: Implement ----
+        current_phase = "implement"
         log.info("[implement] starting (max_turns=30, model=%s)", model)
         pid = _start_phase(conn, "implement")
         prompt = IMPLEMENT_PROMPT.format(
@@ -314,6 +328,9 @@ def run_pipeline(
         resp = _call_with_fallback(prompt, model=model, cwd=wt, max_turns=30)
         resp["_prompt"] = prompt
         spent += resp["cost"]
+        phase_cost = resp["cost"]
+        if phase_cost > PHASE_BUDGET["implement"]:
+            log.warning("[implement] phase cost $%.2f exceeded cap $%.2f", phase_cost, PHASE_BUDGET["implement"])
         _finish_phase(conn, pid, resp,
                       failed=(resp.get("finish_reason") == "error"))
         _guard(spent, budget)
@@ -346,6 +363,7 @@ def run_pipeline(
             )
 
         # ---- Phase 3: Review + PR ----
+        current_phase = "review"
         diff = workspace.get_diff(wt)[:50_000]
         log.info("[review] starting (max_turns=5, model=%s)", model)
         pid = _start_phase(conn, "review")
@@ -357,6 +375,9 @@ def run_pipeline(
         resp = _call_with_fallback(prompt, model=model, cwd=wt, max_turns=5)
         resp["_prompt"] = prompt
         spent += resp["cost"]
+        phase_cost = resp["cost"]
+        if phase_cost > PHASE_BUDGET["review"]:
+            log.warning("[review] phase cost $%.2f exceeded cap $%.2f", phase_cost, PHASE_BUDGET["review"])
         _finish_phase(conn, pid, resp,
                       failed=(resp.get("finish_reason") == "error"))
 
@@ -383,11 +404,16 @@ def run_pipeline(
         return {"status": "error", "error": str(e), "spent_usd": spent, "run_id": run_id}
 
     except Exception as e:
-        log.exception("pipeline failed")
+        log.exception("pipeline failed during phase '%s' (spent $%.2f so far)", current_phase, spent)
+        error_detail = f"[{current_phase}] {e} (spent ${spent:.2f})"
         storage.finish_run(conn, "error", total_cost=spent)
-        storage.log_event(conn, "pipeline_error", {"error": str(e)})
-        _post_failure(repo, issue_number, str(e))
-        return {"status": "error", "error": str(e), "spent_usd": spent, "run_id": run_id}
+        storage.log_event(conn, "pipeline_error", {
+            "error": str(e),
+            "phase": current_phase,
+            "spent_usd": spent,
+        })
+        _post_failure(repo, issue_number, error_detail)
+        return {"status": "error", "error": error_detail, "spent_usd": spent, "run_id": run_id}
 
     finally:
         # Do NOT clean up the worktree -- just log its location
