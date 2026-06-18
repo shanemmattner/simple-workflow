@@ -1,8 +1,8 @@
-"""CLI entry point for the github_claude engine.
+"""CLI entry point for the github_openhands engine.
 
 Usage:
-    python -m engines.github_claude owner/repo#123
-    python -m engines.github_claude owner/repo#123 --budget 2.00 --model opus
+    python -m engines.github_openhands owner/repo#123
+    python -m engines.github_openhands owner/repo#123 --budget 2.00 --model deepseek/deepseek-v4-flash
 """
 from __future__ import annotations
 
@@ -13,20 +13,18 @@ from pathlib import Path
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        prog="engines.github_claude",
-        description="GitHub issue -> tested PR pipeline (Claude engine)",
+        prog="engines.github_openhands",
+        description="GitHub issue -> tested PR pipeline (OpenHands engine)",
     )
     parser.add_argument("issue", help="Issue ref: owner/repo#NNN")
     parser.add_argument("--budget", type=float, default=1.00,
                         help="Max spend in USD (default: 1.00)")
-    parser.add_argument("--model", default="sonnet",
-                        help="Default model (default: sonnet)")
+    parser.add_argument("--model", default="openrouter/deepseek/deepseek-v4-flash",
+                        help="Default model (default: openrouter/deepseek/deepseek-v4-flash)")
     parser.add_argument("--repo-path", default=None,
                         help="Local filesystem path to the repo (default: cwd)")
     parser.add_argument("--workflow", default=None,
                         help="Path to workflow dir (default: workflows/issue-to-pr)")
-    parser.add_argument("--resume", default=None,
-                        help="Resume from a prior run DB path or run ID")
     args = parser.parse_args()
 
     # Parse repo#issue format
@@ -46,9 +44,9 @@ def main() -> None:
     workflow_dir = Path(args.workflow) if args.workflow else None
 
     # Import here to avoid top-level side effects
-    from engines.github_claude.orchestrator import run_pipeline
+    from engines.github_openhands.orchestrator import run_pipeline
 
-    print(f"github_claude: {owner}/{repo}#{issue_number}")
+    print(f"github_openhands: {owner}/{repo}#{issue_number}")
     print(f"  budget: ${args.budget:.2f}  model: {args.model}")
 
     result = run_pipeline(
@@ -56,7 +54,6 @@ def main() -> None:
         budget=args.budget,
         model_override=args.model,
         repo_path=args.repo_path,
-        resume_from=args.resume,
     )
 
     print(f"\n{'=' * 60}")

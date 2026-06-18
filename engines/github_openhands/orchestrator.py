@@ -1,14 +1,14 @@
-"""Central sequencer for the github_claude engine.
+"""Central sequencer for the github_openhands engine.
 
 Wires source -> storage -> workspace -> runtime -> destination.
 Reads workflow.yaml for phase config (models, max_turns).
 
 Usage:
-    python -m engines.github_claude.orchestrator owner/repo 123 [--budget 2.00] [--model opus]
+    python -m engines.github_openhands.orchestrator owner/repo 123 [--budget 2.00] [--model deepseek/deepseek-v4-flash]
 """
 from __future__ import annotations
 
-import argparse, glob, json, logging, os, sqlite3, subprocess, sys
+import argparse, json, logging, os, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_EXCEPTION
 from pathlib import Path
 from typing import Any
@@ -87,25 +87,53 @@ def _content(resp: dict) -> str:
     return resp["content"] if isinstance(resp["content"], str) else json.dumps(resp["content"])
 
 def _extract_json(prose: str, schema_hint: str, cwd: str) -> dict:
-    """Make a dedicated extraction call to pull structured data from prose."""
-    prompt = f"""Extract structured data from the following text. Return ONLY valid JSON matching this schema (no markdown fences, no explanation):
-{schema_hint}
+    """Direct LLM call to extract structured data from prose. No agent needed."""
+    from openhands.sdk import LLM
+    from openhands.sdk.llm import Message, TextContent
 
-Text to extract from:
-{prose}"""
-    resp = runtime.call_agent(prompt, model="haiku", cwd=cwd, max_turns=1)
-    raw = _content(resp)
+    api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("LLM_API_KEY", "")
+    base_url = os.environ.get("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
+
+    llm = LLM(
+        model="deepseek/deepseek-v4-flash",
+        api_key=api_key,
+        base_url=base_url,
+    )
+
+    prompt = (
+        "Extract structured data from the following text. "
+        "Return ONLY valid JSON matching this schema (no markdown fences, no explanation):\n"
+        f"{schema_hint}\n\n"
+        f"Text to extract from:\n{prose}"
+    )
+
+    response = llm.completion(
+        messages=[Message(role="user", content=[TextContent(text=prompt)])],
+    )
+    # response.message is a Message; join all TextContent pieces
+    raw = "".join(
+        c.text for c in response.message.content if hasattr(c, "text")
+    )
+
     # Strip markdown fences if present
     if raw.strip().startswith("```"):
         raw = raw.strip().split("\n", 1)[1].rsplit("```", 1)[0]
-    return json.loads(raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # Try to find JSON object in the text
+        start = raw.find('{')
+        end = raw.rfind('}')
+        if start != -1 and end != -1:
+            return json.loads(raw[start:end + 1])
+        raise
 
 def _start_phase(conn, name):
     """Create a phase record at the START of execution. Returns phase_id."""
     return storage.log_phase(conn, name)
 
 def _log_phase_messages(conn, phase_id, resp):
-    """Log the prompt/response pair as user + assistant messages for this phase."""
+    """Log the prompt/response pair as user + assistant messages, plus tool calls."""
     if not resp:
         return
     prompt = resp.get("_prompt", "")
@@ -122,6 +150,15 @@ def _log_phase_messages(conn, phase_id, resp):
             tokens_out=resp.get("tokens_out", 0),
             cost=resp.get("cost", 0),
         )
+        # Log tool calls extracted from the OpenHands conversation events
+        for tc in resp.get("_tool_calls", []):
+            storage.log_tool_call(
+                conn, msg_id, phase_id,
+                tool_name=tc.get("tool_name", "unknown"),
+                tool_input=tc.get("tool_input", ""),
+                tool_result=tc.get("tool_result", ""),
+                duration_ms=tc.get("duration_ms", 0),
+            )
 
 def _finish_phase(conn, phase_id, resp, failed=False):
     """Update the phase record AFTER execution completes. Also logs messages."""
@@ -157,69 +194,6 @@ def _run_gates(conn, phase_name: str, output: dict, **gate_kw) -> None:
                 f"gate {r['gate']} failed for {phase_name}: {r['reason']}"
             )
 
-def _resolve_resume_db(resume_ref: str) -> str:
-    """Resolve a --resume value to a DB path.
-
-    Accepts either a full path or a substring that matches a single .db file
-    in the runs/ directory.
-    """
-    if os.path.isfile(resume_ref):
-        return resume_ref
-    runs_dir = Path(__file__).parent / "runs"
-    matches = sorted(glob.glob(str(runs_dir / f"*{resume_ref}*.db")))
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) == 0:
-        raise FileNotFoundError(f"No run DB found matching '{resume_ref}'")
-    raise ValueError(
-        f"Ambiguous resume ref '{resume_ref}' — matches {len(matches)} DBs: "
-        + ", ".join(os.path.basename(m) for m in matches[:5])
-    )
-
-
-def load_resume_state(db_path: str) -> dict:
-    """Load completed phases and outputs from a prior run DB."""
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-
-    # Get completed phases
-    phases = conn.execute(
-        "SELECT phase_name, status FROM phase WHERE status = 'completed' ORDER BY id"
-    ).fetchall()
-
-    # Get assistant messages (phase outputs) for completed phases
-    prior: dict[str, str] = {}
-    for p in phases:
-        msg = conn.execute(
-            "SELECT m.content FROM message m "
-            "JOIN phase ph ON m.phase_id = ph.id "
-            "WHERE ph.phase_name = ? AND m.role = 'assistant' "
-            "ORDER BY m.id DESC LIMIT 1",
-            (p['phase_name'],)
-        ).fetchone()
-        if msg:
-            prior[p['phase_name']] = msg['content']
-
-    # Get run metadata
-    run = conn.execute("SELECT * FROM run LIMIT 1").fetchone()
-    branch = run['branch'] if run and 'branch' in run.keys() else None
-
-    # Sum cost from completed phases
-    cost_row = conn.execute(
-        "SELECT COALESCE(SUM(cost), 0) as total FROM phase WHERE status = 'completed'"
-    ).fetchone()
-    spent = cost_row['total'] if cost_row else 0.0
-
-    conn.close()
-    return {
-        'completed_phases': {p['phase_name'] for p in phases},
-        'prior': prior,
-        'branch': branch,
-        'spent': spent,
-        'db_path': db_path,
-    }
-
-
 def _post_failure(repo: str, num: int, err: str):
     try: source.post_comment(repo, num, f"Pipeline failed.\n\n```\n{err[:2000]}\n```")
     except Exception: log.warning("failed to post failure comment on %s#%d", repo, num)
@@ -227,8 +201,7 @@ def _post_failure(repo: str, num: int, err: str):
 
 def run_pipeline(repo: str, issue_number: int, *,
                  budget: float = 1.00, model_override: str | None = None,
-                 repo_path: str | None = None,
-                 resume_from: str | None = None) -> dict:
+                 repo_path: str | None = None) -> dict:
     wf = _load_workflow()
     budget = budget or wf.get("budget", {}).get("max_per_run_usd", 1.00)
     max_par = wf.get("max_parallel_workers", 5)
@@ -237,16 +210,6 @@ def run_pipeline(repo: str, issue_number: int, *,
     issue = source.fetch_issue(repo, issue_number)
     issue_body = f"# {issue['title']}\n\n{issue['body']}"
 
-    # -- Resume state --
-    resume_state: dict | None = None
-    completed_phases: set[str] = set()
-    if resume_from:
-        resume_db = _resolve_resume_db(resume_from)
-        resume_state = load_resume_state(resume_db)
-        completed_phases = resume_state['completed_phases']
-        log.info("resuming from %s — %d phases completed: %s",
-                 resume_db, len(completed_phases), ", ".join(sorted(completed_phases)))
-
     db_path, conn = storage.create_run_db(repo, issue_number, model=model_override)
     run_id = db_path.stem if hasattr(db_path, 'stem') else str(db_path)
     prior_review = ""
@@ -254,18 +217,13 @@ def run_pipeline(repo: str, issue_number: int, *,
         if r.get("review_summary"):
             prior_review = r["review_summary"]
 
-    branch = resume_state['branch'] if resume_state and resume_state.get('branch') else f"sw/issue-{issue_number}"
-    if resume_state:
-        wt = workspace.reuse_or_create_workspace(repo_path or os.getcwd(), branch)
-    else:
-        wt = workspace.create_workspace(repo_path or os.getcwd(), branch)
+    branch = f"sw/issue-{issue_number}"
+    wt = workspace.create_workspace(repo_path or os.getcwd(), branch)
     repo_context = _load_repo_context(wt)
     if repo_context:
         log.info("loaded .workflows/ context (%d chars)", len(repo_context))
     prior: dict[str, Any] = {}
-    if resume_state:
-        prior.update(resume_state['prior'])
-    spent = resume_state['spent'] if resume_state else 0.0
+    spent = 0.0
     kw = dict(cwd=wt, issue_number=issue_number, issue_body=issue_body,
               model_ov=model_override, repo_context=repo_context)
 
@@ -275,14 +233,18 @@ def run_pipeline(repo: str, issue_number: int, *,
         resp = _call("triage", pcfg.get("triage", {}), prior=prior, prior_review=prior_review, **kw)
         _finish_phase(conn, pid, resp); spent += resp["cost"]; _guard(spent, budget)
         triage_text = _content(resp)
+        log.info("triage_text length: %d, first 500 chars: %s", len(triage_text), triage_text[:500])
         prior["triage"] = triage_text
 
         triage = _extract_json(triage_text, (
             '{"tasks": [{"id": 1, "title": "...", "target_files": [...], "depends_on": []}], '
             '"proof_type": "test_passes", "escalate": false}'
         ), cwd=wt)
+        log.info("extracted triage: %s", json.dumps(triage, indent=2)[:500])
         _run_gates(conn, "triage", triage, worktree_path=wt)
         tasks = triage.get("tasks", [])
+        if not tasks:
+            raise RuntimeError(f"Triage returned 0 tasks. triage_text length={len(triage_text)}, extracted={json.dumps(triage)[:500]}")
 
         # -- Verify (check claims against codebase) --
         pid = _start_phase(conn, "verify")
@@ -357,9 +319,7 @@ def run_pipeline(repo: str, issue_number: int, *,
         # -- Wave Planner (prose -> extract wave assignments) --
         pid = _start_phase(conn, "wave-planner")
         resp = _call("wave-planner", pcfg.get("wave-planner", {}), prior=prior, **kw)
-        _finish_phase(conn, pid, resp); spent += resp["cost"]
-        if spent > budget:
-            log.warning("budget exceeded after wave-planner ($%.2f > $%.2f) — continuing to execute", spent, budget)
+        _finish_phase(conn, pid, resp); spent += resp["cost"]; _guard(spent, budget)
         wave_text = _content(resp)
         prior["wave_plan"] = wave_text
 
@@ -395,8 +355,7 @@ def run_pipeline(repo: str, issue_number: int, *,
                     spent += resp["cost"]
                     exec_text = _content(resp)
                     exec_results.append({"task_id": tid, "response": exec_text})
-            if spent > budget:
-                log.warning("budget exceeded after execute wave %d ($%.2f > $%.2f) — continuing to PR", wi, spent, budget)
+            _guard(spent, budget)
         prior["execute"] = exec_results
 
         # -- Safety-net commit: catch changes the execute agent failed to commit --
@@ -490,26 +449,12 @@ def run_pipeline(repo: str, issue_number: int, *,
         _post_failure(repo, issue_number, str(e))
         return {"status": "error", "error": str(e), "spent_usd": spent, "run_id": run_id}
     finally:
-        # Don't destroy branches that have commits — that's recoverable work
-        has_commits = False
-        try:
-            result = subprocess.run(
-                ["git", "log", "origin/main..HEAD", "--oneline"],
-                cwd=wt, capture_output=True, text=True,
-            )
-            has_commits = bool(result.stdout.strip())
-        except Exception:
-            pass
-
-        if has_commits:
-            log.warning("keeping worktree %s — branch has commits", wt)
-        else:
-            workspace.cleanup_workspace(wt)
+        workspace.cleanup_workspace(wt)
         conn.close()
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="github_claude: issue -> PR pipeline")
+    ap = argparse.ArgumentParser(description="github_openhands: issue -> PR pipeline")
     ap.add_argument("repo", help="owner/repo")
     ap.add_argument("issue", type=int, help="Issue number")
     ap.add_argument("--budget", type=float, default=1.00, help="Max spend USD")
@@ -518,7 +463,7 @@ def main() -> None:
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    print(f"github_claude: {args.repo}#{args.issue}  budget=${args.budget:.2f}")
+    print(f"github_openhands: {args.repo}#{args.issue}  budget=${args.budget:.2f}")
     result = run_pipeline(args.repo, args.issue, budget=args.budget,
                           model_override=args.model, repo_path=args.repo_path)
 
