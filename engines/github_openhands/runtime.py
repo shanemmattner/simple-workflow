@@ -1,7 +1,7 @@
 """OpenHands SDK runtime — uses openhands-sdk with LiteLLM for model calls.
 
 Default model: DeepSeek V4 Flash via OpenRouter.
-Auth: OPENROUTER_API_KEY env var (passed as LLM api_key).
+Auth: resolved by the adapters layer (env vars per provider).
 No Docker — local workspace mode only.
 
 Requirements:
@@ -21,35 +21,10 @@ log = logging.getLogger(__name__)
 # Defaults
 # ---------------------------------------------------------------------------
 
-_DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
-_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-
 _DEFAULT_SYSTEM_PROMPT = (
     "You are a coding agent. Focus on the task in your prompt. "
     "Do not delegate work."
 )
-
-# ---------------------------------------------------------------------------
-# Model name mapping
-# ---------------------------------------------------------------------------
-
-# The orchestrator passes short model names like "sonnet", "haiku", "opus".
-# Map these to OpenRouter model strings.  Pass anything else through as-is
-# (the caller may already supply a fully-qualified LiteLLM model string).
-_MODEL_MAP: dict[str, str] = {
-    "sonnet": "anthropic/claude-sonnet-4-6",
-    "haiku": "anthropic/claude-haiku-4-5",
-    "opus": "anthropic/claude-opus-4-6",
-    # DeepSeek shortcuts
-    "deepseek": _DEFAULT_MODEL,
-    "deepseek-flash": _DEFAULT_MODEL,
-    "deepseek-pro": "deepseek/deepseek-v4-pro",
-}
-
-
-def _resolve_model(model: str) -> str:
-    """Map short names to fully-qualified OpenRouter model strings."""
-    return _MODEL_MAP.get(model, model)
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +39,8 @@ def call_agent(
     max_turns: int = 30,
     timeout: int | None = None,
     system_prompt: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
 ) -> dict:
     """Run an OpenHands agent and return a parsed response dict.
 
@@ -73,22 +50,34 @@ def call_agent(
         tokens_out    - output tokens
         cost          - total cost in USD (float)
         duration_s    - wall-clock seconds
-        finish_reason - "end_turn" | "timeout" | "error"
+        finish_reason - "end_turn" | "timeout" | "error" | "max_iterations"
 
     Never raises — returns a dict with finish_reason="error" on failures.
     """
-    resolved_model = _resolve_model(model)
+    # Resolve model via adapter layer when caller didn't supply explicit config
+    if not api_key or not base_url:
+        try:
+            import adapters
+            config = adapters.get_config(model)
+            api_key = api_key or config["api_key"]
+            base_url = base_url or config["base_url"]
+            model = config["model"]
+        except Exception:
+            pass  # fall through to env-var defaults in _run_openhands
+
     start = time.monotonic()
 
     try:
         return _run_openhands(
             prompt,
-            model=resolved_model,
+            model=model,
             cwd=cwd,
             max_turns=max_turns,
             timeout=timeout,
             system_prompt=system_prompt or _DEFAULT_SYSTEM_PROMPT,
             start=start,
+            api_key=api_key,
+            base_url=base_url,
         )
     except Exception as exc:
         elapsed = time.monotonic() - start
@@ -105,6 +94,8 @@ def _run_openhands(
     timeout: int | None,
     system_prompt: str,
     start: float,
+    api_key: str | None = None,
+    base_url: str | None = None,
 ) -> dict:
     """Core OpenHands SDK execution.  Separated for clean error handling."""
 
@@ -123,18 +114,26 @@ def _run_openhands(
         )
 
     # --- Resolve API key ---
-    api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("LLM_API_KEY")
+    # Prefer explicitly passed api_key (typically from adapter); fall back to env vars.
+    if not api_key:
+        api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("LLM_API_KEY")
     if not api_key:
         elapsed = time.monotonic() - start
         return _error_response(
-            "No API key: set OPENROUTER_API_KEY or LLM_API_KEY env var",
+            "No API key: set OPENROUTER_API_KEY or LLM_API_KEY env var, "
+            "or use the adapters layer",
             elapsed,
         )
 
     # --- Determine base_url ---
-    # All models route through OpenRouter — set base_url unconditionally.
-    custom_base = os.environ.get("LLM_BASE_URL")
-    base_url = custom_base or os.environ.get("OPENROUTER_API_BASE", _OPENROUTER_BASE_URL)
+    # Prefer explicitly passed base_url (typically from adapter); fall back to env vars.
+    if not base_url:
+        custom_base = os.environ.get("LLM_BASE_URL")
+        base_url = custom_base or os.environ.get(
+            "OPENROUTER_API_BASE", "https://openrouter.ai/api/v1"
+        )
+    else:
+        custom_base = base_url
 
     # When LLM_BASE_URL is set (e.g. local Claude subscription proxy at
     # localhost:8420), the `anthropic/` prefix causes LiteLLM to bypass the
@@ -197,8 +196,10 @@ def _extract_response(conversation, llm, elapsed: float) -> dict:
         status = conversation.state.execution_status
         # ConversationExecutionStatus enum: FINISHED, ERROR, STUCK, IDLE, etc.
         status_name = status.name if hasattr(status, "name") else str(status)
-        if status_name in ("ERROR", "STUCK"):
+        if status_name == "ERROR":
             finish_reason = "error"
+        elif status_name == "STUCK":
+            finish_reason = "max_iterations"
         # FINISHED and IDLE both map to end_turn (success)
     except Exception:
         pass  # fall through to end_turn default
