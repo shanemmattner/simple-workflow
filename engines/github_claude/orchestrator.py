@@ -40,7 +40,20 @@ def _render(template: str, issue_number: int, issue_body: str,
     return out
 
 def _call(phase: str, cfg: dict, *, cwd: str, issue_number: int, issue_body: str,
-          prior: dict, prior_review: str = "", model_ov: str | None = None) -> dict:
+          prior: dict, prior_review: str = "", model_ov: str | None = None,
+          dry_run: bool = False) -> dict:
+    if dry_run:
+        model = model_ov or cfg.get("model", "sonnet")
+        log.info("[DRY-RUN] %s would use model=%s max_turns=%d",
+                 phase, model, cfg.get("max_turns", 10))
+        return {
+            "content": "<dry-run - no actual LLM response>",
+            "tokens_in": 0,
+            "tokens_out": 0,
+            "cost": 0.0,
+            "duration_s": 0.0,
+            "finish_reason": "dry_run"
+        }
     prompt = _render(_load_prompt(phase), issue_number, issue_body, prior, prior_review)
     model = model_ov or cfg.get("model", "sonnet")
     log.info("[%s] model=%s max_turns=%d", phase, model, cfg.get("max_turns", 10))
@@ -110,7 +123,7 @@ def _post_failure(repo: str, num: int, err: str):
 
 def run_pipeline(repo: str, issue_number: int, *,
                  budget: float = 1.00, model_override: str | None = None,
-                 repo_path: str | None = None) -> dict:
+                 repo_path: str | None = None, dry_run: bool = False) -> dict:
     wf = _load_workflow()
     budget = budget or wf.get("budget", {}).get("max_per_run_usd", 1.00)
     max_par = wf.get("max_parallel_workers", 5)
@@ -130,7 +143,7 @@ def run_pipeline(repo: str, issue_number: int, *,
     wt = workspace.create_workspace(repo_path or os.getcwd(), branch)
     prior: dict[str, Any] = {}
     spent = 0.0
-    kw = dict(cwd=wt, issue_number=issue_number, issue_body=issue_body, model_ov=model_override)
+    kw = dict(cwd=wt, issue_number=issue_number, issue_body=issue_body, model_ov=model_override, dry_run=dry_run)
 
     try:
         # -- Triage (prose -> extract task list) --
