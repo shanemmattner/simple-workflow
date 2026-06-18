@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from . import source, runtime, storage, workspace, destination, gates
+from . import source, runtime, storage, workspace, destination, gates, fix
 
 log = logging.getLogger(__name__)
 WORKFLOW_DIR = Path(__file__).resolve().parent.parent.parent / "workflows" / "issue-to-pr"
@@ -213,13 +213,105 @@ def run_pipeline(repo: str, issue_number: int, *,
             _guard(spent, budget)
         prior["execute"] = exec_results
 
-        # -- Review (prose pass-through) --
-        diff = workspace.get_diff(wt)[:50_000]
-        pid = _start_phase(conn, "review")
-        resp = _call("review", pcfg.get("review", {}),
-                      prior={**prior, "_combined_diff": diff}, **kw)
-        _finish_phase(conn, pid, resp); spent += resp["cost"]
-        prior["review"] = _content(resp)
+        # -- Quick-check gate (pre-review) --
+        # If test-plan produced a test_command, run it before burning $ on review
+        test_command = ""
+        for tid, tp_text in tp_r.items():
+            try:
+                tp_data = _extract_json(tp_text, '{"test_command": "...", "test_file": "..."}', cwd=wt)
+                if tp_data.get("test_command"):
+                    test_command = tp_data["test_command"]
+                    break
+            except Exception:
+                pass
+
+        if test_command:
+            qc = gates.run_green_gate(test_command, wt)
+            storage.log_event(conn, "quick_check", {"passed": qc["passed"], "reason": qc["reason"]})
+            if not qc["passed"]:
+                log.warning("[quick-check] tests failing before review: %s", qc["reason"])
+                # Continue to review anyway — review will see the failures
+
+        # -- Review-Fix Loop (max 2 iterations: initial review + 1 fix round) --
+        review_passed = False
+        for review_iter in range(2):
+            is_re_review = review_iter > 0
+
+            diff = workspace.get_diff(wt)[:50_000]
+            if is_re_review:
+                # Re-review: focused prompt with original findings
+                pid = _start_phase(conn, "re-review")
+                # Build prior with findings for the re-review prompt template
+                re_review_prior = json.dumps(fix_result["fixable"], indent=2, default=str)
+                prompt = _render(
+                    _load_prompt("re-review"), issue_number, issue_body,
+                    {"_findings": re_review_prior, "_combined_diff": diff},
+                )
+                resp = runtime.call_agent(
+                    prompt, model=pcfg.get("review", {}).get("model", "sonnet"),
+                    cwd=wt, max_turns=pcfg.get("review", {}).get("max_turns", 10),
+                )
+                _finish_phase(conn, pid, resp); spent += resp["cost"]
+                log.info("[re-review] %.1fs $%.4f", resp["duration_s"], resp["cost"])
+            else:
+                # Initial review (existing logic)
+                pid = _start_phase(conn, "review")
+                resp = _call("review", pcfg.get("review", {}),
+                              prior={**prior, "_combined_diff": diff}, **kw)
+                _finish_phase(conn, pid, resp); spent += resp["cost"]
+
+            review_text = _content(resp)
+            prior["review"] = review_text
+            _guard(spent, budget)
+
+            # Determine verdict from review prose
+            verdict = "unknown"
+            lower = review_text.lower()
+            if "verdict: pass" in lower or "verdict: approve" in lower:
+                verdict = "pass"
+            elif "verdict: fail" in lower:
+                verdict = "fail"
+            elif "verdict: warn" in lower:
+                verdict = "warn"
+
+            if verdict in ("pass", "warn"):
+                review_passed = True
+                break
+
+            if is_re_review:
+                # Second review failed — stop
+                log.error("[re-review] FAIL after fix round — stopping")
+                break
+
+            # First review failed — attempt fix
+            log.info("[review] FAIL — attempting fix phase")
+            pid = _start_phase(conn, "fix")
+            fix_result = fix.run_fix(
+                review_text, cwd=wt, branch=branch,
+                model=pcfg.get("execute", {}).get("model", "sonnet"),
+                max_turns=pcfg.get("execute", {}).get("max_turns", 15),
+            )
+            _finish_phase(conn, pid, fix_result.get("response"), failed=fix_result["response"] is None)
+            spent += fix_result["cost"]
+            _guard(spent, budget)
+
+            if not fix_result["fixable"]:
+                # No fixable findings (only info-level) — stop
+                log.warning("[fix] no P0/P1 findings to fix — stopping")
+                break
+
+            # Run quick-check after fix
+            if test_command:
+                qc = gates.run_green_gate(test_command, wt)
+                storage.log_event(conn, "post_fix_quick_check", {
+                    "passed": qc["passed"], "reason": qc["reason"],
+                })
+            # Loop continues → re-review
+
+        if not review_passed:
+            storage.finish_run(conn, "review_failed", total_cost=spent, branch=branch)
+            _post_failure(repo, issue_number, "Review failed after fix attempt")
+            return {"status": "review_failed", "spent_usd": spent, "run_id": run_id}
 
         # -- Push + PR --
         destination.push_branch(wt, branch)
