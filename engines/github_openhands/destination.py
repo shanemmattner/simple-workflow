@@ -43,7 +43,7 @@ def push_branch(workspace_path: str, branch: str) -> None:
         raise BranchNotFound(f"branch {branch!r} not found in {workspace_path}")
 
     result = subprocess.run(
-        ["git", "push", "-u", "origin", branch],
+        ["git", "push", "--force-with-lease", "-u", "origin", branch],
         capture_output=True, text=True, cwd=workspace_path, timeout=60,
     )
     if result.returncode != 0:
