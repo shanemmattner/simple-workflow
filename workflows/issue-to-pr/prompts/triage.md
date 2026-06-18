@@ -14,7 +14,7 @@ Your output is the foundation. Every downstream phase trusts your file paths and
 ## Inputs available to you
 
 - The **issue** (below) -- body and comments, including requirements, file paths, function names, error messages
-- The **repo context** (above, injected by the orchestrator) -- file tree, architecture notes, module descriptions
+- The **repo context** (below, injected by the orchestrator from `.workflows/`) -- architecture notes, testing conventions, domain knowledge
 - **Prior run context** (if present below) -- this run may be a continuation of a previous attempt that failed or was incomplete. If prior run context is provided, account for what was already done or what went wrong.
 
 You have full tool access. You can read files, run commands, and explore the codebase to verify your findings. Use this to confirm file paths exist and understand code structure. Read the GitHub issue directly (using `gh issue view`) to get the full context including all comments and discussion.
@@ -118,6 +118,10 @@ Escalation: not needed
 2. Issue is ambiguous -- pick the most likely interpretation, note the assumption in description
 3. More than 5 tasks needed -- set `escalate: true` with reason
 4. Issue requires domain knowledge you lack -- proceed with best guess, note it in description
+
+## Repo context
+
+{repo_context}
 
 ## Issue to triage
 
