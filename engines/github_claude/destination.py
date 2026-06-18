@@ -28,12 +28,18 @@ class BranchNotFound(RuntimeError):
     pass
 
 
-def push_branch(workspace_path: str, branch: str) -> None:
+def push_branch(workspace_path: str, branch: str, dry_run: bool = False) -> None:
     """Push *branch* to origin from the given workspace (worktree) path.
 
     Raises PushFailed on auth/network errors, BranchNotFound if the
     branch doesn't exist locally.
+
+    When dry_run=True, prints what would happen without executing git push.
     """
+    if dry_run:
+        log.info("[dry-run] Would push branch %s from %s", branch, workspace_path)
+        return
+
     # Verify the branch exists locally
     check = subprocess.run(
         ["git", "rev-parse", "--verify", branch],
