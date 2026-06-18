@@ -323,6 +323,8 @@ def call_agent(
 
     total_in = 0
     total_out = 0
+    has_edited = False
+    tool_stats = {"run_command": 0, "read_file": 0, "write_file": 0, "edit_file": 0}
 
     budget_warnings_sent: set[str] = set()
 
@@ -353,15 +355,39 @@ def call_agent(
                     ),
                 })
 
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=TOOLS,
-                tool_choice="auto",
-                temperature=0.7,
-                stream=False,
-                parallel_tool_calls=False,
-            )
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    tools=TOOLS,
+                    tool_choice="auto",
+                    temperature=0.7,
+                    stream=False,
+                    parallel_tool_calls=False,
+                )
+            except Exception as e:
+                error_str = str(e).lower()
+                if any(x in error_str for x in ("429", "rate limit", "timeout", "502", "503")):
+                    log.warning("transient error on turn %d, retrying once: %s", turn + 1, e)
+                    time.sleep(5)
+                    try:
+                        response = client.chat.completions.create(
+                            model=model,
+                            messages=messages,
+                            tools=TOOLS,
+                            tool_choice="auto",
+                            temperature=0.7,
+                            stream=False,
+                            parallel_tool_calls=False,
+                        )
+                    except Exception as e2:
+                        log.error("retry failed: %s", e2)
+                        return _error_response(
+                            f"API call failed after retry: {e2}",
+                            time.monotonic() - start,
+                        )
+                else:
+                    raise
 
             # Track tokens
             if response.usage:
@@ -393,6 +419,7 @@ def call_agent(
                     "cost": cost,
                     "duration_s": elapsed,
                     "finish_reason": "end_turn",
+                    "tool_stats": tool_stats,
                 }
 
             # Execute tool calls
@@ -403,11 +430,32 @@ def call_agent(
 
                 result = _execute_tool(func_name, func_args, cwd)
 
+                # Track tool call stats
+                if func_name in tool_stats:
+                    tool_stats[func_name] += 1
+
+                # Track whether agent has made any file modifications
+                if func_name in ("edit_file", "write_file") and result.startswith("OK"):
+                    has_edited = True
+
                 # Append tool result as plain string
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
                     "content": result,
+                })
+
+            # Execute checkpoint gate: nudge if no edits after every 5 turns
+            turn_num = turn + 1  # 1-based
+            if turn_num in (5, 10, 15, 20) and not has_edited:
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        f"CHECKPOINT: You have used {turn_num} turns without writing "
+                        "or editing any files. If your task requires code changes, "
+                        "start making them NOW. Reading and exploring is important "
+                        "but you must act on what you've learned."
+                    ),
                 })
 
         # Max turns exceeded
@@ -427,6 +475,7 @@ def call_agent(
             "cost": cost,
             "duration_s": elapsed,
             "finish_reason": "max_iterations",
+            "tool_stats": tool_stats,
         }
 
     except Exception as e:
@@ -437,6 +486,7 @@ def call_agent(
         resp["tokens_in"] = total_in
         resp["tokens_out"] = total_out
         resp["cost"] = cost
+        resp["tool_stats"] = tool_stats
         return resp
 
 
