@@ -9,10 +9,13 @@ responsibility — gates just return verdicts.
 
 from __future__ import annotations
 
+import logging
 import re
 import shlex
 import subprocess
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +54,7 @@ def check_test_command_allowed(command: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def validate_triage(output: dict, worktree_path: str) -> dict:
-    """Check triage output: task count, target-file existence."""
+    """Check triage output: task count, target-file existence (warning only)."""
     tasks = output.get("tasks", [])
 
     if len(tasks) > 5:
@@ -69,13 +72,10 @@ def validate_triage(output: dict, worktree_path: str) -> dict:
         existing = sum(1 for f in all_files if _file_exists_fuzzy(f, wt))
         ratio = existing / len(all_files)
         if ratio < 0.5:
-            return {
-                "passed": False,
-                "reason": (
-                    f"only {existing}/{len(all_files)} target files exist "
-                    f"({ratio:.0%} < 50% threshold)"
-                ),
-            }
+            log.warning(
+                "triage file existence low: %d/%d (%.0f%%) — verify phase will check claims",
+                existing, len(all_files), ratio * 100,
+            )
 
     return {"passed": True, "reason": "triage output valid"}
 
