@@ -10,7 +10,6 @@ import json
 import logging
 import re
 import subprocess
-import tempfile
 import time
 
 log = logging.getLogger(__name__)
@@ -65,9 +64,6 @@ def call_agent(
     effective_system_prompt = (
         system_prompt if system_prompt is not None else _DEFAULT_SYSTEM_PROMPT
     )
-    # Run from a neutral temp dir to prevent target repo CLAUDE.md injection.
-    # --add-dir gives the agent access to the actual worktree for file ops.
-    neutral_cwd = tempfile.mkdtemp(prefix="sw-")
     cmd = [
         "claude",
         "-p",
@@ -75,7 +71,6 @@ def call_agent(
         "--output-format", "json",
         "--model", model,
         "--dangerously-skip-permissions",
-        "--add-dir", cwd,
         "--system-prompt", effective_system_prompt,
     ]
 
@@ -89,7 +84,7 @@ def call_agent(
                 capture_output=True,
                 text=True,
                 timeout=effective_timeout,
-                cwd=neutral_cwd,
+                cwd=cwd or None,
             )
             elapsed = time.monotonic() - start
 

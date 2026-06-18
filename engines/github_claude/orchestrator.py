@@ -259,6 +259,7 @@ def run_pipeline(repo: str, issue_number: int, *,
         wt = workspace.reuse_or_create_workspace(repo_path or os.getcwd(), branch)
     else:
         wt = workspace.create_workspace(repo_path or os.getcwd(), branch)
+    workspace.neutralize_claude_md(wt)
     repo_context = _load_repo_context(wt)
     if repo_context:
         log.info("loaded .workflows/ context (%d chars)", len(repo_context))
