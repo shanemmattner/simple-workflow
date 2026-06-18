@@ -63,6 +63,7 @@ def create_pr(
     title: str,
     body: str,
     base: str = "main",
+    dry_run: bool = False,
 ) -> dict:
     """Create a GitHub PR via ``gh pr create``.
 
@@ -70,7 +71,13 @@ def create_pr(
 
     Raises PRAlreadyExists if a PR for *branch* already exists,
     RuntimeError on other failures.
+
+    When dry_run=True, prints what would happen without executing gh pr create.
     """
+    if dry_run:
+        log.info("[dry-run] Would create PR: repo=%s branch=%s title=%s", repo, branch, title[:50])
+        return {"number": 0, "url": "dry-run"}
+
     result = subprocess.run(
         [
             "gh", "pr", "create",
