@@ -30,8 +30,11 @@ case "$ENGINE" in
     openhands)
         MODULE="engines.github_openhands.__main__"
         ;;
+    three-step)
+        MODULE="engines.three_step.__main__"
+        ;;
     *)
-        echo "Unknown engine: $ENGINE (valid: claude, openhands)" >&2
+        echo "Unknown engine: $ENGINE (valid: claude, openhands, three-step)" >&2
         exit 1
         ;;
 esac
