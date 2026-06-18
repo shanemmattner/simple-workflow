@@ -20,6 +20,37 @@ log = logging.getLogger(__name__)
 WORKFLOW_DIR = Path(__file__).resolve().parent.parent.parent / "workflows" / "issue-to-pr"
 
 
+def _load_repo_context(worktree_path: str) -> str:
+    """Read .workflows/ context files from the target repo checkout.
+
+    Returns a formatted string with context.md, testing.md, and knowledge/*.md
+    contents. Returns empty string if .workflows/ doesn't exist.
+    """
+    wf_dir = Path(worktree_path) / ".workflows"
+    if not wf_dir.is_dir():
+        return ""
+
+    sections: list[str] = []
+
+    context_file = wf_dir / "context.md"
+    if context_file.is_file():
+        sections.append(f"## Repo Context\n\n{context_file.read_text()}")
+
+    testing_file = wf_dir / "testing.md"
+    if testing_file.is_file():
+        sections.append(f"## Testing\n\n{testing_file.read_text()}")
+
+    knowledge_dir = wf_dir / "knowledge"
+    if knowledge_dir.is_dir():
+        knowledge_parts: list[str] = []
+        for md in sorted(knowledge_dir.glob("*.md")):
+            knowledge_parts.append(f"### {md.name}\n{md.read_text()}")
+        if knowledge_parts:
+            sections.append("## Domain Knowledge\n\n" + "\n\n".join(knowledge_parts))
+
+    return "\n\n".join(sections)
+
+
 def _load_workflow() -> dict:
     return yaml.safe_load((WORKFLOW_DIR / "workflow.yaml").read_text())
 
@@ -31,17 +62,19 @@ def _phase_cfg(workflow: dict) -> dict[str, dict]:
             for p in workflow.get("phases", [])}
 
 def _render(template: str, issue_number: int, issue_body: str,
-            prior: dict, prior_review: str = "") -> str:
+            prior: dict, prior_review: str = "", repo_context: str = "") -> str:
     out = template.replace("{issue_number}", str(issue_number))
     out = out.replace("{issue_body}", issue_body)
+    out = out.replace("{repo_context}", repo_context)
     out = out.replace("{prior_phases}", json.dumps(prior, indent=2, default=str) if prior else "")
     if prior_review:
         out += f"\n\n## Prior run review\n\n{prior_review}"
     return out
 
 def _call(phase: str, cfg: dict, *, cwd: str, issue_number: int, issue_body: str,
-          prior: dict, prior_review: str = "", model_ov: str | None = None) -> dict:
-    prompt = _render(_load_prompt(phase), issue_number, issue_body, prior, prior_review)
+          prior: dict, prior_review: str = "", model_ov: str | None = None,
+          repo_context: str = "") -> dict:
+    prompt = _render(_load_prompt(phase), issue_number, issue_body, prior, prior_review, repo_context)
     model = model_ov or cfg.get("model", "sonnet")
     log.info("[%s] model=%s max_turns=%d", phase, model, cfg.get("max_turns", 10))
     resp = runtime.call_agent(prompt, model=model, cwd=cwd, max_turns=cfg.get("max_turns", 10))
@@ -128,9 +161,13 @@ def run_pipeline(repo: str, issue_number: int, *,
 
     branch = f"sw/issue-{issue_number}"
     wt = workspace.create_workspace(repo_path or os.getcwd(), branch)
+    repo_context = _load_repo_context(wt)
+    if repo_context:
+        log.info("loaded .workflows/ context (%d chars)", len(repo_context))
     prior: dict[str, Any] = {}
     spent = 0.0
-    kw = dict(cwd=wt, issue_number=issue_number, issue_body=issue_body, model_ov=model_override)
+    kw = dict(cwd=wt, issue_number=issue_number, issue_body=issue_body,
+              model_ov=model_override, repo_context=repo_context)
 
     try:
         # -- Triage (prose -> extract task list) --
