@@ -21,6 +21,8 @@ def main() -> None:
                         help="Max spend in USD (default: 1.00)")
     parser.add_argument("--model", default="sonnet",
                         help="Default model (default: sonnet)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Simulate pipeline without LLM calls or git operations")
     parser.add_argument("--repo-path", default=None,
                         help="Local filesystem path to the repo (default: cwd)")
     parser.add_argument("--workflow", default=None,
@@ -48,12 +50,15 @@ def main() -> None:
 
     print(f"github_claude: {owner}/{repo}#{issue_number}")
     print(f"  budget: ${args.budget:.2f}  model: {args.model}")
+    if args.dry_run:
+        print("  DRY-RUN MODE: No LLM calls or git operations will be performed")
 
     result = run_pipeline(
         f"{owner}/{repo}", issue_number,
         budget=args.budget,
         model_override=args.model,
         repo_path=args.repo_path,
+        dry_run=args.dry_run,
     )
 
     print(f"\n{'=' * 60}")
