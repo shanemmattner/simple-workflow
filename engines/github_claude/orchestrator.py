@@ -539,21 +539,7 @@ def run_pipeline(repo: str, issue_number: int, *,
         _post_failure(repo, issue_number, str(e))
         return {"status": "error", "error": str(e), "spent_usd": spent, "run_id": run_id}
     finally:
-        # Don't destroy branches that have commits — that's recoverable work
-        has_commits = False
-        try:
-            result = subprocess.run(
-                ["git", "log", "origin/main..HEAD", "--oneline"],
-                cwd=wt, capture_output=True, text=True,
-            )
-            has_commits = bool(result.stdout.strip())
-        except Exception:
-            pass
-
-        if has_commits:
-            log.warning("keeping worktree %s — branch has commits", wt)
-        else:
-            workspace.cleanup_workspace(wt)
+        log.info("run complete — worktree preserved at %s (branch: %s)", wt, branch)
         conn.close()
 
 
