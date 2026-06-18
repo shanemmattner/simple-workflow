@@ -35,23 +35,64 @@ Your working directory is the target repository. All paths are relative to it.
 
 ## Instructions
 
-Read the issue carefully. Explore the codebase to understand what's happening.
+Investigate this issue using symptom-first tracing. Do NOT search the codebase broadly.
 
-Start from the user-facing symptom -- what component, page, or function handles \
-the action described in the issue? Trace inward from there.
+### Step 1: Identify the entry point (turns 1-3)
 
-You have a STRICT turn budget. Spend turns 1-18 exploring. By turn 19, you MUST \
-stop calling tools and write your final investigation report as a plain text message.
+Begin from the user-visible symptom described in the issue. What UI element, page, \
+or API endpoint is involved? Extract the user-facing action: "user does X on page Y, \
+then Z breaks." Find the component or handler that directly handles that action. \
+This is your starting point.
+
+Do NOT search for keywords from the issue title. Trace from the UI entry point inward.
+
+### Step 2: Trace the code path (turns 4-10)
+
+Trace the symptom through the code: component -> handler -> service -> data layer. \
+Use grep and file reads to follow the call chain.
+
+From the entry point, trace through the call chain:
+- What function handles the user action?
+- What side effects does it trigger (API calls, state updates, navigation)?
+- Where does the behavior diverge from what the user expects?
+
+Read only files on this call path. Do NOT grep the entire codebase for keywords.
+
+### Step 3: Construct a reproduction model (turns 11-13)
+
+Write a numbered sequence: "1. User does A -> 2. Code calls B -> 3. B triggers C -> \
+... -> N. Bug manifests as Z." If you cannot connect the proposed root cause to the \
+user's symptom through a concrete code path, your root cause is WRONG. Go back to step 2.
+
+### Step 4: Produce the report (turns 14-18)
+
+You have a STRICT turn budget. By turn 19, you MUST stop calling tools and write \
+your final investigation report as a plain text message.
 
 If you keep calling tools until you run out of turns, your report will be lost. \
 STOP and WRITE before the limit.
 
+If you cannot identify a clear root cause within 15 turns, state what you found \
+and what remains uncertain. Do NOT guess.
+
 Produce a structured investigation report with these sections:
 
-1. **Root Cause** -- what exactly is wrong and why
-2. **Affected Files** -- list every file that needs to change
-3. **Proposed Fix** -- for each file, show the before/after code changes
-4. **Risk Assessment** -- what could go wrong, what else might break
+1. **Symptom Chain** -- the numbered reproduction sequence from step 3
+2. **Root Cause** -- what exactly is wrong and why, citing specific file:line
+3. **Affected Files** -- ONLY files that need to change (not files you read for context)
+4. **Proposed Fix** -- for each file, show the minimal before/after code changes
+5. **Risk Assessment** -- what could go wrong, confidence level (HIGH/MEDIUM/LOW)
+6. **Related Issues** -- other issues that amplify or compound this bug (separate, not root cause)
+
+### Anti-patterns to avoid
+
+- Do NOT fixate on the first plausible-sounding pattern match. If you find something \
+that COULD cause the symptom but requires an optional feature to be active, check \
+whether the bug reproduces without that feature.
+- Do NOT grep broadly for error message keywords. Start from the UI component, not \
+from infrastructure code.
+- Do NOT propose fixes for secondary issues you discover along the way. Note them \
+under Related Issues and stay focused on the primary root cause.
 
 Be specific. Reference actual file paths, function names, and line numbers.
 Do NOT make changes -- investigation only.
@@ -60,7 +101,9 @@ Do NOT make changes -- investigation only.
 IMPLEMENT_PROMPT = """\
 You are implementing a fix for GitHub issue #{issue_number}.
 
-Your working directory is the target repository. All paths are relative to it.
+Your working directory is the target repository. All file paths are relative to \
+the repository root. Use `ls` and `find` to orient yourself in the first 2 turns \
+if needed, but do NOT spend more than 2 turns exploring.
 
 ## Issue
 
@@ -75,12 +118,21 @@ Your working directory is the target repository. All paths are relative to it.
 The investigation report above tells you what to change. Do NOT re-investigate. \
 Start editing files immediately.
 
-Spend at most 3 turns reading files to orient yourself, then start making changes.
+If the investigation report's proposed fix has specific before/after code, apply \
+those changes directly using edit_file. Do not rewrite files from scratch.
 
-1. Apply the code changes identified in the investigation
-2. Run any existing tests to verify nothing is broken
-3. If appropriate, add a test for the fix
-4. After making all changes, run `git add -A && git commit -m 'fix: resolve #{issue_number}'`
+1. Read only the files listed in "Affected Files" from the investigation report
+2. Apply the code changes identified in the investigation -- match the before/after \
+code shown in the report
+3. After making changes, verify with:
+   (a) Run any relevant test command from the repo to confirm nothing is broken
+   (b) A quick grep to confirm your changes are in place
+4. If appropriate, add a test for the fix
+5. After making all changes, run `git add -A && git commit -m 'fix: resolve #{issue_number}'`
+
+If the investigation report is wrong (a file doesn't exist, the code doesn't match \
+what's described), STOP and report the discrepancy as your final message. Do not \
+improvise a different fix.
 
 When done, write a summary of what you changed as your final message.
 
@@ -112,14 +164,18 @@ Review the diff and check:
 3. Are the changes minimal and focused?
 4. Is there any debug code, commented-out code, or leftovers?
 
+If the diff is empty or trivially small (<5 lines changed), verdict should be \
+REQUEST_CHANGES with explanation of what's missing.
+
 Produce a PR summary with:
 
 - **What changed** -- brief description of the fix
 - **How it works** -- technical explanation
 - **Testing** -- what was tested or should be tested
-- **Verdict** -- one of: APPROVE, REQUEST_CHANGES, NEEDS_DISCUSSION
+- **Verdict** -- your verdict MUST be one of: APPROVE, REQUEST_CHANGES, NEEDS_DISCUSSION. \
+Do not hedge.
 
-If verdict is REQUEST_CHANGES, explain what needs to change.
+If verdict is REQUEST_CHANGES, explain specifically what needs to change.
 """
 
 
