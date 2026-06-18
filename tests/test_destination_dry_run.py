@@ -39,7 +39,7 @@ def test_create_pr_skips_gh_when_dry_run():
             args = call[0][0] if call[0] else []
             assert not ("gh", "pr", "create") in tuple(args), "gh pr create should not be called in dry-run"
         # Should return a dry-run status dict
-        assert "skipped" in result or "dry_run" in result
+        assert result["url"] == "dry-run"
 
 
 def test_create_pr_calls_gh_when_not_dry_run():
