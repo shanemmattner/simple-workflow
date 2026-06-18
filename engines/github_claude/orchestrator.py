@@ -269,27 +269,44 @@ def run_pipeline(repo: str, issue_number: int, *,
     kw = dict(cwd=wt, issue_number=issue_number, issue_body=issue_body,
               model_ov=model_override, repo_context=repo_context)
 
+    # Helper to check if a phase (or any execute-task-*) was completed in a prior run
+    def _skip(phase_name: str) -> bool:
+        if phase_name in completed_phases:
+            log.info("resuming: skipping %s (completed in prior run)", phase_name)
+            return True
+        return False
+
+    # For resume: check if all execute phases completed
+    _any_execute_completed = any(p.startswith("execute-task-") for p in completed_phases)
+
     try:
         # -- Triage (prose -> extract task list) --
-        pid = _start_phase(conn, "triage")
-        resp = _call("triage", pcfg.get("triage", {}), prior=prior, prior_review=prior_review, **kw)
-        _finish_phase(conn, pid, resp); spent += resp["cost"]; _guard(spent, budget)
-        triage_text = _content(resp)
-        prior["triage"] = triage_text
+        if _skip("triage"):
+            triage_text = prior.get("triage", "")
+        else:
+            pid = _start_phase(conn, "triage")
+            resp = _call("triage", pcfg.get("triage", {}), prior=prior, prior_review=prior_review, **kw)
+            _finish_phase(conn, pid, resp); spent += resp["cost"]; _guard(spent, budget)
+            triage_text = _content(resp)
+            prior["triage"] = triage_text
 
         triage = _extract_json(triage_text, (
             '{"tasks": [{"id": 1, "title": "...", "target_files": [...], "depends_on": []}], '
             '"proof_type": "test_passes", "escalate": false}'
         ), cwd=wt)
-        _run_gates(conn, "triage", triage, worktree_path=wt)
+        if "triage" not in completed_phases:
+            _run_gates(conn, "triage", triage, worktree_path=wt)
         tasks = triage.get("tasks", [])
 
         # -- Verify (check claims against codebase) --
-        pid = _start_phase(conn, "verify")
-        resp = _call("verify", pcfg.get("verify", {}), prior=prior, **kw)
-        _finish_phase(conn, pid, resp); spent += resp["cost"]; _guard(spent, budget)
-        verify_text = _content(resp)
-        prior["verify"] = verify_text
+        if _skip("verify"):
+            verify_text = prior.get("verify", "")
+        else:
+            pid = _start_phase(conn, "verify")
+            resp = _call("verify", pcfg.get("verify", {}), prior=prior, **kw)
+            _finish_phase(conn, pid, resp); spent += resp["cost"]; _guard(spent, budget)
+            verify_text = _content(resp)
+            prior["verify"] = verify_text
 
         verify = _extract_json(verify_text, (
             '{"verified_tasks": [{"task_id": 1, "status": "CONFIRMED", "evidence": "...", '
@@ -297,13 +314,14 @@ def run_pipeline(repo: str, issue_number: int, *,
             '"buildable_count": 1, "refuted_count": 0, "stale_count": 0, '
             '"recommendation": "proceed"}'
         ), cwd=wt)
-        _run_gates(conn, "verify", verify)
-        storage.log_event(conn, "verify_result", {
-            "buildable": verify.get("buildable_count", 0),
-            "refuted": verify.get("refuted_count", 0),
-            "stale": verify.get("stale_count", 0),
-            "recommendation": verify.get("recommendation", ""),
-        })
+        if "verify" not in completed_phases:
+            _run_gates(conn, "verify", verify)
+            storage.log_event(conn, "verify_result", {
+                "buildable": verify.get("buildable_count", 0),
+                "refuted": verify.get("refuted_count", 0),
+                "stale": verify.get("stale_count", 0),
+                "recommendation": verify.get("recommendation", ""),
+            })
 
         # Filter tasks: only CONFIRMED or PARTIAL proceed
         buildable_ids: set[int] = set()
@@ -331,61 +349,34 @@ def run_pipeline(repo: str, issue_number: int, *,
         log.info("verify passed: %d/%d tasks buildable", len(tasks), len(triage.get("tasks", [])))
 
         # -- Plan + Test-Plan (parallel per task, prose pass-through) --
+        # Check if all plan/test-plan phases are already done
+        _all_plans_done = all(
+            f"plan-task-{t['id']}" in completed_phases and f"test-plan-task-{t['id']}" in completed_phases
+            for t in tasks
+        )
         plan_r: dict[int, str] = {}; tp_r: dict[int, str] = {}
-        with ThreadPoolExecutor(max_workers=min(len(tasks) * 2, max_par)) as pool:
-            futs: dict[Any, tuple[str, int, int]] = {}
-            for t in tasks:
-                tp = {**prior, "_current_task": t}
-                for ph in ("plan", "test-plan"):
-                    pid = _start_phase(conn, f"{ph}-task-{t['id']}")
-                    futs[pool.submit(_call, ph, pcfg.get(ph, {}), prior=tp, **kw)] = (ph, t["id"], pid)
-            done, _ = wait(futs, return_when=FIRST_EXCEPTION)
-            for f in done:
-                ph, tid, pid = futs[f]
-                try:
-                    resp = f.result()
-                    _finish_phase(conn, pid, resp)
-                except Exception:
-                    _finish_phase(conn, pid, None, failed=True)
-                    raise
-                spent += resp["cost"]
-                text = _content(resp)
-                (plan_r if ph == "plan" else tp_r)[tid] = text
-        _guard(spent, budget)
-        prior["plans"] = plan_r; prior["test_plans"] = tp_r
-
-        # -- Wave Planner (prose -> extract wave assignments) --
-        pid = _start_phase(conn, "wave-planner")
-        resp = _call("wave-planner", pcfg.get("wave-planner", {}), prior=prior, **kw)
-        _finish_phase(conn, pid, resp); spent += resp["cost"]
-        if spent > budget:
-            log.warning("budget exceeded after wave-planner ($%.2f > $%.2f) — continuing to execute", spent, budget)
-        wave_text = _content(resp)
-        prior["wave_plan"] = wave_text
-
-        wave_plan = _extract_json(wave_text, (
-            '{"waves": [[1, 2], [3, 4]]}  -- list of lists, each inner list is task IDs in that wave'
-        ), cwd=wt)
-        task_ids = [t["id"] for t in tasks]
-        _run_gates(conn, "wave-planner", wave_plan,
-                   task_ids=task_ids, max_parallel=max_par)
-
-        # -- Execute (parallel within wave, serial across waves) --
-        exec_results: list[dict] = []
-        for wi, wave_task_ids in enumerate(wave_plan.get("waves", [])):
-            log.info("wave %d: %s", wi, wave_task_ids)
-            with ThreadPoolExecutor(max_workers=max_par) as pool:
-                efuts: dict[Any, tuple[int, int]] = {}
-                for tid in wave_task_ids:
-                    t = next((t for t in tasks if t["id"] == tid), None)
-                    if not t: continue
-                    ep = {**prior, "_current_task": t,
-                          "_current_plan": plan_r.get(tid, ""),
-                          "_current_test_plan": tp_r.get(tid, "")}
-                    pid = _start_phase(conn, f"execute-task-{tid}")
-                    efuts[pool.submit(_call, "execute", pcfg.get("execute", {}), prior=ep, **kw)] = (tid, pid)
-                for f in as_completed(efuts):
-                    tid, pid = efuts[f]
+        if _all_plans_done:
+            log.info("resuming: skipping plan + test-plan phases (completed in prior run)")
+            # Rebuild plan_r / tp_r from prior outputs
+            if isinstance(prior.get("plans"), dict):
+                plan_r = {int(k): v for k, v in prior["plans"].items()}
+            if isinstance(prior.get("test_plans"), dict):
+                tp_r = {int(k): v for k, v in prior["test_plans"].items()}
+        else:
+            with ThreadPoolExecutor(max_workers=min(len(tasks) * 2, max_par)) as pool:
+                futs: dict[Any, tuple[str, int, int]] = {}
+                for t in tasks:
+                    tp = {**prior, "_current_task": t}
+                    for ph in ("plan", "test-plan"):
+                        phase_key = f"{ph}-task-{t['id']}"
+                        if phase_key in completed_phases:
+                            log.info("resuming: skipping %s (completed in prior run)", phase_key)
+                            continue
+                        pid = _start_phase(conn, phase_key)
+                        futs[pool.submit(_call, ph, pcfg.get(ph, {}), prior=tp, **kw)] = (ph, t["id"], pid)
+                done, _ = wait(futs, return_when=FIRST_EXCEPTION)
+                for f in done:
+                    ph, tid, pid = futs[f]
                     try:
                         resp = f.result()
                         _finish_phase(conn, pid, resp)
@@ -393,11 +384,63 @@ def run_pipeline(repo: str, issue_number: int, *,
                         _finish_phase(conn, pid, None, failed=True)
                         raise
                     spent += resp["cost"]
-                    exec_text = _content(resp)
-                    exec_results.append({"task_id": tid, "response": exec_text})
+                    text = _content(resp)
+                    (plan_r if ph == "plan" else tp_r)[tid] = text
+            _guard(spent, budget)
+            prior["plans"] = plan_r; prior["test_plans"] = tp_r
+
+        # -- Wave Planner (prose -> extract wave assignments) --
+        if _skip("wave-planner"):
+            wave_text = prior.get("wave_plan", "")
+        else:
+            pid = _start_phase(conn, "wave-planner")
+            resp = _call("wave-planner", pcfg.get("wave-planner", {}), prior=prior, **kw)
+            _finish_phase(conn, pid, resp); spent += resp["cost"]
             if spent > budget:
-                log.warning("budget exceeded after execute wave %d ($%.2f > $%.2f) — continuing to PR", wi, spent, budget)
-        prior["execute"] = exec_results
+                log.warning("budget exceeded after wave-planner ($%.2f > $%.2f) — continuing to execute", spent, budget)
+            wave_text = _content(resp)
+            prior["wave_plan"] = wave_text
+
+        wave_plan = _extract_json(wave_text, (
+            '{"waves": [[1, 2], [3, 4]]}  -- list of lists, each inner list is task IDs in that wave'
+        ), cwd=wt)
+        task_ids = [t["id"] for t in tasks]
+        if "wave-planner" not in completed_phases:
+            _run_gates(conn, "wave-planner", wave_plan,
+                       task_ids=task_ids, max_parallel=max_par)
+
+        # -- Execute (parallel within wave, serial across waves) --
+        if _any_execute_completed:
+            log.info("resuming: skipping execute phases (completed in prior run)")
+            exec_results = prior.get("execute", [])
+        else:
+            exec_results: list[dict] = []
+            for wi, wave_task_ids in enumerate(wave_plan.get("waves", [])):
+                log.info("wave %d: %s", wi, wave_task_ids)
+                with ThreadPoolExecutor(max_workers=max_par) as pool:
+                    efuts: dict[Any, tuple[int, int]] = {}
+                    for tid in wave_task_ids:
+                        t = next((t for t in tasks if t["id"] == tid), None)
+                        if not t: continue
+                        ep = {**prior, "_current_task": t,
+                              "_current_plan": plan_r.get(tid, ""),
+                              "_current_test_plan": tp_r.get(tid, "")}
+                        pid = _start_phase(conn, f"execute-task-{tid}")
+                        efuts[pool.submit(_call, "execute", pcfg.get("execute", {}), prior=ep, **kw)] = (tid, pid)
+                    for f in as_completed(efuts):
+                        tid, pid = efuts[f]
+                        try:
+                            resp = f.result()
+                            _finish_phase(conn, pid, resp)
+                        except Exception:
+                            _finish_phase(conn, pid, None, failed=True)
+                            raise
+                        spent += resp["cost"]
+                        exec_text = _content(resp)
+                        exec_results.append({"task_id": tid, "response": exec_text})
+                if spent > budget:
+                    log.warning("budget exceeded after execute wave %d ($%.2f > $%.2f) — continuing to PR", wi, spent, budget)
+            prior["execute"] = exec_results
 
         # -- Safety-net commit: catch changes the execute agent failed to commit --
         _porcelain = subprocess.run(
@@ -421,51 +464,57 @@ def run_pipeline(repo: str, issue_number: int, *,
 
         # -- Review (prose pass-through) --
         diff = workspace.get_diff(wt)[:50_000]
-        pid = _start_phase(conn, "review")
-        resp = _call("review", pcfg.get("review", {}),
-                      prior={**prior, "_combined_diff": diff}, **kw)
-        _finish_phase(conn, pid, resp); spent += resp["cost"]
-        prior["review"] = _content(resp)
+        if _skip("review"):
+            pass  # prior["review"] already populated from resume state
+        else:
+            pid = _start_phase(conn, "review")
+            resp = _call("review", pcfg.get("review", {}),
+                          prior={**prior, "_combined_diff": diff}, **kw)
+            _finish_phase(conn, pid, resp); spent += resp["cost"]
+            prior["review"] = _content(resp)
 
         # -- Improve (informational — does not block PR) --
-        try:
-            cost_summary = json.dumps({
-                "total_spent_usd": round(spent, 4),
-                "budget_usd": budget,
-                "utilization_pct": round(spent / budget * 100, 1) if budget else 0,
-            })
-            improve_prompt = _load_prompt("improve")
-            improve_prompt = improve_prompt.replace("{cost_summary}", cost_summary)
-            improve_prompt = improve_prompt.replace("{combined_diff}", diff[:30_000])
-            improve_prompt = improve_prompt.replace("{prior_phases}",
-                json.dumps(prior, indent=2, default=str))
-            improve_cfg = pcfg.get("improve", {"model": "haiku", "max_turns": 5})
-            model = model_override or improve_cfg.get("model", "haiku")
-            pid = _start_phase(conn, "improve")
-            log.info("[improve] model=%s max_turns=%d", model, improve_cfg.get("max_turns", 5))
-            resp = runtime.call_agent(improve_prompt, model=model, cwd=wt,
-                                      max_turns=improve_cfg.get("max_turns", 5))
-            resp["_prompt"] = improve_prompt
-            _finish_phase(conn, pid, resp); spent += resp["cost"]
-            improve_text = _content(resp)
-            prior["improve"] = improve_text
-            # Try to extract and log structured suggestions
+        if _skip("improve"):
+            pass  # prior["improve"] already populated from resume state
+        else:
             try:
-                improve_data = json.loads(improve_text) if improve_text.strip().startswith("{") \
-                    else _extract_json(improve_text, (
-                        '{"stale_claims": [], "missing_knowledge": [], "tool_suggestions": [], '
-                        '"prompt_improvements": [], "preservations": [], '
-                        '"score": {"triage": 0, "plan": 0, "execute": 0, "review": 0, "overall": 0}}'
-                    ), cwd=wt)
-                storage.log_event(conn, "improvement_suggestions", improve_data)
-                log.info("[improve] score=%s", improve_data.get("score", {}))
-            except (json.JSONDecodeError, Exception) as je:
-                log.warning("[improve] could not extract structured JSON: %s", je)
-                storage.log_event(conn, "improvement_suggestions", {"raw": improve_text[:5000]})
-        except Exception as ie:
-            log.warning("[improve] phase failed (non-blocking): %s", ie)
-            if 'pid' in dir():
-                _finish_phase(conn, pid, None, failed=True)
+                cost_summary = json.dumps({
+                    "total_spent_usd": round(spent, 4),
+                    "budget_usd": budget,
+                    "utilization_pct": round(spent / budget * 100, 1) if budget else 0,
+                })
+                improve_prompt = _load_prompt("improve")
+                improve_prompt = improve_prompt.replace("{cost_summary}", cost_summary)
+                improve_prompt = improve_prompt.replace("{combined_diff}", diff[:30_000])
+                improve_prompt = improve_prompt.replace("{prior_phases}",
+                    json.dumps(prior, indent=2, default=str))
+                improve_cfg = pcfg.get("improve", {"model": "haiku", "max_turns": 5})
+                model = model_override or improve_cfg.get("model", "haiku")
+                pid = _start_phase(conn, "improve")
+                log.info("[improve] model=%s max_turns=%d", model, improve_cfg.get("max_turns", 5))
+                resp = runtime.call_agent(improve_prompt, model=model, cwd=wt,
+                                          max_turns=improve_cfg.get("max_turns", 5))
+                resp["_prompt"] = improve_prompt
+                _finish_phase(conn, pid, resp); spent += resp["cost"]
+                improve_text = _content(resp)
+                prior["improve"] = improve_text
+                # Try to extract and log structured suggestions
+                try:
+                    improve_data = json.loads(improve_text) if improve_text.strip().startswith("{") \
+                        else _extract_json(improve_text, (
+                            '{"stale_claims": [], "missing_knowledge": [], "tool_suggestions": [], '
+                            '"prompt_improvements": [], "preservations": [], '
+                            '"score": {"triage": 0, "plan": 0, "execute": 0, "review": 0, "overall": 0}}'
+                        ), cwd=wt)
+                    storage.log_event(conn, "improvement_suggestions", improve_data)
+                    log.info("[improve] score=%s", improve_data.get("score", {}))
+                except (json.JSONDecodeError, Exception) as je:
+                    log.warning("[improve] could not extract structured JSON: %s", je)
+                    storage.log_event(conn, "improvement_suggestions", {"raw": improve_text[:5000]})
+            except Exception as ie:
+                log.warning("[improve] phase failed (non-blocking): %s", ie)
+                if 'pid' in dir():
+                    _finish_phase(conn, pid, None, failed=True)
 
         # -- Push + PR --
         destination.push_branch(wt, branch)
@@ -515,12 +564,14 @@ def main() -> None:
     ap.add_argument("--budget", type=float, default=1.00, help="Max spend USD")
     ap.add_argument("--model", default=None, help="Override model for all phases")
     ap.add_argument("--repo-path", default=None, help="Local filesystem path to the repo (default: cwd)")
+    ap.add_argument("--resume", default=None, help="Resume from a prior run DB path or run ID")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     print(f"github_claude: {args.repo}#{args.issue}  budget=${args.budget:.2f}")
     result = run_pipeline(args.repo, args.issue, budget=args.budget,
-                          model_override=args.model, repo_path=args.repo_path)
+                          model_override=args.model, repo_path=args.repo_path,
+                          resume_from=args.resume)
 
     print(f"\n{'='*50}")
     for k, label in [("status","Status"), ("spent_usd","Cost"), ("pr_url","PR"), ("error","Error")]:
