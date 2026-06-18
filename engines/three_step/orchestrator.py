@@ -421,14 +421,14 @@ def run_pipeline(
         # ---- Phase 3: Review + PR ----
         current_phase = "review"
         diff = workspace.get_diff(wt)[:50_000]
-        log.info("[review] starting (max_turns=5, model=%s)", model)
+        log.info("[review] starting (max_turns=10, model=%s)", model)
         pid = _start_phase(conn, "review")
         prompt = REVIEW_PROMPT.format(
             issue_number=issue_number,
             issue_body=issue_body,
             diff=diff,
         )
-        resp = _call_with_fallback(prompt, model=model, cwd=wt, max_turns=5)
+        resp = _call_with_fallback(prompt, model=model, cwd=wt, max_turns=10)
         resp["_prompt"] = prompt
         spent += resp["cost"]
         phase_cost = resp["cost"]
