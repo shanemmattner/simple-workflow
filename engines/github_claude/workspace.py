@@ -8,6 +8,19 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 
+def neutralize_claude_md(worktree_path: str) -> None:
+    """Rename CLAUDE.md and .claude/ in the worktree to prevent auto-discovery."""
+    wt = Path(worktree_path)
+    claude_md = wt / "CLAUDE.md"
+    claude_dir = wt / ".claude"
+    if claude_md.exists():
+        claude_md.rename(wt / "CLAUDE.md.pipeline-hidden")
+        log.info("neutralized %s", claude_md)
+    if claude_dir.exists():
+        claude_dir.rename(wt / ".claude.pipeline-hidden")
+        log.info("neutralized %s", claude_dir)
+
+
 def create_workspace(repo_path: str, branch: str, base: str = "main") -> str:
     """Create a git worktree for the given branch, returning the worktree path.
 
