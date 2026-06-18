@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import subprocess
+import tempfile
 import time
 
 log = logging.getLogger(__name__)
@@ -27,7 +28,7 @@ _RETRYABLE_PATTERNS = re.compile(
 
 _DEFAULT_SYSTEM_PROMPT = (
     "You are a coding agent. Focus on the task in your prompt. "
-    "Do not delegate work."
+    "Do not delegate work. Work in the directory specified in the prompt."
 )
 
 
@@ -64,6 +65,9 @@ def call_agent(
     effective_system_prompt = (
         system_prompt if system_prompt is not None else _DEFAULT_SYSTEM_PROMPT
     )
+    # Run from a neutral temp dir to prevent target repo CLAUDE.md injection.
+    # --add-dir gives the agent access to the actual worktree for file ops.
+    neutral_cwd = tempfile.mkdtemp(prefix="sw-")
     cmd = [
         "claude",
         "-p",
@@ -71,6 +75,7 @@ def call_agent(
         "--output-format", "json",
         "--model", model,
         "--dangerously-skip-permissions",
+        "--add-dir", cwd,
         "--system-prompt", effective_system_prompt,
     ]
 
@@ -84,7 +89,7 @@ def call_agent(
                 capture_output=True,
                 text=True,
                 timeout=effective_timeout,
-                cwd=cwd or None,
+                cwd=neutral_cwd,
             )
             elapsed = time.monotonic() - start
 
