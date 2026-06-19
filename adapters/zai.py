@@ -9,10 +9,13 @@ BASE_URL = "https://api.z.ai/api/coding/paas/v4"  # Coding Plan subscription end
 AVAILABLE_MODELS: set[str] = {
     "glm-5.2",
     "glm-4.7",
+    "glm-4.7-flash",
 }
 
 _SHORT_NAMES: dict[str, str] = {
     "glm": "glm-5.2",
+    "glm-flash": "glm-4.7-flash",
+    "glm-4.7-flash": "glm-4.7-flash",
 }
 
 

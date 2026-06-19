@@ -19,7 +19,7 @@ def main() -> None:
     parser.add_argument("--budget", type=float, default=5.00,
                         help="Max spend in USD (default: 5.00)")
     parser.add_argument("--model", default=None,
-                        help="Override model for all phases (default: engine default)")
+                        help="Override model for all phases (default: haiku for investigate/review, sonnet for implement)")
     parser.add_argument("--repo-path", default=None,
                         help="Local filesystem path to the repo (default: auto-detect)")
     args = parser.parse_args()

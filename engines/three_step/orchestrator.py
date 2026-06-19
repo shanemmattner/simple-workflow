@@ -1,8 +1,8 @@
 """Three-step orchestrator: investigate -> implement -> review+PR.
 
-Uses a direct OpenAI SDK runtime (engines.three_step.runtime) against Z.ai's
-OpenAI-compatible endpoint. Reuses shared modules from github_openhands for
-source, storage, workspace, and destination.
+Uses the Claude CLI subscription runtime (engines.three_step.claude_runtime)
+which invokes `claude` with --output-format json. Reuses shared modules from
+github_openhands for source, storage, workspace, and destination.
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from engines.three_step import runtime
+from engines.three_step import claude_runtime
 from engines.github_openhands import source, storage, workspace, destination
 
 log = logging.getLogger(__name__)
@@ -183,12 +183,9 @@ If verdict is REQUEST_CHANGES, explain specifically what needs to change.
 # Helpers
 # ---------------------------------------------------------------------------
 
-import adapters
-
-FALLBACK_MODEL = "deepseek-pro"
+PHASE_MODELS = {"investigate": "haiku", "implement": "sonnet", "review": "haiku"}
+PHASE_MAX_TURNS = {"investigate": 25, "implement": 30, "review": 10}
 PHASE_BUDGET = {"investigate": 1.50, "implement": 2.50, "review": 0.50}
-
-_RATE_LIMIT_INDICATORS = ("429", "rate limit", "quota", "exhausted", "too many requests")
 
 
 class BudgetExceeded(RuntimeError):
@@ -233,23 +230,83 @@ def _finish_phase(conn, phase_id: int, resp: dict | None, failed: bool = False) 
     )
 
 
-def _call_with_fallback(prompt: str, *, model: str, cwd: str, max_turns: int) -> dict:
-    """Route to correct API backend via the adapter layer, with rate-limit fallback."""
+def _call_agent(prompt: str, *, phase: str, cwd: str, model: str | None = None) -> dict:
+    """Route to the correct backend based on model string."""
+    effective_model = model or PHASE_MODELS.get(phase, "sonnet")
+
+    if effective_model in ("haiku", "sonnet", "opus") or effective_model.startswith("claude"):
+        return _call_claude(prompt, phase=phase, cwd=cwd, model=effective_model)
+    else:
+        return _call_openai_compat(prompt, phase=phase, cwd=cwd, model=effective_model)
+
+
+def _call_openai_compat(prompt: str, *, phase: str, cwd: str, model: str) -> dict:
+    """Call an OpenAI-compatible backend (Z.ai, OpenRouter) via the SDK runtime."""
+    import adapters
+    from engines.three_step import runtime
+
     config = adapters.get_config(model)
-    resp = runtime.call_agent(
-        prompt, model=config["model"], cwd=cwd, max_turns=max_turns,
-        api_key=config["api_key"], base_url=config["base_url"],
+    max_turns = PHASE_MAX_TURNS.get(phase, 25)
+
+    # OpenRouter adapter prefixes model with "openrouter/" for OpenHands SDK,
+    # but our runtime.call_agent hits the OpenAI SDK directly — strip the prefix.
+    api_model = config["model"]
+    if api_model.startswith("openrouter/"):
+        api_model = api_model[len("openrouter/"):]
+
+    return runtime.call_agent(
+        prompt,
+        model=api_model,
+        cwd=cwd,
+        max_turns=max_turns,
+        api_key=config["api_key"],
+        base_url=config["base_url"],
     )
-    if resp.get("finish_reason") == "error":
-        content = (resp.get("content", "") or "").lower()
-        if any(ind in content for ind in _RATE_LIMIT_INDICATORS):
-            log.warning("%s rate-limited, falling back to %s", model, FALLBACK_MODEL)
-            fallback_config = adapters.get_config(FALLBACK_MODEL)
-            resp = runtime.call_agent(
-                prompt, model=fallback_config["model"], cwd=cwd, max_turns=max_turns,
-                api_key=fallback_config["api_key"], base_url=fallback_config["base_url"],
-            )
-    return resp
+
+
+def _call_claude(prompt: str, *, phase: str, cwd: str, model: str | None = None) -> dict:
+    """Call claude CLI and adapt the response to the orchestrator's expected dict shape.
+
+    Maps claude_runtime.run_phase_agent() output to the keys that _finish_phase(),
+    _content(), and budget tracking depend on:
+        result       -> content
+        cost_usd     -> cost
+        duration_ms  -> duration_s (converted)
+        stop_reason  -> finish_reason (mapped)
+        tokens_in, tokens_out preserved as-is
+    """
+    phase_model = model or PHASE_MODELS.get(phase, "sonnet")
+    max_turns = PHASE_MAX_TURNS.get(phase, 25)
+
+    raw = claude_runtime.run_phase_agent(
+        worktree=cwd,
+        prompt=prompt,
+        phase=phase,
+        max_turns=max_turns,
+        model=phase_model,
+    )
+
+    # Map stop_reason to finish_reason
+    stop = raw.get("stop_reason", "")
+    if stop in ("end_turn", ""):
+        finish_reason = "end_turn"
+    elif stop == "max_turns" or raw.get("hit_turn_limit"):
+        finish_reason = "max_iterations"
+    elif stop in ("error", "timeout") or raw.get("hit_timeout"):
+        finish_reason = "error"
+    else:
+        finish_reason = stop or "end_turn"
+
+    return {
+        "content": raw.get("result", ""),
+        "cost": raw.get("cost_usd", 0.0),
+        "tokens_in": raw.get("tokens_in", 0),
+        "tokens_out": raw.get("tokens_out", 0),
+        "duration_s": raw.get("duration_ms", 0) / 1000.0,
+        "finish_reason": finish_reason,
+        "session_id": raw.get("session_id", ""),
+        "num_turns": raw.get("num_turns", 0),
+    }
 
 
 def _find_repo_path(repo: str) -> str:
@@ -317,7 +374,7 @@ def run_pipeline(
 
     Returns dict with keys: status, pr_url, spent_usd, run_id, error.
     """
-    model = model_override or "glm-5.2"
+    model = model_override or "sonnet"
 
     # Fetch issue
     issue = source.fetch_issue(repo, issue_number)
@@ -340,12 +397,14 @@ def run_pipeline(
     try:
         # ---- Phase 1: Investigate ----
         current_phase = "investigate"
-        log.info("[investigate] starting (max_turns=25, model=%s)", model)
+        log.info("[investigate] starting (max_turns=%d, model=%s)",
+                 PHASE_MAX_TURNS["investigate"], model_override or PHASE_MODELS["investigate"])
         pid = _start_phase(conn, "investigate")
         prompt = INVESTIGATE_PROMPT.format(
             issue_number=issue_number, issue_body=issue_body,
         )
-        resp = _call_with_fallback(prompt, model=model, cwd=wt, max_turns=25)
+        resp = _call_agent(prompt, phase="investigate", cwd=wt,
+                          model=model_override)
         resp["_prompt"] = prompt
         spent += resp["cost"]
         _finish_phase(conn, pid, resp,
@@ -374,14 +433,16 @@ def run_pipeline(
 
         # ---- Phase 2: Implement ----
         current_phase = "implement"
-        log.info("[implement] starting (max_turns=30, model=%s)", model)
+        log.info("[implement] starting (max_turns=%d, model=%s)",
+                 PHASE_MAX_TURNS["implement"], model_override or PHASE_MODELS["implement"])
         pid = _start_phase(conn, "implement")
         prompt = IMPLEMENT_PROMPT.format(
             issue_number=issue_number,
             issue_body=issue_body,
             investigation_report=investigation_report,
         )
-        resp = _call_with_fallback(prompt, model=model, cwd=wt, max_turns=30)
+        resp = _call_agent(prompt, phase="implement", cwd=wt,
+                          model=model_override)
         resp["_prompt"] = prompt
         spent += resp["cost"]
         phase_cost = resp["cost"]
@@ -421,14 +482,16 @@ def run_pipeline(
         # ---- Phase 3: Review + PR ----
         current_phase = "review"
         diff = workspace.get_diff(wt)[:50_000]
-        log.info("[review] starting (max_turns=10, model=%s)", model)
+        log.info("[review] starting (max_turns=%d, model=%s)",
+                 PHASE_MAX_TURNS["review"], model_override or PHASE_MODELS["review"])
         pid = _start_phase(conn, "review")
         prompt = REVIEW_PROMPT.format(
             issue_number=issue_number,
             issue_body=issue_body,
             diff=diff,
         )
-        resp = _call_with_fallback(prompt, model=model, cwd=wt, max_turns=10)
+        resp = _call_agent(prompt, phase="review", cwd=wt,
+                          model=model_override)
         resp["_prompt"] = prompt
         spent += resp["cost"]
         phase_cost = resp["cost"]

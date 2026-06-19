@@ -15,9 +15,10 @@ python -m engines.github_claude owner/repo#123
 ./scripts/run.sh owner/repo#123 --engine openhands --budget 2.00
 python -m engines.github_openhands owner/repo#123
 
-# Three-step engine (GLM-5.2 via Z.ai subscription)
+# Three-step engine (Claude subscription via CLI)
 ./scripts/run.sh owner/repo#123 --engine three-step
 python -m engines.three_step owner/repo#123 --budget 3.00
+python -m engines.three_step owner/repo#123 --model opus  # override all phases
 ```
 
 ## Stats
@@ -47,8 +48,9 @@ python3 -m pytest tests/
 - `engines/github_claude/__main__.py` -- package entry point for `python -m engines.github_claude`
 - `engines/github_openhands/runtime.py` -- OpenHands SDK runtime (DeepSeek V4 Flash via OpenRouter, no Docker)
 - `engines/github_openhands/__main__.py` -- package entry point for `python -m engines.github_openhands`
-- `engines/three_step/runtime.py` -- direct OpenAI SDK agent loop against Z.ai (no OpenHands, no LiteLLM)
-- `engines/three_step/orchestrator.py` -- 3-phase pipeline: investigate, implement, review+PR
+- `engines/three_step/claude_runtime.py` -- Claude CLI subscription runtime (wraps `claude` with --output-format json)
+- `engines/three_step/runtime.py` -- legacy OpenAI SDK agent loop against Z.ai (retained for reference, unused)
+- `engines/three_step/orchestrator.py` -- 3-phase pipeline: investigate, implement, review+PR (uses claude_runtime)
 - `workflows/issue-to-pr/workflow.yaml` -- phase definitions, model config, gates, budget
 - `workflows/issue-to-pr/prompts/` -- frozen prompt templates per phase (triage, verify, plan, test-plan, wave-planner, execute, review, improve)
 - `scripts/run.sh` -- shell entry point
@@ -59,5 +61,5 @@ python3 -m pytest tests/
 - `engines/github_claude/runs/` holds per-run `.db` files (gitignored). Each `.db` is self-contained -- full replay of every phase, message, tool call, and event.
 - Prompts are frozen templates in `workflows/issue-to-pr/prompts/`. Change them deliberately. `system_prompt_hash` in phase logs links runs to exact prompt versions.
 - Target repos provide context via `.workflows/` (context.md, testing.md, knowledge/).
-- `ZAI_API_KEY` required for three-step engine (GLM-5.2 via Z.ai subscription).
+- Three-step engine uses Claude CLI subscription (no API key needed — uses logged-in `claude` CLI). Default models: haiku (investigate/review), sonnet (implement). Override with `--model`.
 - No abstract interfaces. Each engine is a self-contained folder. New engine = copy the folder, swap what differs.
