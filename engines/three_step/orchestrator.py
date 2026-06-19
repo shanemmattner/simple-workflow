@@ -387,6 +387,149 @@ If verdict is BLOCK or CONCERNS, list each correction as a numbered item with th
 specific file and what needs to change.
 """
 
+EXTRACT_LESSONS_PROMPT = """\
+You are a pipeline learning extractor. Analyze the pipeline run results below \
+and extract actionable lessons that would prevent future failures or improve \
+pipeline quality.
+
+## Pipeline Outcome: {pipeline_outcome}
+
+{pipeline_outcome_detail}
+
+## Audit Analysis
+
+{audit_text}
+
+## Review Corrections
+
+{review_text}
+
+## Deep Review Findings
+
+{deep_review_text}
+
+## Run Metadata
+
+- Repo: {repo}
+- Issue: #{issue_number}
+- Run ID: {run_id}
+- Cost: ${total_cost:.2f}
+
+## Instructions
+
+Extract 0-5 lessons from this run. Each lesson MUST be:
+1. Specific and actionable — not "investigate better" but "investigate prompt \
+should require checking observer cleanup patterns when adding event listeners"
+2. Grounded in DIRECT EVIDENCE from the audit/review text — quote the relevant \
+finding
+3. Something that would prevent the SAME class of failure in a FUTURE run on \
+a DIFFERENT issue
+
+For each lesson, classify its type:
+- pipeline_prompt: a missing constraint or anti-pattern in a pipeline phase \
+prompt (investigate/implement/review). Include which phase and what to add.
+- repo_knowledge: factual knowledge about the target repo's codebase that \
+the pipeline didn't know. Include which file/pattern was missed.
+- cross_repo: a general engineering pattern applicable across all repos. \
+Write it as a failure mode (what went wrong, how to avoid).
+
+Classify confidence:
+- high: the review/audit EXPLICITLY stated this correction
+- medium: inferred from the pattern of failure, but not stated directly
+- low: speculative — might be wrong
+
+If the run was successful (grade A or B) with no corrections needed, extract \
+zero lessons. A clean run is not a lesson — it's the goal.
+
+If the run failed before investigation completed, extract zero lessons — \
+infrastructure failures are not learning opportunities.
+
+Do NOT extract lessons about:
+- Rate limits, timeouts, or budget exceeded (infrastructure, not learning)
+- Known pipeline limitations already documented
+- Vague observations ("could have been better", "investigation was thorough")
+
+Write each lesson in this exact format, separated by blank lines:
+
+LESSON 1
+Title: [short description]
+Type: [pipeline_prompt | repo_knowledge | cross_repo]
+Confidence: [high | medium | low]
+Target Repo: [repo name]
+Target File: [which file should change, or "N/A"]
+Evidence: [direct quote from audit/review that supports this lesson]
+Description: [2-3 sentences: what happened, what should change, why it matters]
+
+LESSON 2
+Title: ...
+(etc.)
+
+If there are no lessons to extract, write: NO LESSONS
+
+Do not wrap in JSON. Do not add commentary before or after the lessons.
+"""
+
+ADVERSARIAL_LESSON_REVIEW_PROMPT = """\
+You are an adversarial reviewer for a pipeline-extracted lesson. Your job is to \
+determine whether this lesson is worth acting on or whether it should be rejected.
+
+## The Lesson
+
+Title: {lesson_title}
+Type: {lesson_type}
+Confidence: {lesson_confidence}
+Target Repo: {lesson_target_repo}
+Target File: {lesson_target_file}
+Evidence: {lesson_evidence}
+Description: {lesson_description}
+
+## Source Run
+
+- Repo: {repo}
+- Issue: #{issue_number}
+- Pipeline Outcome: {pipeline_outcome}
+
+## Review Criteria
+
+Evaluate this lesson against ALL of the following criteria. Be harsh — false \
+positives waste engineering time and pollute knowledge bases.
+
+1. **Actionability**: Is this specific enough that someone could make a concrete \
+change based on it? "Improve investigation" fails. "Add a check for observer \
+cleanup patterns when the fix involves event listeners" passes. If the lesson \
+cannot be turned into a specific file edit or prompt addition, REJECT.
+
+2. **Evidence grounding**: Is the evidence quote real and does it actually \
+support the lesson? If the evidence is vague, paraphrased, or doesn't match \
+the lesson's claim, REJECT.
+
+3. **Preventive value**: Would this lesson actually prevent the same class of \
+failure in a future run on a DIFFERENT issue? Lessons that are too specific to \
+one issue ("always check ShiftObserver.swift") have no preventive value. REJECT.
+
+4. **Harm potential**: Could applying this lesson cause harm? Would it make \
+prompts too long, add contradictory constraints, cause agents to over-check \
+irrelevant things, or slow down pipeline runs? If yes, REJECT.
+
+5. **Novelty**: Is this lesson already covered by existing pipeline prompts or \
+knowledge? If the investigate prompt already says "check peer implementations" \
+and this lesson says "check peer implementations for observers," it's a \
+duplicate. REJECT duplicates.
+
+## Output Format
+
+Write your analysis naturally. For each criterion, state your assessment in \
+1-2 sentences.
+
+End with exactly one of these verdicts on its own line:
+
+VERDICT: ACCEPT
+VERDICT: REJECT
+
+If rejecting, add a one-line reason after the verdict:
+REASON: [why this lesson should not be applied]
+"""
+
 AUDIT_PROMPT = """\
 You are the Post-Run Auditor. Evaluate the pipeline run described below. Write your \
 analysis naturally — reason through each dimension, then state your conclusions.
@@ -574,9 +717,10 @@ NEVER:
 # Helpers
 # ---------------------------------------------------------------------------
 
-PHASE_MODELS = {"investigate": "sonnet", "implement": "sonnet", "review": "sonnet", "deep_review": "opus", "audit": "opus"}
-PHASE_MAX_TURNS = {"investigate": 40, "implement": 30, "review": 25, "deep_review": 50, "audit": 10}
-PHASE_BUDGET = {"investigate": 1.50, "implement": 2.50, "review": 1.50, "deep_review": 3.00, "audit": 3.00}
+PHASE_MODELS = {"investigate": "sonnet", "implement": "sonnet", "review": "sonnet", "deep_review": "opus", "audit": "opus", "extract_lessons": "opus", "adversarial_review": "sonnet"}
+PHASE_MAX_TURNS = {"investigate": 40, "implement": 30, "review": 25, "deep_review": 50, "audit": 10, "extract_lessons": 10, "adversarial_review": 5}
+PHASE_BUDGET = {"investigate": 1.50, "implement": 2.50, "review": 1.50, "deep_review": 3.00, "audit": 3.00, "extract_lessons": 1.50, "adversarial_review": 0.30}
+LEARNING_BUDGET = 3.00  # Total cap for the entire learning phase
 
 
 class BudgetExceeded(RuntimeError):
@@ -845,6 +989,359 @@ def _post_failure(repo: str, num: int, err: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Learning phase helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_lessons_from_text(text: str) -> list[dict]:
+    """Parse structured lessons from the extractor's natural language output.
+
+    Expects lessons in the format:
+        LESSON N
+        Title: ...
+        Type: ...
+        Confidence: ...
+        Target Repo: ...
+        Target File: ...
+        Evidence: ...
+        Description: ...
+    """
+    if "NO LESSONS" in text.upper():
+        return []
+
+    lessons: list[dict] = []
+    # Split on LESSON N headers
+    blocks = re.split(r'LESSON\s+\d+\s*\n', text, flags=re.IGNORECASE)
+
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+
+        lesson: dict[str, str] = {}
+        fields = {
+            "title": r'Title\s*:\s*(.+)',
+            "type": r'Type\s*:\s*(.+)',
+            "confidence": r'Confidence\s*:\s*(.+)',
+            "target_repo": r'Target\s+Repo\s*:\s*(.+)',
+            "target_file": r'Target\s+File\s*:\s*(.+)',
+            "evidence": r'Evidence\s*:\s*(.+)',
+            "description": r'Description\s*:\s*(.+)',
+        }
+        for key, pattern in fields.items():
+            match = re.search(pattern, block, re.IGNORECASE)
+            if match:
+                lesson[key] = match.group(1).strip()
+
+        # Must have at minimum a title and type to be valid
+        if lesson.get("title") and lesson.get("type"):
+            # Normalize type
+            ltype = lesson.get("type", "").lower().strip()
+            if "pipeline" in ltype or "prompt" in ltype:
+                lesson["type"] = "pipeline_prompt"
+            elif "cross" in ltype:
+                lesson["type"] = "cross_repo"
+            elif "repo" in ltype:
+                lesson["type"] = "repo_knowledge"
+            else:
+                lesson["type"] = "repo_knowledge"
+
+            # Normalize confidence
+            conf = lesson.get("confidence", "medium").lower().strip()
+            if "high" in conf:
+                lesson["confidence"] = "high"
+            elif "low" in conf:
+                lesson["confidence"] = "low"
+            else:
+                lesson["confidence"] = "medium"
+
+            lessons.append(lesson)
+
+    return lessons[:5]  # Cap at 5
+
+
+def _parse_adversarial_verdict(text: str) -> tuple[str, str]:
+    """Parse ACCEPT/REJECT verdict from adversarial review output.
+
+    Returns (verdict, reason).
+    """
+    verdict = "REJECT"  # Default to reject if parsing fails
+    reason = ""
+
+    verdict_match = re.search(r'VERDICT\s*:\s*(ACCEPT|REJECT)', text, re.IGNORECASE)
+    if verdict_match:
+        verdict = verdict_match.group(1).upper()
+
+    reason_match = re.search(r'REASON\s*:\s*(.+)', text, re.IGNORECASE)
+    if reason_match:
+        reason = reason_match.group(1).strip()
+
+    return verdict, reason
+
+
+def _create_lesson_issue(
+    repo: str,
+    lesson: dict,
+    adversarial_text: str,
+    run_id: str,
+    issue_number: int,
+    pipeline_outcome: str,
+) -> str | None:
+    """Create a GitHub issue for an accepted lesson. Returns the issue URL or None."""
+    title = lesson.get("title", "Untitled lesson")
+    ltype = lesson.get("type", "unknown")
+    confidence = lesson.get("confidence", "medium")
+    target_file = lesson.get("target_file", "N/A")
+    evidence = lesson.get("evidence", "N/A")
+    description = lesson.get("description", "N/A")
+
+    # Determine which repo to file the issue on
+    if ltype == "pipeline_prompt":
+        # Pipeline prompt changes go to simple-workflow
+        target_repo = "shanemattner/simple-workflow"
+    else:
+        # Repo knowledge and cross-repo go to the target repo
+        target_repo = repo
+
+    body = f"""## Pipeline Learning: {title}
+
+**Source**: Pipeline run `{run_id}` on #{issue_number} ({pipeline_outcome})
+**Type**: {ltype}
+**Confidence**: {confidence}
+**Target file**: {target_file}
+
+### What happened
+
+{description}
+
+### Evidence
+
+> {evidence}
+
+### Adversarial review
+
+{adversarial_text[:2000]}
+
+---
+
+*Auto-generated by the pipeline learning system. This lesson passed adversarial review.*
+"""
+
+    try:
+        result = subprocess.run(
+            [
+                "gh", "issue", "create",
+                "--repo", target_repo,
+                "--title", f"[pipeline-learning] {title}",
+                "--body", body,
+                "--label", "auto-generated",
+                "--label", "pipeline-learning",
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            url = result.stdout.strip()
+            log.info("[learn] created issue: %s", url)
+            return url
+        else:
+            # Labels might not exist — retry without labels
+            log.warning("[learn] issue create failed (labels?), retrying without labels: %s", result.stderr.strip())
+            result = subprocess.run(
+                [
+                    "gh", "issue", "create",
+                    "--repo", target_repo,
+                    "--title", f"[pipeline-learning] {title}",
+                    "--body", body,
+                ],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0:
+                url = result.stdout.strip()
+                log.info("[learn] created issue (no labels): %s", url)
+                return url
+            log.warning("[learn] issue create failed: %s", result.stderr.strip())
+            return None
+    except Exception:
+        log.exception("[learn] failed to create issue for lesson: %s", title)
+        return None
+
+
+def _run_learning_phase(
+    *,
+    conn,
+    repo: str,
+    issue_number: int,
+    run_id: str,
+    pipeline_outcome: str,
+    pipeline_outcome_detail: str,
+    audit_text: str,
+    review_text: str,
+    deep_review_text: str,
+    total_cost: float,
+    wt: str,
+) -> dict:
+    """Extract lessons from the pipeline run, adversarially review each one,
+    and create GitHub issues for survivors.
+
+    Returns a summary dict with extracted/accepted/rejected counts.
+    """
+    learning_spent = 0.0
+    summary = {
+        "lessons_extracted": 0,
+        "lessons_accepted": 0,
+        "lessons_rejected": 0,
+        "issues_created": [],
+        "learning_cost": 0.0,
+    }
+
+    # ---- Step 1: Extract lessons with Opus ----
+    log.info("[learn] extracting lessons (model=opus)")
+    pid = _start_phase(conn, "extract_lessons")
+
+    prompt = EXTRACT_LESSONS_PROMPT.format(
+        pipeline_outcome=pipeline_outcome,
+        pipeline_outcome_detail=pipeline_outcome_detail,
+        audit_text=audit_text,
+        review_text=review_text,
+        deep_review_text=deep_review_text,
+        repo=repo,
+        issue_number=issue_number,
+        run_id=run_id,
+        total_cost=total_cost,
+    )
+
+    resp = _call_agent(prompt, phase="extract_lessons", cwd=wt, model="opus")
+    resp["_prompt"] = prompt
+    learning_spent += resp.get("cost", 0.0)
+    _finish_phase(conn, pid, resp, failed=(resp.get("finish_reason") == "error"))
+
+    extract_text = _content(resp)
+    lessons = _parse_lessons_from_text(extract_text)
+    summary["lessons_extracted"] = len(lessons)
+
+    storage.log_event(conn, "lessons_raw_text", {"text": extract_text})
+    storage.log_event(conn, "lessons_extracted", {
+        "count": len(lessons),
+        "items": lessons,
+    })
+
+    log.info("[learn] extracted %d lessons", len(lessons))
+
+    if not lessons:
+        summary["learning_cost"] = learning_spent
+        return summary
+
+    # ---- Step 2: Adversarial review each lesson with Sonnet ----
+    accepted: list[dict] = []
+    rejected: list[dict] = []
+
+    for i, lesson in enumerate(lessons):
+        if learning_spent >= LEARNING_BUDGET:
+            log.warning("[learn] learning budget exhausted ($%.2f >= $%.2f), skipping remaining lessons",
+                        learning_spent, LEARNING_BUDGET)
+            break
+
+        log.info("[learn] adversarial review %d/%d: %s", i + 1, len(lessons), lesson.get("title", "?"))
+        pid = _start_phase(conn, f"adversarial_review_{i + 1}")
+
+        review_prompt = ADVERSARIAL_LESSON_REVIEW_PROMPT.format(
+            lesson_title=lesson.get("title", ""),
+            lesson_type=lesson.get("type", ""),
+            lesson_confidence=lesson.get("confidence", ""),
+            lesson_target_repo=lesson.get("target_repo", ""),
+            lesson_target_file=lesson.get("target_file", "N/A"),
+            lesson_evidence=lesson.get("evidence", ""),
+            lesson_description=lesson.get("description", ""),
+            repo=repo,
+            issue_number=issue_number,
+            pipeline_outcome=pipeline_outcome,
+        )
+
+        adv_resp = _call_agent(review_prompt, phase="adversarial_review", cwd=wt, model="sonnet")
+        adv_resp["_prompt"] = review_prompt
+        learning_spent += adv_resp.get("cost", 0.0)
+        _finish_phase(conn, pid, adv_resp, failed=(adv_resp.get("finish_reason") == "error"))
+
+        adv_text = _content(adv_resp)
+        verdict, reason = _parse_adversarial_verdict(adv_text)
+
+        storage.log_event(conn, f"adversarial_review_{i + 1}", {
+            "lesson_title": lesson.get("title"),
+            "verdict": verdict,
+            "reason": reason,
+            "text": adv_text[:3000],
+        })
+
+        if verdict == "ACCEPT":
+            log.info("[learn] ACCEPTED: %s", lesson.get("title"))
+            lesson["adversarial_text"] = adv_text
+            accepted.append(lesson)
+        else:
+            log.info("[learn] REJECTED: %s — %s", lesson.get("title"), reason)
+            rejected.append({"lesson": lesson, "reason": reason})
+
+    summary["lessons_accepted"] = len(accepted)
+    summary["lessons_rejected"] = len(rejected)
+
+    # ---- Step 3: Create GitHub issues for accepted lessons ----
+    for lesson in accepted:
+        if learning_spent >= LEARNING_BUDGET:
+            break
+
+        url = _create_lesson_issue(
+            repo=repo,
+            lesson=lesson,
+            adversarial_text=lesson.get("adversarial_text", ""),
+            run_id=run_id,
+            issue_number=issue_number,
+            pipeline_outcome=pipeline_outcome,
+        )
+        if url:
+            summary["issues_created"].append(url)
+
+    storage.log_event(conn, "lessons_applied", {
+        "accepted": len(accepted),
+        "rejected": len(rejected),
+        "issues_created": summary["issues_created"],
+    })
+
+    # ---- Step 4: Post summary comment on the original issue ----
+    try:
+        comment_lines = [
+            f"**Pipeline Learning — Run `{run_id}`**",
+            "",
+            f"- Lessons extracted: {len(lessons)}",
+            f"- Accepted (passed adversarial review): {len(accepted)}",
+            f"- Rejected: {len(rejected)}",
+        ]
+        if accepted:
+            comment_lines.append("")
+            comment_lines.append("**Accepted lessons:**")
+            for lesson in accepted:
+                comment_lines.append(f"- {lesson.get('title', '?')} ({lesson.get('type', '?')}, {lesson.get('confidence', '?')})")
+        if summary["issues_created"]:
+            comment_lines.append("")
+            comment_lines.append("**Issues created:**")
+            for url in summary["issues_created"]:
+                comment_lines.append(f"- {url}")
+        if rejected:
+            comment_lines.append("")
+            comment_lines.append("**Rejected lessons:**")
+            for r in rejected:
+                comment_lines.append(f"- ~~{r['lesson'].get('title', '?')}~~ — {r.get('reason', 'no reason')}")
+
+        source.post_comment(repo, issue_number, "\n".join(comment_lines))
+    except Exception:
+        log.warning("[learn] failed to post learning summary comment on %s#%d", repo, issue_number)
+
+    summary["learning_cost"] = learning_spent
+    log.info("[learn] done — extracted=%d accepted=%d rejected=%d issues=%d cost=$%.2f",
+             len(lessons), len(accepted), len(rejected), len(summary["issues_created"]), learning_spent)
+
+    return summary
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
@@ -884,7 +1381,7 @@ def run_pipeline(
     current_phase = "init"
     phase_stats: dict[str, dict] = {}
 
-    # Accumulated context for audit — populated as phases complete
+    # Accumulated context for audit and learning — populated as phases complete
     investigation_report = "(not available — investigation did not run)"
     diff = "(not available — no diff produced)"
     review_text = "(not available — review did not run)"
@@ -894,6 +1391,7 @@ def run_pipeline(
     pipeline_outcome_detail = ""
     pipeline_result: dict[str, Any] = {}
     audit_verdict: dict | None = None
+    audit_raw = "(not available — audit did not run)"
 
     _default_phase_stat = {"turns": 0, "cost": 0.0, "duration": 0.0, "finish": "(not run)"}
 
@@ -1338,6 +1836,30 @@ def run_pipeline(
             source.post_comment(repo, issue_number, "\n".join(comment_lines))
         except Exception:
             log.warning("failed to post run metadata comment on %s#%d", repo, issue_number)
+
+        # ---- Learning Phase — extract lessons, adversarial review, create issues ----
+        try:
+            current_phase = "learn"
+            log.info("[learn] starting learning phase")
+            learning_summary = _run_learning_phase(
+                conn=conn,
+                repo=repo,
+                issue_number=issue_number,
+                run_id=run_id,
+                pipeline_outcome=pipeline_outcome,
+                pipeline_outcome_detail=pipeline_outcome_detail,
+                audit_text=audit_raw,
+                review_text=review_text,
+                deep_review_text=deep_review_text,
+                total_cost=spent,
+                wt=wt,
+            )
+            spent += learning_summary.get("learning_cost", 0.0)
+            pipeline_result["learning"] = learning_summary
+            log.info("[learn] complete — %s", learning_summary)
+        except Exception:
+            log.exception("[learn] learning phase failed (non-fatal)")
+            storage.log_event(conn, "learning_error", {"error": "learning phase exception"})
 
         # Do NOT clean up the worktree -- just log its location
         log.info("worktree preserved at: %s", wt)
