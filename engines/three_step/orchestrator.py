@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -873,7 +874,8 @@ def run_pipeline(
     run_id = os.path.splitext(os.path.basename(db_path))[0]
 
     # Set up workspace
-    branch = f"three-step/issue-{issue_number}"
+    run_start = datetime.now()
+    branch = f"three-step/issue-{issue_number}-{run_start.strftime('%m%d-%H%M')}"
     if not repo_path:
         repo_path = _find_repo_path(repo)
     wt = workspace.create_workspace(repo_path, branch)
@@ -1317,6 +1319,25 @@ def run_pipeline(
         except Exception:
             log.exception("[audit] audit phase failed (non-fatal)")
             storage.log_event(conn, "audit_error", {"error": "audit phase exception"})
+
+        # Post run metadata to the GitHub issue
+        try:
+            status = pipeline_result.get("status", pipeline_outcome)
+            comment_pr = pipeline_result.get("pr_url", pr_url)
+            comment_lines = [
+                "**Pipeline run completed**",
+                f"- Run: `{run_id}`",
+                f"- Branch: `{branch}`",
+                f"- Outcome: {pipeline_outcome}",
+                f"- Cost: ${spent:.2f}",
+            ]
+            if comment_pr and comment_pr != "(no PR created)":
+                comment_lines.append(f"- PR: {comment_pr}")
+            else:
+                comment_lines.append("- PR: not created")
+            source.post_comment(repo, issue_number, "\n".join(comment_lines))
+        except Exception:
+            log.warning("failed to post run metadata comment on %s#%d", repo, issue_number)
 
         # Do NOT clean up the worktree -- just log its location
         log.info("worktree preserved at: %s", wt)
