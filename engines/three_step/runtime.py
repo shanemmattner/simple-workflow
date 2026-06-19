@@ -278,6 +278,7 @@ def call_agent(
     system_prompt: str | None = None,
     api_key: str | None = None,
     base_url: str | None = None,
+    model_config: dict | None = None,
 ) -> dict:
     """Run an agent loop using the OpenAI SDK and return a response dict.
 
@@ -315,9 +316,35 @@ def call_agent(
     except Exception as e:
         return _error_response(f"Failed to create OpenAI client: {e}", time.monotonic() - start)
 
+    # Load model config (or empty dict for defaults)
+    cfg = model_config or {}
+
+    # Apply system prompt suffix from model config
+    effective_system = system_prompt or _DEFAULT_SYSTEM_PROMPT
+    suffix = cfg.get("system_prompt_suffix", "")
+    if suffix:
+        effective_system += suffix
+
+    # Sampling params from model config
+    temperature = cfg.get("temperature", 0.7)
+    sampling_kwargs: dict[str, Any] = {"temperature": temperature}
+    if cfg.get("top_p") is not None:
+        sampling_kwargs["top_p"] = cfg["top_p"]
+    if cfg.get("max_tokens") is not None:
+        sampling_kwargs["max_tokens"] = cfg["max_tokens"]
+
+    # Pricing from model config
+    price_in = cfg.get("price_in", _PRICE_IN)
+    price_out = cfg.get("price_out", _PRICE_OUT)
+
+    # Checkpoint/nudge config
+    checkpoint_interval = cfg.get("checkpoint_interval", 5)
+    budget_warning_turns = cfg.get("budget_warning_turns", 7)
+    budget_critical_turns = cfg.get("budget_critical_turns", 3)
+
     # Build initial messages
     messages: list[dict] = [
-        {"role": "system", "content": system_prompt or _DEFAULT_SYSTEM_PROMPT},
+        {"role": "system", "content": effective_system},
         {"role": "user", "content": prompt},
     ]
 
@@ -334,17 +361,17 @@ def call_agent(
 
             # Inject turn-budget warnings so the model knows when to wrap up
             remaining = max_turns - turn
-            if remaining <= 3 and "critical" not in budget_warnings_sent:
+            if remaining <= budget_critical_turns and "critical" not in budget_warnings_sent:
                 budget_warnings_sent.add("critical")
                 messages.append({
                     "role": "system",
                     "content": (
                         f"CRITICAL: Only {remaining} turns left. Your NEXT message "
                         "must be your final text response with NO tool calls. "
-                        "Write your answer NOW."
+                        "Write your answer NOW. Do NOT call any more tools."
                     ),
                 })
-            elif remaining <= 7 and "warning" not in budget_warnings_sent:
+            elif remaining <= budget_warning_turns and "warning" not in budget_warnings_sent:
                 budget_warnings_sent.add("warning")
                 messages.append({
                     "role": "system",
@@ -361,9 +388,9 @@ def call_agent(
                     messages=messages,
                     tools=TOOLS,
                     tool_choice="auto",
-                    temperature=0.7,
                     stream=False,
                     parallel_tool_calls=False,
+                    **sampling_kwargs,
                 )
             except Exception as e:
                 error_str = str(e).lower()
@@ -376,9 +403,9 @@ def call_agent(
                             messages=messages,
                             tools=TOOLS,
                             tool_choice="auto",
-                            temperature=0.7,
                             stream=False,
                             parallel_tool_calls=False,
+                            **sampling_kwargs,
                         )
                     except Exception as e2:
                         log.error("retry failed: %s", e2)
@@ -401,15 +428,23 @@ def call_agent(
             choice = response.choices[0]
             message = choice.message
 
-            # Append assistant message to history
-            messages.append(_serialize_message(message))
+            # Append assistant message to history (clean think tags from context)
+            serialized = _serialize_message(message)
+            if cfg and cfg.get("strip_think_tags") and serialized.get("content"):
+                from models import clean_output
+                serialized["content"] = clean_output(serialized["content"], cfg)
+            messages.append(serialized)
 
             # Check if model wants to call tools
             if not message.tool_calls:
                 # Done — model returned a regular message
                 elapsed = time.monotonic() - start
                 content = message.content or ""
-                cost = (total_in * _PRICE_IN + total_out * _PRICE_OUT) / 1_000_000
+                # Clean output (strip <think> tags etc.) per model config
+                if cfg:
+                    from models import clean_output
+                    content = clean_output(content, cfg)
+                cost = (total_in * price_in + total_out * price_out) / 1_000_000
                 log.info("[done] %d turns, %d in / %d out tokens, $%.4f, %.1fs",
                          turn + 1, total_in, total_out, cost, elapsed)
                 return {
@@ -445,9 +480,9 @@ def call_agent(
                     "content": result,
                 })
 
-            # Execute checkpoint gate: nudge if no edits after every 5 turns
+            # Execute checkpoint gate: nudge if no edits after N turns
             turn_num = turn + 1  # 1-based
-            if turn_num in (5, 10, 15, 20) and not has_edited:
+            if turn_num % checkpoint_interval == 0 and not has_edited:
                 messages.append({
                     "role": "system",
                     "content": (
@@ -460,7 +495,7 @@ def call_agent(
 
         # Max turns exceeded
         elapsed = time.monotonic() - start
-        cost = (total_in * _PRICE_IN + total_out * _PRICE_OUT) / 1_000_000
+        cost = (total_in * price_in + total_out * price_out) / 1_000_000
         # Try to extract any content from the last assistant message
         content = ""
         for msg in reversed(messages):
@@ -480,7 +515,7 @@ def call_agent(
 
     except Exception as e:
         elapsed = time.monotonic() - start
-        cost = (total_in * _PRICE_IN + total_out * _PRICE_OUT) / 1_000_000
+        cost = (total_in * price_in + total_out * price_out) / 1_000_000
         log.exception("agent loop failed")
         resp = _error_response(str(e), elapsed)
         resp["tokens_in"] = total_in

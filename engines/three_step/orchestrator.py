@@ -778,10 +778,17 @@ def _call_agent(prompt: str, *, phase: str, cwd: str, model: str | None = None) 
 def _call_openai_compat(prompt: str, *, phase: str, cwd: str, model: str) -> dict:
     """Call an OpenAI-compatible backend (Z.ai, OpenRouter) via the SDK runtime."""
     import adapters
+    import models as model_configs
     from engines.three_step import runtime
 
     config = adapters.get_config(model)
-    max_turns = PHASE_MAX_TURNS.get(phase, 25)
+
+    # Load per-model config for sampling, message processing, turn limits
+    model_cfg = model_configs.get_model_config(model)
+
+    # Turn limit: model config per-phase override > orchestrator default
+    phase_turns = model_cfg.get("max_turns", {})
+    max_turns = phase_turns.get(phase) or PHASE_MAX_TURNS.get(phase, 25)
 
     # OpenRouter adapter prefixes model with "openrouter/" for OpenHands SDK,
     # but our runtime.call_agent hits the OpenAI SDK directly — strip the prefix.
@@ -796,6 +803,7 @@ def _call_openai_compat(prompt: str, *, phase: str, cwd: str, model: str) -> dic
         max_turns=max_turns,
         api_key=config["api_key"],
         base_url=config["base_url"],
+        model_config=model_cfg,
     )
 
 
