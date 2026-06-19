@@ -1160,6 +1160,23 @@ def _create_lesson_issue(
                 log.info("[learn] created issue (no labels): %s", url)
                 return url
             log.warning("[learn] issue create failed: %s", result.stderr.strip())
+            # Fallback: file pipeline_prompt lessons on the source repo if simple-workflow is unreachable
+            if target_repo != repo:
+                log.info("[learn] falling back to source repo %s for pipeline_prompt lesson", repo)
+                result = subprocess.run(
+                    [
+                        "gh", "issue", "create",
+                        "--repo", repo,
+                        "--title", f"[pipeline-learning] {title}",
+                        "--body", body,
+                    ],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if result.returncode == 0:
+                    url = result.stdout.strip()
+                    log.info("[learn] created issue on fallback repo: %s", url)
+                    return url
+                log.warning("[learn] fallback issue create also failed: %s", result.stderr.strip())
             return None
     except Exception:
         log.exception("[learn] failed to create issue for lesson: %s", title)
