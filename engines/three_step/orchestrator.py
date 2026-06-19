@@ -338,6 +338,17 @@ AUDIT_PROMPT = """\
 You are the Post-Run Auditor. Evaluate the pipeline run described below. Write your \
 analysis naturally — reason through each dimension, then state your conclusions.
 
+The audit is a PIPELINE EVALUATION tool, not a code review tool. It is most valuable \
+when things go wrong — failure modes reveal what to fix in prompts, gates, and flow.
+
+## Pipeline Outcome
+
+**{pipeline_outcome}**
+
+{pipeline_outcome_detail}
+
+---
+
 ## Run Context
 
 **Issue #{issue_number}**
@@ -392,6 +403,9 @@ phase produced output that degraded the next phase.
 For each dimension, write your reasoning first, then state the score as "D1: N/5" \
 (or D2, D3, D4).
 
+If a phase did not run (marked "not available"), score it 1/5 and explain why the \
+pipeline exited before reaching it. The failure to reach a phase IS the finding.
+
 ### D1: Investigation Quality (1–5)
 - Did the report trace symptom → code path → root cause with specific file:line citations?
 - Did it start from the user-visible entry point, or did it grep broadly for keywords?
@@ -431,6 +445,19 @@ For each dimension, write your reasoning first, then state the score as "D1: N/5
 
 ---
 
+## Failure Mode Analysis
+
+If the pipeline did NOT reach PR creation, this section is MANDATORY. Analyze:
+
+1. **Where did the pipeline exit?** Which phase failed or blocked, and why?
+2. **Was the exit justified?** Should the gate have caught this, or did it over-react?
+3. **Root cause of failure:** What specific weakness in the investigate/implement/review \
+   prompt or gate logic caused the pipeline to fail?
+4. **What would fix it?** Draft a concrete prompt or gate change (≤3 sentences) that \
+   would prevent this failure mode next time.
+
+---
+
 ## Error Taxonomy
 
 Scan the run for these error patterns. List every category that applies by name.
@@ -446,6 +473,8 @@ Scan the run for these error patterns. List every category that applies by name.
 | RE_INVESTIGATION | Implement used grep/find/read on files not in Affected Files before editing |
 | INCOMPLETE_FIX | Fix addresses symptom but not root cause (review says REQUEST_CHANGES) |
 | OVERCOMPLICATED | Diff modifies >3× the lines needed (can be inferred from diff size vs. fix scope) |
+| EARLY_EXIT | Pipeline exited before PR creation (investigation_failed, review_blocked, etc.) |
+| BUDGET_EXCEEDED | Pipeline hit budget cap before completing all phases |
 
 ---
 
@@ -458,6 +487,7 @@ A run qualifies as GOLDEN if ALL of the following are true:
 4. D4 ≥ 3 (cost < $3.00, no excessive turns)
 5. Review verdict is APPROVE
 6. Error categories list is empty
+7. Pipeline outcome is "pr_created"
 
 State whether this run is golden. If not, list the specific blockers.
 
@@ -479,6 +509,7 @@ state the anti-pattern, and draft the missing constraint in ≤2 sentences.
 - Whether this run is golden, and if not, what blocks it
 - What went right and what went wrong
 - Prompt improvement suggestions for low-scoring dimensions
+- Failure mode analysis (mandatory if pipeline did not create a PR)
 
 NEVER:
 - Invent tool calls — you have no tools. All context is above.
@@ -646,7 +677,8 @@ def _extract_audit_verdict(text: str) -> dict:
     known_cats = [
         "NO_EDITS", "WRONG_FILES", "THIN_REPORT", "DEBUG_LEFTOVERS",
         "TYPE_ERROR", "TEST_FAILURE", "RE_INVESTIGATION",
-        "INCOMPLETE_FIX", "OVERCOMPLICATED",
+        "INCOMPLETE_FIX", "OVERCOMPLICATED", "EARLY_EXIT",
+        "BUDGET_EXCEEDED",
     ]
     # Only scan the last 30% of the text where the actual verdict/findings live
     cutoff = len(text) - len(text) // 3
@@ -796,6 +828,20 @@ def run_pipeline(
 
     current_phase = "init"
     phase_stats: dict[str, dict] = {}
+
+    # Accumulated context for audit — populated as phases complete
+    investigation_report = "(not available — investigation did not run)"
+    diff = "(not available — no diff produced)"
+    review_text = "(not available — review did not run)"
+    deep_review_text = "(not available — deep review did not run)"
+    pr_url = "(no PR created)"
+    pipeline_outcome = "unknown_error"
+    pipeline_outcome_detail = ""
+    pipeline_result: dict[str, Any] = {}
+    audit_verdict: dict | None = None
+
+    _default_phase_stat = {"turns": 0, "cost": 0.0, "duration": 0.0, "finish": "(not run)"}
+
     try:
         # ---- Phase 1: Investigate ----
         current_phase = "investigate"
@@ -833,11 +879,13 @@ def run_pipeline(
                  investigation_report.count("**"))
         if len(investigation_report) < 500:
             log.warning("[investigate] thin report (%d chars) — implement phase may re-investigate", len(investigation_report))
-            raise RuntimeError(
+            pipeline_outcome = "investigation_failed"
+            pipeline_outcome_detail = (
                 f"Investigation report too thin ({len(investigation_report)} chars). "
                 "Required: >500 chars with Root Cause and Affected Files sections. "
-                "Aborting to avoid wasting $3-5 on implement+review that will fail."
+                "Pipeline aborted to avoid wasting $3-5 on implement+review that will fail."
             )
+            raise RuntimeError(pipeline_outcome_detail)
 
         # Validate required sections exist
         report_lower = investigation_report.lower()
@@ -847,12 +895,16 @@ def run_pipeline(
         if "affected files" not in report_lower:
             missing_sections.append("Affected Files")
         if missing_sections:
-            raise RuntimeError(
+            pipeline_outcome = "investigation_failed"
+            pipeline_outcome_detail = (
                 f"Investigation report missing required sections: {missing_sections}. "
                 "Report must contain 'Root Cause' and 'Affected Files' sections."
             )
+            raise RuntimeError(pipeline_outcome_detail)
 
         if resp.get("finish_reason") == "error" and len(investigation_report) < 200:
+            pipeline_outcome = "investigation_failed"
+            pipeline_outcome_detail = f"Investigate phase errored with thin output: {investigation_report[:500]}"
             raise RuntimeError(f"Investigate phase failed: {investigation_report[:500]}")
         if resp.get("finish_reason") in ("error", "max_iterations"):
             log.warning("[investigate] finished with %s but has %d chars of content — continuing",
@@ -907,6 +959,11 @@ def run_pipeline(
             )
             storage.log_event(conn, "safety_net_commit", {"files": porcelain})
         elif not commits:
+            pipeline_outcome = "implement_failed"
+            pipeline_outcome_detail = (
+                "Implement phase produced no changes — "
+                "no commits on branch and no uncommitted files."
+            )
             raise RuntimeError(
                 "Implement phase produced no changes -- "
                 "no commits on branch and no uncommitted files"
@@ -952,21 +1009,28 @@ def run_pipeline(
                     f"**Pipeline review blocked PR creation.**\n\n{review_text[:3000]}")
             except Exception:
                 log.warning("failed to post review_blocked comment on %s#%d", repo, issue_number)
+            pipeline_outcome = "review_blocked"
+            pipeline_outcome_detail = (
+                "Review phase returned REQUEST_CHANGES verdict. PR was NOT created. "
+                "The review identified problems that need fixing before the code ships."
+            )
             storage.finish_run(conn, "review_blocked", total_cost=spent, branch=branch)
-            return {
+            pipeline_result = {
                 "status": "review_blocked",
                 "review_text": review_text,
                 "spent_usd": spent,
                 "run_id": run_id,
             }
+            # fall through to audit in finally block
+            return pipeline_result
 
         # Push and create PR
         destination.push_branch(wt, branch)
         body = destination.format_pr_body(issue_number, review_text, db_path, [])
         pr = destination.create_pr(repo, branch, f"fix: resolve #{issue_number}", body)
+        pr_url = pr["url"]
 
         # ---- Phase 4: Deep Review (Opus) — adversarial review after PR ----
-        deep_review_text = ""
         try:
             current_phase = "deep_review"
             log.info("[deep_review] starting (max_turns=%d, model=%s)",
@@ -1015,10 +1079,51 @@ def run_pipeline(
             log.exception("[deep_review] deep review phase failed (non-fatal — PR already created)")
             storage.log_event(conn, "deep_review_error", {"error": "deep review phase exception"})
 
-        # ---- Phase 5: Post-Run Audit (Opus) ----
-        audit_verdict = None
+        pipeline_outcome = "pr_created"
+        pipeline_outcome_detail = (
+            f"Pipeline completed successfully. PR created at {pr_url}. "
+            "All phases ran: investigate, implement, review, deep_review."
+        )
+        storage.finish_run(conn, "ok", total_cost=spent, branch=branch)
+        pipeline_result = {
+            "status": "ok",
+            "pr_url": pr["url"],
+            "spent_usd": spent,
+            "run_id": run_id,
+        }
+        return pipeline_result
+
+    except BudgetExceeded as e:
+        log.error("budget exceeded: %s", e)
+        if pipeline_outcome == "unknown_error":
+            pipeline_outcome = "budget_exceeded"
+            pipeline_outcome_detail = f"Budget exceeded during {current_phase}: {e}"
+        storage.finish_run(conn, "budget_exceeded", total_cost=spent)
+        _post_failure(repo, issue_number, str(e))
+        pipeline_result = {"status": "error", "error": str(e), "spent_usd": spent, "run_id": run_id}
+        return pipeline_result
+
+    except Exception as e:
+        log.exception("pipeline failed during phase '%s' (spent $%.2f so far)", current_phase, spent)
+        error_detail = f"[{current_phase}] {e} (spent ${spent:.2f})"
+        if pipeline_outcome == "unknown_error":
+            pipeline_outcome = f"{current_phase}_failed"
+            pipeline_outcome_detail = f"Pipeline failed during {current_phase}: {e}"
+        storage.finish_run(conn, "error", total_cost=spent)
+        storage.log_event(conn, "pipeline_error", {
+            "error": str(e),
+            "phase": current_phase,
+            "spent_usd": spent,
+        })
+        _post_failure(repo, issue_number, error_detail)
+        pipeline_result = {"status": "error", "error": error_detail, "spent_usd": spent, "run_id": run_id}
+        return pipeline_result
+
+    finally:
+        # ---- Post-Run Audit (Opus) — ALWAYS runs, even on failure ----
         try:
             current_phase = "audit"
+            log.info("[audit] starting (pipeline_outcome=%s)", pipeline_outcome)
             pid = _start_phase(conn, "audit")
             prompt = AUDIT_PROMPT.format(
                 issue_number=issue_number,
@@ -1026,21 +1131,23 @@ def run_pipeline(
                 investigation_report=investigation_report,
                 diff=diff,
                 review_text=review_text,
-                deep_review_text=deep_review_text or "(deep review not available)",
-                pr_url=pr["url"],
+                deep_review_text=deep_review_text,
+                pr_url=pr_url,
                 run_id=run_id,
-                investigate_turns=phase_stats["investigate"]["turns"],
-                investigate_cost=phase_stats["investigate"]["cost"],
-                investigate_duration=phase_stats["investigate"]["duration"],
-                investigate_finish=phase_stats["investigate"]["finish"],
-                implement_turns=phase_stats["implement"]["turns"],
-                implement_cost=phase_stats["implement"]["cost"],
-                implement_duration=phase_stats["implement"]["duration"],
-                implement_finish=phase_stats["implement"]["finish"],
-                review_turns=phase_stats["review"]["turns"],
-                review_cost=phase_stats["review"]["cost"],
-                review_duration=phase_stats["review"]["duration"],
-                review_finish=phase_stats["review"]["finish"],
+                pipeline_outcome=pipeline_outcome,
+                pipeline_outcome_detail=pipeline_outcome_detail,
+                investigate_turns=phase_stats.get("investigate", _default_phase_stat)["turns"],
+                investigate_cost=phase_stats.get("investigate", _default_phase_stat)["cost"],
+                investigate_duration=phase_stats.get("investigate", _default_phase_stat)["duration"],
+                investigate_finish=phase_stats.get("investigate", _default_phase_stat)["finish"],
+                implement_turns=phase_stats.get("implement", _default_phase_stat)["turns"],
+                implement_cost=phase_stats.get("implement", _default_phase_stat)["cost"],
+                implement_duration=phase_stats.get("implement", _default_phase_stat)["duration"],
+                implement_finish=phase_stats.get("implement", _default_phase_stat)["finish"],
+                review_turns=phase_stats.get("review", _default_phase_stat)["turns"],
+                review_cost=phase_stats.get("review", _default_phase_stat)["cost"],
+                review_duration=phase_stats.get("review", _default_phase_stat)["duration"],
+                review_finish=phase_stats.get("review", _default_phase_stat)["finish"],
                 total_cost=spent,
             )
             audit_resp = _call_agent(prompt, phase="audit", cwd=wt, model="opus")
@@ -1058,43 +1165,14 @@ def run_pipeline(
                      audit_verdict.get("is_golden"),
                      audit_verdict.get("error_categories"))
 
-            _guard(spent, budget)
-        except BudgetExceeded:
-            log.warning("[audit] budget exceeded after PR creation — skipping audit write")
-            storage.log_event(conn, "audit_skipped", {"reason": "budget_exceeded"})
+            # Attach audit results to the pipeline result
+            pipeline_result["audit_grade"] = audit_verdict.get("overall_grade")
+            pipeline_result["is_golden"] = audit_verdict.get("is_golden", False)
+
         except Exception:
-            log.exception("[audit] audit phase failed (non-fatal — PR already created)")
+            log.exception("[audit] audit phase failed (non-fatal)")
             storage.log_event(conn, "audit_error", {"error": "audit phase exception"})
 
-        storage.finish_run(conn, "ok", total_cost=spent, branch=branch)
-        return {
-            "status": "ok",
-            "pr_url": pr["url"],
-            "spent_usd": spent,
-            "run_id": run_id,
-            "audit_grade": audit_verdict.get("overall_grade") if audit_verdict else None,
-            "is_golden": audit_verdict.get("is_golden", False) if audit_verdict else False,
-        }
-
-    except BudgetExceeded as e:
-        log.error("budget exceeded: %s", e)
-        storage.finish_run(conn, "budget_exceeded", total_cost=spent)
-        _post_failure(repo, issue_number, str(e))
-        return {"status": "error", "error": str(e), "spent_usd": spent, "run_id": run_id}
-
-    except Exception as e:
-        log.exception("pipeline failed during phase '%s' (spent $%.2f so far)", current_phase, spent)
-        error_detail = f"[{current_phase}] {e} (spent ${spent:.2f})"
-        storage.finish_run(conn, "error", total_cost=spent)
-        storage.log_event(conn, "pipeline_error", {
-            "error": str(e),
-            "phase": current_phase,
-            "spent_usd": spent,
-        })
-        _post_failure(repo, issue_number, error_detail)
-        return {"status": "error", "error": error_detail, "spent_usd": spent, "run_id": run_id}
-
-    finally:
         # Do NOT clean up the worktree -- just log its location
         log.info("worktree preserved at: %s", wt)
         conn.close()
