@@ -84,6 +84,15 @@ Produce a structured investigation report with these sections:
 4. **Proposed Fix** -- for each file, show the minimal before/after code changes
 5. **Risk Assessment** -- what could go wrong, confidence level (HIGH/MEDIUM/LOW)
 6. **Related Issues** -- other issues that amplify or compound this bug (separate, not root cause)
+7. **Peer Implementations** (mandatory when integrating with an existing API/system) -- \
+when the task involves integrating with, extending, or following an existing pattern \
+(API, registry, component system, state machine), identify at least 2 existing consumers \
+of that API. For each, document:
+   - Where they call it (file:line)
+   - How often (once on init, on every state change, on specific events)
+   - What lifecycle hooks or state triggers the call
+This section prevents "correct structure, wrong behavior" failures where the implementation \
+looks right but misses the usage contract.
 
 ### Workstream discipline
 
@@ -251,6 +260,49 @@ the specific file and what needs to change.
 
 Only describe code you can see in the diff or files you have read. Never infer \
 behavior -- verify it.
+"""
+
+IMPLEMENT_RETRY_PROMPT = """\
+You are re-implementing a fix for GitHub issue #{issue_number}.
+
+Your working directory is the target repository. All file paths are relative to \
+the repository root.
+
+## Issue
+
+{issue_body}
+
+## Investigation Report
+
+{investigation_report}
+
+## Previous Review Findings
+
+Your previous implementation was rejected by the reviewer. Here are the findings:
+
+{review_findings}
+
+## Rejected Diff
+
+```diff
+{rejected_diff}
+```
+
+## Instructions
+
+Fix ALL the issues identified by the reviewer. Do not re-investigate — the \
+investigation report is still valid. Focus only on fixing the specific problems \
+listed above.
+
+1. Read the reviewer's findings carefully — each numbered item is a required fix
+2. For each finding, make the specific change requested
+3. After making changes, verify with:
+   (a) Run any relevant test command from the repo to confirm nothing is broken
+   (b) A quick grep to confirm your changes are in place
+4. After making all changes, run `git add -A && git commit -m 'fix: address review feedback for #{issue_number}'`
+
+Keep changes minimal. Do not refactor unrelated code. Do not leave debug \
+statements or commented-out code.
 """
 
 DEEP_REVIEW_PROMPT = """\
@@ -802,6 +854,7 @@ def run_pipeline(
     budget: float = 5.00,
     model_override: str | None = None,
     repo_path: str | None = None,
+    review_retries: int = 1,
 ) -> dict:
     """Run the 3-step pipeline: investigate -> implement -> review+PR.
 
@@ -1000,29 +1053,121 @@ def run_pipeline(
         review_text = _content(resp)
         log.info("[review] done (%.1fs, $%.4f)", resp["duration_s"], resp["cost"])
 
-        # ---- Review gate: check verdict before proceeding ----
-        if "REQUEST_CHANGES" in review_text:
-            log.warning("[review] verdict is REQUEST_CHANGES — blocking PR creation")
-            storage.log_event(conn, "review_blocked", {"text": review_text})
-            try:
-                source.post_comment(repo, issue_number,
-                    f"**Pipeline review blocked PR creation.**\n\n{review_text[:3000]}")
-            except Exception:
-                log.warning("failed to post review_blocked comment on %s#%d", repo, issue_number)
-            pipeline_outcome = "review_blocked"
-            pipeline_outcome_detail = (
-                "Review phase returned REQUEST_CHANGES verdict. PR was NOT created. "
-                "The review identified problems that need fixing before the code ships."
+        # ---- Review gate: check verdict, retry if REQUEST_CHANGES ----
+        review_attempt = 0
+        while "REQUEST_CHANGES" in review_text:
+            review_attempt += 1
+            if review_attempt > review_retries:
+                # Exhausted retries — block PR creation
+                log.warning("[review] verdict is REQUEST_CHANGES after %d attempt(s) — blocking PR creation",
+                            review_attempt)
+                storage.log_event(conn, "review_blocked", {
+                    "text": review_text,
+                    "attempts": review_attempt,
+                })
+                try:
+                    source.post_comment(repo, issue_number,
+                        f"**Pipeline review blocked PR creation ({review_attempt} attempt(s)).**\n\n{review_text[:3000]}")
+                except Exception:
+                    log.warning("failed to post review_blocked comment on %s#%d", repo, issue_number)
+                pipeline_outcome = "review_blocked"
+                pipeline_outcome_detail = (
+                    f"Review phase returned REQUEST_CHANGES verdict after {review_attempt} attempt(s). "
+                    "PR was NOT created. The review identified problems that need fixing before the code ships."
+                )
+                storage.finish_run(conn, "review_blocked", total_cost=spent, branch=branch)
+                pipeline_result = {
+                    "status": "review_blocked",
+                    "review_text": review_text,
+                    "spent_usd": spent,
+                    "run_id": run_id,
+                }
+                # fall through to audit in finally block
+                return pipeline_result
+
+            # ---- Retry: feed review findings back into a new implement attempt ----
+            log.info("[review] REQUEST_CHANGES on attempt %d — retrying implement (max retries: %d)",
+                     review_attempt, review_retries)
+            storage.log_event(conn, "review_retry", {
+                "attempt": review_attempt,
+                "review_findings": review_text[:5000],
+            })
+
+            rejected_diff = diff
+
+            # Re-implement with review feedback
+            current_phase = f"implement_retry_{review_attempt}"
+            log.info("[implement_retry_%d] starting", review_attempt)
+            pid = _start_phase(conn, f"implement_retry_{review_attempt}")
+            retry_prompt = IMPLEMENT_RETRY_PROMPT.format(
+                issue_number=issue_number,
+                issue_body=issue_body,
+                investigation_report=investigation_report,
+                review_findings=review_text,
+                rejected_diff=rejected_diff,
             )
-            storage.finish_run(conn, "review_blocked", total_cost=spent, branch=branch)
-            pipeline_result = {
-                "status": "review_blocked",
-                "review_text": review_text,
-                "spent_usd": spent,
-                "run_id": run_id,
+            resp = _call_agent(retry_prompt, phase="implement", cwd=wt,
+                              model=model_override)
+            resp["_prompt"] = retry_prompt
+            spent += resp["cost"]
+            phase_stats[f"implement_retry_{review_attempt}"] = {
+                "turns": resp.get("num_turns", 0),
+                "cost": resp.get("cost", 0.0),
+                "duration": resp.get("duration_s", 0.0),
+                "finish": resp.get("finish_reason", ""),
             }
-            # fall through to audit in finally block
-            return pipeline_result
+            _finish_phase(conn, pid, resp,
+                          failed=(resp.get("finish_reason") == "error"))
+            _guard(spent, budget)
+            log.info("[implement_retry_%d] done (%.1fs, $%.4f)",
+                     review_attempt, resp["duration_s"], resp["cost"])
+
+            # Safety-net commit for retry
+            porcelain = subprocess.run(
+                ["git", "status", "--porcelain"], cwd=wt,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            if porcelain:
+                log.warning("implement_retry_%d left uncommitted changes -- safety-net commit",
+                            review_attempt)
+                subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
+                subprocess.run(
+                    ["git", "commit", "-m",
+                     f"fix: address review feedback for #{issue_number} (retry {review_attempt})"],
+                    cwd=wt, check=True,
+                )
+                storage.log_event(conn, "safety_net_commit_retry", {
+                    "attempt": review_attempt, "files": porcelain,
+                })
+
+            # Re-review the updated diff
+            current_phase = f"review_retry_{review_attempt}"
+            diff = workspace.get_diff(wt)[:50_000]
+            log.info("[review_retry_%d] starting", review_attempt)
+            pid = _start_phase(conn, f"review_retry_{review_attempt}")
+            prompt = REVIEW_PROMPT.format(
+                issue_number=issue_number,
+                issue_body=issue_body,
+                investigation_report=investigation_report,
+                diff=diff,
+            )
+            resp = _call_agent(prompt, phase="review", cwd=wt,
+                              model=model_override)
+            resp["_prompt"] = prompt
+            spent += resp["cost"]
+            phase_stats[f"review_retry_{review_attempt}"] = {
+                "turns": resp.get("num_turns", 0),
+                "cost": resp.get("cost", 0.0),
+                "duration": resp.get("duration_s", 0.0),
+                "finish": resp.get("finish_reason", ""),
+            }
+            _finish_phase(conn, pid, resp,
+                          failed=(resp.get("finish_reason") == "error"))
+
+            review_text = _content(resp)
+            log.info("[review_retry_%d] done (%.1fs, $%.4f)",
+                     review_attempt, resp["duration_s"], resp["cost"])
+            # Loop back to check if this review also says REQUEST_CHANGES
 
         # Push and create PR
         destination.push_branch(wt, branch)
