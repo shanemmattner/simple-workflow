@@ -1370,6 +1370,22 @@ def run_pipeline(
     # db_path is a string from storage module, extract run_id from filename
     run_id = os.path.splitext(os.path.basename(db_path))[0]
 
+    # Check for existing PR on this issue before doing any work
+    try:
+        pr_check = subprocess.run(
+            ["gh", "pr", "list", "--repo", repo, "--search", f"issue {issue_number}", "--state", "open", "--json", "number,title,url"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if pr_check.returncode == 0 and pr_check.stdout.strip() not in ("", "[]"):
+            existing_prs = json.loads(pr_check.stdout)
+            if existing_prs:
+                urls = ", ".join(p.get("url", "") for p in existing_prs)
+                log.warning("[pre-check] open PR(s) already exist for issue #%d: %s — aborting", issue_number, urls)
+                conn.close()
+                return {"status": "skipped", "error": f"Open PR already exists: {urls}", "spent_usd": 0.0, "run_id": run_id}
+    except Exception:
+        log.warning("[pre-check] failed to check for existing PRs, continuing anyway")
+
     # Set up workspace
     run_start = datetime.now()
     branch = f"three-step/issue-{issue_number}-{run_start.strftime('%m%d-%H%M')}"
@@ -1377,6 +1393,19 @@ def run_pipeline(
         repo_path = _find_repo_path(repo)
     wt = workspace.create_workspace(repo_path, branch)
     spent = 0.0
+
+    # Hide target repo's CLAUDE.md so it doesn't override pipeline agent behavior
+    claude_md_path = os.path.join(wt, "CLAUDE.md")
+    claude_md_hidden = os.path.join(wt, "CLAUDE.md.pipeline-hidden")
+    if os.path.exists(claude_md_path):
+        os.rename(claude_md_path, claude_md_hidden)
+        log.info("[init] hid CLAUDE.md → CLAUDE.md.pipeline-hidden in worktree")
+
+    claude_dir = os.path.join(wt, ".claude")
+    claude_dir_hidden = os.path.join(wt, ".claude.pipeline-hidden")
+    if os.path.isdir(claude_dir):
+        os.rename(claude_dir, claude_dir_hidden)
+        log.info("[init] hid .claude/ → .claude.pipeline-hidden/ in worktree")
 
     current_phase = "init"
     phase_stats: dict[str, dict] = {}
@@ -1860,6 +1889,16 @@ def run_pipeline(
         except Exception:
             log.exception("[learn] learning phase failed (non-fatal)")
             storage.log_event(conn, "learning_error", {"error": "learning phase exception"})
+
+        # Restore hidden CLAUDE.md
+        if os.path.exists(claude_md_hidden):
+            os.rename(claude_md_hidden, claude_md_path)
+            log.info("[cleanup] restored CLAUDE.md.pipeline-hidden → CLAUDE.md")
+
+        # Restore hidden .claude/
+        if os.path.exists(claude_dir_hidden):
+            os.rename(claude_dir_hidden, claude_dir)
+            log.info("[cleanup] restored .claude.pipeline-hidden/ → .claude/")
 
         # Do NOT clean up the worktree -- just log its location
         log.info("worktree preserved at: %s", wt)
