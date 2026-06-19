@@ -5,10 +5,13 @@ subscription (no API credits). Adapted from shftty/workflows/src/agent.py.
 """
 
 import json
+import logging
 import os
 import subprocess
 import time
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 
 def parse_json(text: str) -> dict:
@@ -84,10 +87,9 @@ def run_phase_agent(
     """
     Run a claude agent for a pipeline phase.
 
-    Writes the prompt to a temp file in the worktree, then invokes:
-      claude "Read {prompt_file} and execute every instruction in it."
-        --output-format json --model {model} --max-turns {max_turns}
-        --permission-mode bypassPermissions
+    Passes the prompt directly as a positional argument:
+      claude "{prompt}" --output-format json --model {model}
+        --max-turns {max_turns} --permission-mode bypassPermissions
 
     Args:
         worktree:  path the agent cwd
@@ -109,18 +111,34 @@ def run_phase_agent(
         prompts_dir.mkdir(parents=True, exist_ok=True)
         (prompts_dir / f"{phase}.md").write_text(prompt, encoding="utf-8")
 
-    # Write prompt to file in the worktree (prompt may exceed shell arg limits)
-    prompt_file = Path(worktree) / f".pipeline-{phase}-prompt.md"
-    prompt_file.write_text(prompt, encoding="utf-8")
-
     cmd = [
         "claude",
-        f"Read {prompt_file} and execute every instruction in it.",
+        prompt,
         "--output-format", "json",
         "--model", model,
         "--max-turns", str(max_turns),
         "--permission-mode", "bypassPermissions",
     ]
+
+    # Hide target repo's CLAUDE.md and .claude/ to prevent them from
+    # silently overriding pipeline agent behavior (lesson: shftty's CLAUDE.md
+    # tells agents "You NEVER write code", causing execute agents to no-op).
+    wt = Path(worktree)
+    claude_md = wt / "CLAUDE.md"
+    claude_md_hidden = wt / "CLAUDE.md.pipeline-hidden"
+    claude_dir = wt / ".claude"
+    claude_dir_hidden = wt / ".claude.pipeline-hidden"
+    hid_claude_md = False
+    hid_claude_dir = False
+
+    if claude_md.exists():
+        log.info("Hiding %s → %s", claude_md, claude_md_hidden)
+        claude_md.rename(claude_md_hidden)
+        hid_claude_md = True
+    if claude_dir.exists():
+        log.info("Hiding %s → %s", claude_dir, claude_dir_hidden)
+        claude_dir.rename(claude_dir_hidden)
+        hid_claude_dir = True
 
     start_ms = time.time() * 1000
     hit_timeout = False
@@ -146,9 +164,13 @@ def run_phase_agent(
     except Exception as exc:
         raw_output = str(exc)
     finally:
-        # Always clean up the temp prompt file
-        if prompt_file.exists():
-            prompt_file.unlink()
+        # Always restore hidden CLAUDE.md and .claude/
+        if hid_claude_md and claude_md_hidden.exists():
+            log.info("Restoring %s → %s", claude_md_hidden, claude_md)
+            claude_md_hidden.rename(claude_md)
+        if hid_claude_dir and claude_dir_hidden.exists():
+            log.info("Restoring %s → %s", claude_dir_hidden, claude_dir)
+            claude_dir_hidden.rename(claude_dir)
 
     duration_ms = int(time.time() * 1000 - start_ms)
 
@@ -156,6 +178,7 @@ def run_phase_agent(
     # Claude emits either a list of events or a single result object
     envelope: dict = {}
     result_text = ""
+    payload: list | dict | None = None
 
     if raw_output.strip():
         try:
@@ -174,6 +197,20 @@ def run_phase_agent(
 
     if envelope:
         result_text = envelope.get("result", "")
+
+        # Bug 2 fix: fallback content extraction when result is empty
+        # but assistant text exists in the event stream
+        if not result_text and isinstance(payload, list):
+            text_parts = []
+            for event in payload:
+                if event.get("type") == "assistant":
+                    message = event.get("message", {})
+                    for block in message.get("content", []):
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text_parts.append(block["text"])
+            if text_parts:
+                result_text = "\n\n".join(text_parts)
+
         usage = envelope.get("usage", {})
         tokens_in = usage.get("input_tokens", 0)
         tokens_out = usage.get("output_tokens", 0)
@@ -183,7 +220,16 @@ def run_phase_agent(
         session_id = envelope.get("session_id", "")
         num_turns = envelope.get("num_turns", 0)
         stop_reason = envelope.get("stop_reason", "")
-        hit_turn_limit = stop_reason == "max_turns"
+
+        # Bug 1 fix: detect max_turns hit via subtype for mid-tool-call stops
+        subtype = envelope.get("subtype", "")
+        hit_turn_limit = stop_reason == "max_turns" or subtype == "error_max_turns"
+
+        # Bug 3 fix: detect error condition from is_error flag
+        is_error = envelope.get("is_error", False)
+        if is_error and stop_reason not in ("error",):
+            log.warning("Claude CLI returned is_error=True with stop_reason=%r", stop_reason)
+            stop_reason = "error"
     else:
         tokens_in = 0
         tokens_out = 0

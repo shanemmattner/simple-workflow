@@ -11,12 +11,15 @@ Part of the closed-loop improvement cycle (PRD section 7):
 from __future__ import annotations
 
 FAILURE_CATEGORIES: list[str] = [
-    "wrong_scope",
-    "incomplete_impl",
-    "test_failure",
-    "hallucination",
-    "timeout",
-    "format_error",
+    "NO_EDITS",
+    "WRONG_FILES",
+    "THIN_REPORT",
+    "DEBUG_LEFTOVERS",
+    "TYPE_ERROR",
+    "TEST_FAILURE",
+    "RE_INVESTIGATION",
+    "INCOMPLETE_FIX",
+    "OVERCOMPLICATED",
 ]
 
 

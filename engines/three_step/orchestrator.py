@@ -10,6 +10,7 @@ import glob
 import json
 import logging
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -84,6 +85,24 @@ Produce a structured investigation report with these sections:
 5. **Risk Assessment** -- what could go wrong, confidence level (HIGH/MEDIUM/LOW)
 6. **Related Issues** -- other issues that amplify or compound this bug (separate, not root cause)
 
+### Workstream discipline
+
+Identify the PRIMARY workstream for this issue (frontend, backend, database, \
+infrastructure, etc.) and stay within it. Do NOT attempt fixes outside your \
+primary workstream.
+
+If you discover work needed in a different workstream (e.g., a frontend issue \
+that needs a new API endpoint, or a UI fix that requires a database migration), \
+do NOT fold it into your investigation. Instead:
+
+1. Note the dependency in your report under **Related Issues**
+2. Include a `gh issue create` command for the dependency:
+   `gh issue create --title "..." --body "Dependency of #{issue_number}. ..." --repo REPO`
+3. Proceed with ONLY the work in your primary workstream
+
+Your report's **Affected Files** must contain files from a single workstream. \
+Mixed workstreams produce overcomplicated PRs that fail review.
+
 ### Anti-patterns to avoid
 
 - Do NOT fixate on the first plausible-sounding pattern match. If you find something \
@@ -127,8 +146,14 @@ code shown in the report
 3. After making changes, verify with:
    (a) Run any relevant test command from the repo to confirm nothing is broken
    (b) A quick grep to confirm your changes are in place
-4. If appropriate, add a test for the fix
-5. After making all changes, run `git add -A && git commit -m 'fix: resolve #{issue_number}'`
+4. You MUST add or update at least one test that verifies your fix. If the repo \
+has no test infrastructure for this area of code, state that explicitly in your \
+summary with the reason why no test was added. "If appropriate" is not a valid \
+reason to skip -- default to writing a test.
+5. Before declaring done, list every acceptance criterion from the issue and confirm \
+each is addressed by your changes. If any criterion is not covered, report it \
+explicitly.
+6. After making all changes, run `git add -A && git commit -m 'fix: resolve #{issue_number}'`
 
 If the investigation report is wrong (a file doesn't exist, the code doesn't match \
 what's described), STOP and report the discrepancy as your final message. Do not \
@@ -141,13 +166,22 @@ statements or commented-out code.
 """
 
 REVIEW_PROMPT = """\
-You are reviewing changes for GitHub issue #{issue_number}.
+You are an adversarial code reviewer for GitHub issue #{issue_number}.
 
-Your working directory is the target repository.
+You have FULL access to the codebase. Your working directory is the target repository. \
+You can read any file, grep for patterns, and explore the code to verify claims. \
+Use your tools aggressively -- do not trust the diff at face value.
+
+Your job is to find problems, not confirm the fix works. Assume the implementation is \
+wrong until you have verified otherwise by reading the actual code.
 
 ## Issue
 
 {issue_body}
+
+## Investigation Report
+
+{investigation_report}
 
 ## Diff
 
@@ -155,27 +189,300 @@ Your working directory is the target repository.
 {diff}
 ```
 
-## Instructions
+## Review Protocol
 
-Review the diff and check:
+Work through each check below. For each one, use your tools to verify -- do not skip \
+any check or rely on inference.
 
-1. Does it actually fix the issue described?
-2. Are there any bugs or potential regressions?
-3. Are the changes minimal and focused?
-4. Is there any debug code, commented-out code, or leftovers?
+### 1. Read the diff carefully
+Understand every changed line. Note anything that looks suspicious, incomplete, or \
+inconsistent.
 
-If the diff is empty or trivially small (<5 lines changed), verdict should be \
-REQUEST_CHANGES with explanation of what's missing.
+### 2. Verify changes in context
+For every file modified in the diff, read the surrounding code (at least 50 lines \
+above and below each change site). Verify the change makes sense in context -- correct \
+variable names, correct function signatures, no broken imports, no violated assumptions.
 
-Produce a PR summary with:
+### 3. Verify new code is wired up
+For every new component, function, hook, utility, or export created in the diff, grep \
+the codebase to verify it is actually imported and used somewhere. Dead code that was \
+written but never connected is a common failure mode.
 
+### 4. Check acceptance criteria coverage
+Extract every acceptance criterion from the issue. For each one, find the specific \
+line(s) in the diff that address it. If any criterion is not covered by the diff, \
+flag it explicitly. Do not assume a criterion is met -- find the code.
+
+### 5. Check for missing tests
+If no test file was added or modified in the diff, flag it. If a test was added, read \
+it and verify it actually tests the fix (not just a stub or trivially passing test).
+
+### 6. Check for debug artifacts
+Scan the diff for: console.log, console.warn, console.error (unless intentional logging), \
+debugger statements, TODO/FIXME/HACK comments, commented-out code blocks, hardcoded \
+values that should be configurable.
+
+### 7. Verify investigation alignment
+Compare the investigation report's stated root cause with what was actually fixed in \
+the diff. If they diverge (e.g., investigation says "problem is in X" but diff changes Y), \
+flag the mismatch.
+
+## Output Format
+
+Structure your response in two clearly separated sections:
+
+### PR Description
+Write a factual summary of what the diff changes. Only reference code that exists \
+in the diff or that you have read from the repository. This section will be used as \
+the PR body.
+
+### Review Assessment
+Your technical review with:
 - **What changed** -- brief description of the fix
-- **How it works** -- technical explanation
-- **Testing** -- what was tested or should be tested
-- **Verdict** -- your verdict MUST be one of: APPROVE, REQUEST_CHANGES, NEEDS_DISCUSSION. \
-Do not hedge.
+- **How it works** -- technical explanation referencing specific code you read
+- **Issues found** -- every problem discovered during the review protocol above
+- **Testing** -- what was tested, or what testing is missing
+- **Verdict** -- your verdict MUST be one of: APPROVE, REQUEST_CHANGES, NEEDS_DISCUSSION
 
-If verdict is REQUEST_CHANGES, explain specifically what needs to change.
+If you would not pass this in a real code review, verdict MUST be REQUEST_CHANGES.
+
+If verdict is REQUEST_CHANGES, list each required change as a numbered item with \
+the specific file and what needs to change.
+
+Only describe code you can see in the diff or files you have read. Never infer \
+behavior -- verify it.
+"""
+
+DEEP_REVIEW_PROMPT = """\
+You are an adversarial deep reviewer for GitHub issue #{issue_number}.
+
+You have FULL access to the codebase. Your working directory is the target repository. \
+Use tools aggressively -- read files, grep for patterns, run tests. Your job is to find \
+problems the initial review missed.
+
+## Issue
+
+{issue_body}
+
+## Investigation Report
+
+{investigation_report}
+
+## Diff
+
+```diff
+{diff}
+```
+
+## Initial Review
+
+{review_text}
+
+## PR
+
+{pr_url}
+
+## Deep Review Protocol
+
+Work through EVERY step below. Do not skip any.
+
+### 1. Read every file in the diff
+For each modified file, read the full file (or at least 100 lines of surrounding context \
+around each change site). Understand how the change fits into the broader module.
+
+### 2. Verify new code is wired up
+For every new component, function, import, hook, or export created in the diff, grep the \
+codebase to verify it is actually imported and used somewhere. Dead code that was written \
+but never connected is a common failure mode.
+
+### 3. Check acceptance criteria
+Extract every acceptance criterion from the issue. For each one, find the specific line(s) \
+in the diff that address it. If any criterion is not covered, flag it explicitly.
+
+### 4. Run tests
+If the repo has a test command (check package.json scripts, Makefile, pytest.ini, etc.), \
+run it. Report the results.
+
+### 5. Look for problems
+Scan for:
+- Missing error handling (what happens when X fails?)
+- Null safety gaps (what if this value is undefined/null?)
+- Security issues (user input validation, auth checks, SQL injection, XSS)
+- Performance problems (N+1 queries, unbounded loops, missing indexes)
+- Missing tests for the new code
+- Debug artifacts (console.log, debugger, TODO/FIXME, hardcoded values)
+- Race conditions or state management issues
+
+### 6. Check for regressions
+Read related components that interact with the changed code. Could this fix break any \
+other feature? Check imports, shared state, and downstream consumers.
+
+### 7. Compare investigation vs implementation
+Compare the investigation report's proposed fix against what was actually implemented. \
+Flag any divergence.
+
+## Output Format
+
+List every problem found with specific file:line references.
+
+End with a verdict -- one of:
+- **APPROVE** -- merge-ready, no significant issues found
+- **CONCERNS** -- merge with noted risks (list them)
+- **BLOCK** -- should not merge without changes (list specific corrections needed)
+
+If verdict is BLOCK or CONCERNS, list each correction as a numbered item with the \
+specific file and what needs to change.
+"""
+
+AUDIT_PROMPT = """\
+You are the Post-Run Auditor. Evaluate the pipeline run described below. Write your \
+analysis naturally — reason through each dimension, then state your conclusions.
+
+## Run Context
+
+**Issue #{issue_number}**
+
+{issue_body}
+
+---
+
+**Investigation Report**
+
+{investigation_report}
+
+---
+
+**Full Diff**
+
+```diff
+{diff}
+```
+
+---
+
+**Review Verdict**
+
+{review_text}
+
+---
+
+**Deep Review**
+
+{deep_review_text}
+
+---
+
+**Run Metadata**
+
+- Run ID: {run_id}
+- PR: {pr_url}
+- Investigate: {investigate_turns} turns, ${investigate_cost:.4f}, {investigate_duration:.0f}s, stop={investigate_finish}
+- Implement: {implement_turns} turns, ${implement_cost:.4f}, {implement_duration:.0f}s, stop={implement_finish}
+- Review: {review_turns} turns, ${review_cost:.4f}, {review_duration:.0f}s, stop={review_finish}
+- Total: ${total_cost:.4f}
+
+---
+
+## Evaluation Dimensions
+
+Score each dimension 1–5. Be harsh. A score of 5 means this phase could serve as \
+a training example. A score of 3 means acceptable but flawed. Below 3 means the \
+phase produced output that degraded the next phase.
+
+For each dimension, write your reasoning first, then state the score as "D1: N/5" \
+(or D2, D3, D4).
+
+### D1: Investigation Quality (1–5)
+- Did the report trace symptom → code path → root cause with specific file:line citations?
+- Did it start from the user-visible entry point, or did it grep broadly for keywords?
+- Did it produce a numbered reproduction chain?
+- Did it correctly identify all files that needed changing?
+- Penalty: -1 if root cause is stated without a concrete code path. \
+  -1 if "Affected Files" includes files the implement phase did not touch. \
+  -1 if report is under 600 chars (THIN_REPORT). \
+  -1 if report exceeds 18 tool calls worth of investigation (OVER_EXPLORED).
+
+### D2: Implementation Quality (1–5)
+- Did the implement phase follow the investigation without re-investigating?
+- Are changes minimal and focused to the files listed in the report?
+- No debug statements, commented-out code, or unrelated refactors?
+- Did it run tests and confirm they pass?
+- Penalty: -1 for each file changed that was NOT in the investigation's "Affected Files". \
+  -1 if implement turns exceeded investigate turns (RE_INVESTIGATION signal). \
+  -1 if diff contains any of: `console.log`, `print(`, `debugger`, `TODO`, `FIXME` in changed lines.
+
+### D3: Fix Correctness (1–5)
+- Does the diff actually address the root cause identified in the investigation?
+- Are there any obvious regressions (changed code paths with no test coverage)?
+- Are edge cases from the issue addressed?
+- Is the change complete, or does it fix one symptom while leaving another?
+- Penalty: -1 if the review verdict is REQUEST_CHANGES. \
+  -1 if the diff modifies a file but leaves the specific bug line unchanged. \
+  -1 if the review identifies any regression.
+
+### D4: Process Efficiency (1–5)
+- Were turns used effectively, or was there redundant exploration?
+- Did the investigate phase stay within 15 turns for straightforward issues?
+- Did the implement phase start making changes within the first 3 turns?
+- Was total cost under $3.00?
+- Penalty: -1 if investigate used >20 turns. \
+  -1 if implement used >25 turns without a complexity justification. \
+  -1 if total cost exceeded $4.00.
+
+---
+
+## Error Taxonomy
+
+Scan the run for these error patterns. List every category that applies by name.
+
+| Category | Definition |
+|---|---|
+| NO_EDITS | Implement phase produced zero file changes |
+| WRONG_FILES | Implement changed files not in investigation's Affected Files |
+| THIN_REPORT | Investigation report under 600 chars or missing ≥2 required sections |
+| DEBUG_LEFTOVERS | Diff contains console.log / print( / debugger / commented-out blocks |
+| TYPE_ERROR | Diff introduces an obvious type mismatch or undefined variable |
+| TEST_FAILURE | Review or metadata indicates tests failed |
+| RE_INVESTIGATION | Implement used grep/find/read on files not in Affected Files before editing |
+| INCOMPLETE_FIX | Fix addresses symptom but not root cause (review says REQUEST_CHANGES) |
+| OVERCOMPLICATED | Diff modifies >3× the lines needed (can be inferred from diff size vs. fix scope) |
+
+---
+
+## Golden Dataset Criteria
+
+A run qualifies as GOLDEN if ALL of the following are true:
+1. D1 ≥ 4 (investigation has concrete code path, correct files)
+2. D2 ≥ 4 (implementation followed investigation, no artifacts)
+3. D3 ≥ 4 (fix is correct, no regressions)
+4. D4 ≥ 3 (cost < $3.00, no excessive turns)
+5. Review verdict is APPROVE
+6. Error categories list is empty
+
+State whether this run is golden. If not, list the specific blockers.
+
+---
+
+## Prompt Improvement Signals
+
+For each dimension scored ≤ 3, identify the specific phase prompt that needs changing \
+and what constraint is missing or weak. Be specific: quote the failure behavior, \
+state the anti-pattern, and draft the missing constraint in ≤2 sentences.
+
+---
+
+## What to include in your analysis
+
+- For each dimension: your reasoning, then the score as "D1: N/5" (same for D2, D3, D4)
+- Error categories found (use the exact category names from the taxonomy)
+- Grade: A/B/C/D/F (A = all scores ≥ 4, B = avg ≥ 3.5, C = avg ≥ 2.5, D = avg ≥ 1.5, F = avg < 1.5)
+- Whether this run is golden, and if not, what blocks it
+- What went right and what went wrong
+- Prompt improvement suggestions for low-scoring dimensions
+
+NEVER:
+- Invent tool calls — you have no tools. All context is above.
+- Assign scores higher than the evidence supports.
 """
 
 
@@ -183,9 +490,9 @@ If verdict is REQUEST_CHANGES, explain specifically what needs to change.
 # Helpers
 # ---------------------------------------------------------------------------
 
-PHASE_MODELS = {"investigate": "haiku", "implement": "sonnet", "review": "haiku"}
-PHASE_MAX_TURNS = {"investigate": 25, "implement": 30, "review": 10}
-PHASE_BUDGET = {"investigate": 1.50, "implement": 2.50, "review": 0.50}
+PHASE_MODELS = {"investigate": "sonnet", "implement": "sonnet", "review": "sonnet", "deep_review": "opus", "audit": "opus"}
+PHASE_MAX_TURNS = {"investigate": 40, "implement": 30, "review": 25, "deep_review": 50, "audit": 10}
+PHASE_BUDGET = {"investigate": 1.50, "implement": 2.50, "review": 1.50, "deep_review": 3.00, "audit": 3.00}
 
 
 class BudgetExceeded(RuntimeError):
@@ -309,6 +616,100 @@ def _call_claude(prompt: str, *, phase: str, cwd: str, model: str | None = None)
     }
 
 
+def _extract_audit_verdict(text: str) -> dict:
+    """Extract structured audit data from natural language audit text.
+
+    Looks for dimension scores (D1-D4), error categories, grade, golden status,
+    and findings. Lenient — returns None/empty for fields it can't find.
+    """
+    verdict: dict[str, Any] = {}
+
+    # Extract dimension scores: "D1: 4/5" or "D1: 4" patterns
+    scores: dict[str, int] = {}
+    score_map = {
+        "D1": "investigation_quality",
+        "D2": "implementation_quality",
+        "D3": "fix_correctness",
+        "D4": "process_efficiency",
+    }
+    for key, field in score_map.items():
+        match = re.search(rf'{key}\s*:\s*(\d)\s*/?\s*5?', text)
+        if match:
+            scores[field] = int(match.group(1))
+    verdict["scores"] = scores if scores else None
+
+    # Extract error categories from the verdict/findings section (last 30% of text),
+    # not the taxonomy definition table that gets echoed in the prompt.
+    # Also require contextual markers (bullet, comma-list, bracket-list) to avoid
+    # matching category names that appear only in the reference table.
+    error_cats = []
+    known_cats = [
+        "NO_EDITS", "WRONG_FILES", "THIN_REPORT", "DEBUG_LEFTOVERS",
+        "TYPE_ERROR", "TEST_FAILURE", "RE_INVESTIGATION",
+        "INCOMPLETE_FIX", "OVERCOMPLICATED",
+    ]
+    # Only scan the last 30% of the text where the actual verdict/findings live
+    cutoff = len(text) - len(text) // 3
+    verdict_section = text[cutoff:]
+    for cat in known_cats:
+        # Match in context: preceded by bullet/dash/comma/bracket/colon, or
+        # appearing as a standalone word in the verdict section
+        if re.search(rf'(?:[-*•,\[\s:])\s*{cat}\b', verdict_section):
+            error_cats.append(cat)
+    verdict["error_categories"] = error_cats
+
+    # Extract overall grade
+    grade_match = re.search(r'[Gg]rade\s*:\s*([ABCDF])\b', text)
+    if grade_match:
+        verdict["overall_grade"] = grade_match.group(1)
+    else:
+        # Try standalone grade pattern like "Overall: B" or "**B**"
+        grade_match2 = re.search(r'[Oo]verall\s*[:\-]\s*([ABCDF])\b', text)
+        if grade_match2:
+            verdict["overall_grade"] = grade_match2.group(1)
+        else:
+            verdict["overall_grade"] = None
+
+    # Extract golden status
+    golden_lower = text.lower()
+    if "is golden" in golden_lower or "qualifies as golden" in golden_lower:
+        verdict["is_golden"] = True
+    elif "not golden" in golden_lower or "does not qualify" in golden_lower or "is not golden" in golden_lower:
+        verdict["is_golden"] = False
+    else:
+        verdict["is_golden"] = False
+
+    # Extract findings: what went right/wrong (look for bullet points after headers)
+    right: list[str] = []
+    wrong: list[str] = []
+    right_section = re.search(
+        r'[Ww]hat went right[:\s]*\n((?:\s*[-*].+\n?)+)', text
+    )
+    if right_section:
+        right = [line.strip().lstrip('-*').strip() for line in right_section.group(1).strip().split('\n') if line.strip()]
+    wrong_section = re.search(
+        r'[Ww]hat went wrong[:\s]*\n((?:\s*[-*].+\n?)+)', text
+    )
+    if wrong_section:
+        wrong = [line.strip().lstrip('-*').strip() for line in wrong_section.group(1).strip().split('\n') if line.strip()]
+    verdict["findings"] = {"what_went_right": right, "what_went_wrong": wrong}
+
+    # Extract prompt improvements
+    improvements: list[dict] = []
+    improvement_blocks = re.finditer(
+        r'(investigate|implement|review)\s*[:\-]\s*(.+?)(?=\n(?:investigate|implement|review)\s*[:\-]|\n##|\Z)',
+        text, re.IGNORECASE | re.DOTALL,
+    )
+    for m in improvement_blocks:
+        improvements.append({
+            "phase": m.group(1).lower(),
+            "suggestion": m.group(2).strip()[:500],
+        })
+    verdict["prompt_improvements"] = improvements
+
+    return verdict
+
+
 def _find_repo_path(repo: str) -> str:
     """Auto-resolve a local clone path for 'owner/repo' style repo strings.
 
@@ -394,6 +795,7 @@ def run_pipeline(
     spent = 0.0
 
     current_phase = "init"
+    phase_stats: dict[str, dict] = {}
     try:
         # ---- Phase 1: Investigate ----
         current_phase = "investigate"
@@ -411,6 +813,13 @@ def run_pipeline(
                       failed=(resp.get("finish_reason") == "error"))
         _guard(spent, budget)
 
+        phase_stats["investigate"] = {
+            "turns": resp.get("num_turns", 0),
+            "cost": resp.get("cost", 0.0),
+            "duration": resp.get("duration_s", 0.0),
+            "finish": resp.get("finish_reason", ""),
+        }
+
         phase_cost = resp["cost"]
         if phase_cost > PHASE_BUDGET["investigate"]:
             log.warning("[investigate] phase cost $%.2f exceeded cap $%.2f", phase_cost, PHASE_BUDGET["investigate"])
@@ -424,6 +833,24 @@ def run_pipeline(
                  investigation_report.count("**"))
         if len(investigation_report) < 500:
             log.warning("[investigate] thin report (%d chars) — implement phase may re-investigate", len(investigation_report))
+            raise RuntimeError(
+                f"Investigation report too thin ({len(investigation_report)} chars). "
+                "Required: >500 chars with Root Cause and Affected Files sections. "
+                "Aborting to avoid wasting $3-5 on implement+review that will fail."
+            )
+
+        # Validate required sections exist
+        report_lower = investigation_report.lower()
+        missing_sections = []
+        if "root cause" not in report_lower:
+            missing_sections.append("Root Cause")
+        if "affected files" not in report_lower:
+            missing_sections.append("Affected Files")
+        if missing_sections:
+            raise RuntimeError(
+                f"Investigation report missing required sections: {missing_sections}. "
+                "Report must contain 'Root Cause' and 'Affected Files' sections."
+            )
 
         if resp.get("finish_reason") == "error" and len(investigation_report) < 200:
             raise RuntimeError(f"Investigate phase failed: {investigation_report[:500]}")
@@ -445,6 +872,12 @@ def run_pipeline(
                           model=model_override)
         resp["_prompt"] = prompt
         spent += resp["cost"]
+        phase_stats["implement"] = {
+            "turns": resp.get("num_turns", 0),
+            "cost": resp.get("cost", 0.0),
+            "duration": resp.get("duration_s", 0.0),
+            "finish": resp.get("finish_reason", ""),
+        }
         phase_cost = resp["cost"]
         if phase_cost > PHASE_BUDGET["implement"]:
             log.warning("[implement] phase cost $%.2f exceeded cap $%.2f", phase_cost, PHASE_BUDGET["implement"])
@@ -461,7 +894,7 @@ def run_pipeline(
             capture_output=True, text=True,
         ).stdout.strip()
         commits = subprocess.run(
-            ["git", "log", "origin/main..HEAD", "--oneline"], cwd=wt,
+            ["git", "log", "origin/dev..HEAD", "--oneline"], cwd=wt,
             capture_output=True, text=True,
         ).stdout.strip()
 
@@ -488,12 +921,19 @@ def run_pipeline(
         prompt = REVIEW_PROMPT.format(
             issue_number=issue_number,
             issue_body=issue_body,
+            investigation_report=investigation_report,
             diff=diff,
         )
         resp = _call_agent(prompt, phase="review", cwd=wt,
                           model=model_override)
         resp["_prompt"] = prompt
         spent += resp["cost"]
+        phase_stats["review"] = {
+            "turns": resp.get("num_turns", 0),
+            "cost": resp.get("cost", 0.0),
+            "duration": resp.get("duration_s", 0.0),
+            "finish": resp.get("finish_reason", ""),
+        }
         phase_cost = resp["cost"]
         if phase_cost > PHASE_BUDGET["review"]:
             log.warning("[review] phase cost $%.2f exceeded cap $%.2f", phase_cost, PHASE_BUDGET["review"])
@@ -503,10 +943,128 @@ def run_pipeline(
         review_text = _content(resp)
         log.info("[review] done (%.1fs, $%.4f)", resp["duration_s"], resp["cost"])
 
+        # ---- Review gate: check verdict before proceeding ----
+        if "REQUEST_CHANGES" in review_text:
+            log.warning("[review] verdict is REQUEST_CHANGES — blocking PR creation")
+            storage.log_event(conn, "review_blocked", {"text": review_text})
+            try:
+                source.post_comment(repo, issue_number,
+                    f"**Pipeline review blocked PR creation.**\n\n{review_text[:3000]}")
+            except Exception:
+                log.warning("failed to post review_blocked comment on %s#%d", repo, issue_number)
+            storage.finish_run(conn, "review_blocked", total_cost=spent, branch=branch)
+            return {
+                "status": "review_blocked",
+                "review_text": review_text,
+                "spent_usd": spent,
+                "run_id": run_id,
+            }
+
         # Push and create PR
         destination.push_branch(wt, branch)
         body = destination.format_pr_body(issue_number, review_text, db_path, [])
         pr = destination.create_pr(repo, branch, f"fix: resolve #{issue_number}", body)
+
+        # ---- Phase 4: Deep Review (Opus) — adversarial review after PR ----
+        deep_review_text = ""
+        try:
+            current_phase = "deep_review"
+            log.info("[deep_review] starting (max_turns=%d, model=%s)",
+                     PHASE_MAX_TURNS["deep_review"], PHASE_MODELS["deep_review"])
+            pid = _start_phase(conn, "deep_review")
+            prompt = DEEP_REVIEW_PROMPT.format(
+                issue_number=issue_number,
+                issue_body=issue_body,
+                investigation_report=investigation_report,
+                diff=diff,
+                review_text=review_text,
+                pr_url=pr["url"],
+            )
+            dr_resp = _call_agent(prompt, phase="deep_review", cwd=wt)
+            dr_resp["_prompt"] = prompt
+            spent += dr_resp["cost"]
+            phase_stats["deep_review"] = {
+                "turns": dr_resp.get("num_turns", 0),
+                "cost": dr_resp.get("cost", 0.0),
+                "duration": dr_resp.get("duration_s", 0.0),
+                "finish": dr_resp.get("finish_reason", ""),
+            }
+            _finish_phase(conn, pid, dr_resp,
+                          failed=(dr_resp.get("finish_reason") == "error"))
+
+            deep_review_text = _content(dr_resp)
+            storage.log_event(conn, "deep_review_text", {"text": deep_review_text})
+            log.info("[deep_review] done (%.1fs, $%.4f)", dr_resp["duration_s"], dr_resp["cost"])
+
+            # If deep review blocks, post corrections on both issue and PR
+            if "BLOCK" in deep_review_text or "CONCERNS" in deep_review_text:
+                dr_verdict = "BLOCK" if "BLOCK" in deep_review_text else "CONCERNS"
+                log.warning("[deep_review] verdict is %s", dr_verdict)
+                try:
+                    comment = f"**Deep review verdict: {dr_verdict}**\n\n{deep_review_text[:3000]}"
+                    source.post_comment(repo, issue_number, comment)
+                    source.post_comment(repo, pr["number"], comment)
+                except Exception:
+                    log.warning("failed to post deep_review comment")
+
+            _guard(spent, budget)
+        except BudgetExceeded:
+            log.warning("[deep_review] budget exceeded after PR creation — skipping")
+            storage.log_event(conn, "deep_review_skipped", {"reason": "budget_exceeded"})
+        except Exception:
+            log.exception("[deep_review] deep review phase failed (non-fatal — PR already created)")
+            storage.log_event(conn, "deep_review_error", {"error": "deep review phase exception"})
+
+        # ---- Phase 5: Post-Run Audit (Opus) ----
+        audit_verdict = None
+        try:
+            current_phase = "audit"
+            pid = _start_phase(conn, "audit")
+            prompt = AUDIT_PROMPT.format(
+                issue_number=issue_number,
+                issue_body=issue_body,
+                investigation_report=investigation_report,
+                diff=diff,
+                review_text=review_text,
+                deep_review_text=deep_review_text or "(deep review not available)",
+                pr_url=pr["url"],
+                run_id=run_id,
+                investigate_turns=phase_stats["investigate"]["turns"],
+                investigate_cost=phase_stats["investigate"]["cost"],
+                investigate_duration=phase_stats["investigate"]["duration"],
+                investigate_finish=phase_stats["investigate"]["finish"],
+                implement_turns=phase_stats["implement"]["turns"],
+                implement_cost=phase_stats["implement"]["cost"],
+                implement_duration=phase_stats["implement"]["duration"],
+                implement_finish=phase_stats["implement"]["finish"],
+                review_turns=phase_stats["review"]["turns"],
+                review_cost=phase_stats["review"]["cost"],
+                review_duration=phase_stats["review"]["duration"],
+                review_finish=phase_stats["review"]["finish"],
+                total_cost=spent,
+            )
+            audit_resp = _call_agent(prompt, phase="audit", cwd=wt, model="opus")
+            audit_resp["_prompt"] = prompt
+            spent += audit_resp["cost"]
+            _finish_phase(conn, pid, audit_resp, failed=(audit_resp.get("finish_reason") == "error"))
+
+            audit_raw = _content(audit_resp)
+            storage.log_event(conn, "audit_text", {"text": audit_raw})
+
+            audit_verdict = _extract_audit_verdict(audit_raw)
+            storage.log_event(conn, "audit_verdict", audit_verdict)
+            log.info("[audit] grade=%s golden=%s errors=%s",
+                     audit_verdict.get("overall_grade"),
+                     audit_verdict.get("is_golden"),
+                     audit_verdict.get("error_categories"))
+
+            _guard(spent, budget)
+        except BudgetExceeded:
+            log.warning("[audit] budget exceeded after PR creation — skipping audit write")
+            storage.log_event(conn, "audit_skipped", {"reason": "budget_exceeded"})
+        except Exception:
+            log.exception("[audit] audit phase failed (non-fatal — PR already created)")
+            storage.log_event(conn, "audit_error", {"error": "audit phase exception"})
 
         storage.finish_run(conn, "ok", total_cost=spent, branch=branch)
         return {
@@ -514,6 +1072,8 @@ def run_pipeline(
             "pr_url": pr["url"],
             "spent_usd": spent,
             "run_id": run_id,
+            "audit_grade": audit_verdict.get("overall_grade") if audit_verdict else None,
+            "is_golden": audit_verdict.get("is_golden", False) if audit_verdict else False,
         }
 
     except BudgetExceeded as e:

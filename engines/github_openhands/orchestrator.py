@@ -363,7 +363,7 @@ def run_pipeline(repo: str, issue_number: int, *,
             ["git", "status", "--porcelain"], cwd=wt, capture_output=True, text=True,
         ).stdout.strip()
         _commits = subprocess.run(
-            ["git", "log", "origin/main..HEAD", "--oneline"], cwd=wt, capture_output=True, text=True,
+            ["git", "log", "origin/dev..HEAD", "--oneline"], cwd=wt, capture_output=True, text=True,
         ).stdout.strip()
         if _porcelain:
             log.warning("execute phase left uncommitted changes — committing as safety net")

@@ -8,7 +8,7 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 
-def create_workspace(repo_path: str, branch: str, base: str = "main") -> str:
+def create_workspace(repo_path: str, branch: str, base: str = "dev") -> str:
     """Create a git worktree for the given branch, returning the worktree path.
 
     Branch naming convention: issue-<number>-<short-id>
@@ -73,7 +73,7 @@ def create_workspace(repo_path: str, branch: str, base: str = "main") -> str:
     return str(wt_path)
 
 
-def get_diff(workspace_path: str, base: str = "main") -> str:
+def get_diff(workspace_path: str, base: str = "dev") -> str:
     """Return the combined diff of all changes in the workspace vs base branch."""
     wt = Path(workspace_path)
     if not wt.exists():
@@ -101,7 +101,7 @@ def get_diff(workspace_path: str, base: str = "main") -> str:
     return "\n".join(parts)
 
 
-def get_changed_files(workspace_path: str, base: str = "main") -> list[str]:
+def get_changed_files(workspace_path: str, base: str = "dev") -> list[str]:
     """Return list of file paths changed in workspace vs base branch."""
     wt = Path(workspace_path)
     if not wt.exists():
