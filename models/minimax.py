@@ -1,6 +1,6 @@
 """Model config: MiniMax M3.
 
-Needs temperature=0.0 for stable tool use. No think-tag issues.
+Needs temperature=0.0 for stable tool use. Also emits think tags like DeepSeek/GLM.
 """
 
 CONFIG = {
@@ -17,7 +17,7 @@ CONFIG = {
     },
 
     # --- Message processing ---
-    "strip_think_tags": False,  # M3 doesn't emit think tags
+    "strip_think_tags": True,   # M3 emits think tags
 
     # --- System prompt additions ---
     "system_prompt_suffix": (
