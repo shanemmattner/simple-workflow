@@ -2,7 +2,7 @@ name: issue-to-pr
 description: Transform a GitHub issue into a tested, reviewed PR
 
 budget:
-  max_per_run_usd: 1.00
+  max_per_run_usd: 2.00
 
 max_parallel_workers: 5
 
@@ -19,34 +19,42 @@ models:
     name: claude-opus-4-6
     max_tokens: 16384
     cost: {input_per_mtok: 15.00, output_per_mtok: 75.00}
+  m27hs:
+    name: MiniMax-M2.7-highspeed
+    max_tokens: 16384
+    cost: {input_per_mtok: 0.20, output_per_mtok: 0.80}
+  m3:
+    name: MiniMax-M3
+    max_tokens: 16384
+    cost: {input_per_mtok: 0.30, output_per_mtok: 1.20}
 
 phases:
   - name: triage
-    model: haiku
+    model: m27hs
     max_turns: 5
   - name: verify
-    model: haiku
+    model: m27hs
     max_turns: 5
   - name: plan
-    model: sonnet
+    model: m3
     max_turns: 10
     parallel: per_task
   - name: test-plan
-    model: haiku
+    model: m27hs
     max_turns: 5
     parallel: per_task
   - name: wave-planner
-    model: haiku
+    model: m27hs
     max_turns: 2
   - name: execute
-    model: sonnet
+    model: m3
     max_turns: 30
     parallel: per_wave
   - name: review
-    model: haiku
+    model: m3
     max_turns: 5
   - name: improve
-    model: haiku
+    model: m27hs
     max_turns: 5
 
 review:
