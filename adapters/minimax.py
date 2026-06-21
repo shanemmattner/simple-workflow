@@ -8,12 +8,22 @@ BASE_URL = "https://api.minimaxi.chat/v1"
 
 AVAILABLE_MODELS: set[str] = {
     "MiniMax-M3",
+    "MiniMax-M2.7-highspeed",
+}
+
+# Cost in USD per million tokens (input, output). Verify against
+# https://docs.minimax.io/ before production use.
+MODELS: dict[str, dict] = {
+    "MiniMax-M3":            {"cost_in": 0.30, "cost_out": 1.20, "context": 1_048_576},
+    "MiniMax-M2.7-highspeed":{"cost_in": 0.20, "cost_out": 0.80, "context": 205_000},
 }
 
 _SHORT_NAMES: dict[str, str] = {
     "minimax": "MiniMax-M3",
     "m3": "MiniMax-M3",
     "minimax-m3": "MiniMax-M3",
+    "m27hs": "MiniMax-M2.7-highspeed",
+    "minimax-m2.7-highspeed": "MiniMax-M2.7-highspeed",
 }
 
 # Extra sampling params M3 needs for stable tool-use performance
