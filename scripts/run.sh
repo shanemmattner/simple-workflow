@@ -59,4 +59,4 @@ if ! $HAS_REPO_PATH; then
     fi
 fi
 
-PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" python3 "$MODULE" "${ARGS[@]}"
+PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" python3 -m "$MODULE" "${ARGS[@]}"
