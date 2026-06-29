@@ -1396,18 +1396,14 @@ def run_pipeline(
     wt = workspace.create_workspace(repo_path, branch)
     spent = 0.0
 
-    # Hide target repo's CLAUDE.md so it doesn't override pipeline agent behavior
+    # NOTE: CLAUDE.md hiding is handled per-phase by claude_runtime.py
+    # (hide before each `claude` call, restore after). Do NOT hide at the
+    # orchestrator level — that persists across phases and gets committed
+    # by `git add -A` in the implement phase.
     claude_md_path = os.path.join(wt, "CLAUDE.md")
     claude_md_hidden = os.path.join(wt, "CLAUDE.md.pipeline-hidden")
-    if os.path.exists(claude_md_path):
-        os.rename(claude_md_path, claude_md_hidden)
-        log.info("[init] hid CLAUDE.md → CLAUDE.md.pipeline-hidden in worktree")
-
     claude_dir = os.path.join(wt, ".claude")
     claude_dir_hidden = os.path.join(wt, ".claude.pipeline-hidden")
-    if os.path.isdir(claude_dir):
-        os.rename(claude_dir, claude_dir_hidden)
-        log.info("[init] hid .claude/ → .claude.pipeline-hidden/ in worktree")
 
     current_phase = "init"
     phase_stats: dict[str, dict] = {}
@@ -1530,7 +1526,7 @@ def run_pipeline(
             capture_output=True, text=True,
         ).stdout.strip()
         commits = subprocess.run(
-            ["git", "log", "origin/dev..HEAD", "--oneline"], cwd=wt,
+            ["git", "log", "origin/main..HEAD", "--oneline"], cwd=wt,
             capture_output=True, text=True,
         ).stdout.strip()
 
