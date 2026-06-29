@@ -89,8 +89,13 @@ def call_agent(
     )
 
     if model.lower() == "minimax":
+        # The github_claude engine never resolves "minimax" to a concrete
+        # model itself — the orchestrator's `_phase_cfg()` owns phase-aware
+        # routing via `resolve_auto(phase_name)`. If we get here with the
+        # bare wildcard, the caller is the legacy Claude-CLI path that
+        # ignores phase context; fall back to the cheap default (m27hs).
         from adapters.minimax import resolve_auto
-        model = resolve_auto("search")  # default; explicit m3/m27hs unchanged
+        model = resolve_auto("search")
 
     if _is_minimax_model(model):
         return _call_minimax(

@@ -785,8 +785,20 @@ def _call_agent(prompt: str, *, phase: str, cwd: str, model: str | None = None) 
     compat, or m3/m27hs/minimax short names, or full MiniMax IDs — is sent
     through the same OpenAI-compat path. The MiniMax runtime is responsible
     for resolving short names and rejecting unknown models.
+
+    Per-phase routing: PHASE_MODELS maps phase name → short model name. When
+    the caller passes `model=None` we honour the per-phase routing (cheap
+    m27hs for investigate/review, M3 for implement/deep_review/etc.). When
+    the caller passes an explicit `model`, that override wins — this is the
+    CLI `--model` flag path.
     """
-    effective_model = model or PHASE_MODELS.get(phase, "m3")
+    if model:
+        effective_model = model
+    else:
+        # Per-phase routing via PHASE_MODELS. `model_override` is consulted
+        # by callers that want to force a single model for the whole run;
+        # we resolve it here so the orchestrator no longer needs to.
+        effective_model = PHASE_MODELS.get(phase, "m3")
     return _call_openai_compat(prompt, phase=phase, cwd=cwd, model=effective_model)
 
 
@@ -833,40 +845,12 @@ def _call_claude(prompt: str, *, phase: str, cwd: str, model: str | None = None)
         f"phase={phase!r} model={model!r}"
     )
 
-    # --- Unreachable stub below: documents the original shape in case the
-    # --- engine ever grows a Claude path. Do not call this code.
-    phase_model = model or PHASE_MODELS.get(phase, "sonnet")
-    max_turns = PHASE_MAX_TURNS.get(phase, 25)
-
-    raw = claude_runtime.run_phase_agent(
-        worktree=cwd,
-        prompt=prompt,
-        phase=phase,
-        max_turns=max_turns,
-        model=phase_model,
-    )
-
-    # Map stop_reason to finish_reason
-    stop = raw.get("stop_reason", "")
-    if stop in ("end_turn", ""):
-        finish_reason = "end_turn"
-    elif stop == "max_turns" or raw.get("hit_turn_limit"):
-        finish_reason = "max_iterations"
-    elif stop in ("error", "timeout") or raw.get("hit_timeout"):
-        finish_reason = "error"
-    else:
-        finish_reason = stop or "end_turn"
-
-    return {
-        "content": raw.get("result", ""),
-        "cost": raw.get("cost_usd", 0.0),
-        "tokens_in": raw.get("tokens_in", 0),
-        "tokens_out": raw.get("tokens_out", 0),
-        "duration_s": raw.get("duration_ms", 0) / 1000.0,
-        "finish_reason": finish_reason,
-        "session_id": raw.get("session_id", ""),
-        "num_turns": raw.get("num_turns", 0),
-    }
+    # NOTE: there is intentionally NO Claude-CLI stub here. An earlier
+    # version of this file kept a 30-line skeleton calling
+    # claude_runtime.run_phase_agent() as "documentation" — but the symbol
+    # was never imported, so any future agent that removed the raise above
+    # would hit a NameError on first call. Delete it; raise RuntimeError is
+    # the entire contract.
 
 
 def _extract_audit_verdict(text: str) -> dict:

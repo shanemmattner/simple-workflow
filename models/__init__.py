@@ -41,6 +41,9 @@ _MODEL_TO_MODULE: dict[str, str] = {
     "minimax-m3": "minimax",
     "m3": "minimax",
     "MiniMax-M3": "minimax",
+    "m27hs": "minimax",
+    "minimax-m2.7-highspeed": "minimax",
+    "MiniMax-M2.7-highspeed": "minimax",
     # Others via OpenRouter
     "grok": "default",
     "gemini-flash": "default",
