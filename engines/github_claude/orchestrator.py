@@ -100,9 +100,18 @@ Text to extract from:
         raw = raw.strip().split("\n", 1)[1].rsplit("```", 1)[0]
     return json.loads(raw)
 
-def _start_phase(conn, name):
+def _start_phase(conn, name, model=None):
     """Create a phase record at the START of execution. Returns phase_id."""
-    return storage.log_phase(conn, name)
+    return storage.log_phase(conn, name, model=model)
+
+def _resolve_model(cfg: dict | None, model_ov: str | None = None) -> str:
+    """Resolve the model for a phase: override wins, else cfg, else 'sonnet'.
+
+    Mirrors the model-selection logic in `_call()` so that the model stored
+    in the `phase` SQLite row matches the model actually dispatched.
+    """
+    cfg = cfg or {}
+    return model_ov or cfg.get("model", "sonnet")
 
 def _log_phase_messages(conn, phase_id, resp):
     """Log the prompt/response pair as user + assistant messages for this phase."""
@@ -285,7 +294,7 @@ def run_pipeline(repo: str, issue_number: int, *,
         if _skip("triage"):
             triage_text = prior.get("triage", "")
         else:
-            pid = _start_phase(conn, "triage")
+            pid = _start_phase(conn, "triage", model=_resolve_model(pcfg.get("triage", {}), kw.get("model_ov")))
             resp = _call("triage", pcfg.get("triage", {}), prior=prior, prior_review=prior_review, **kw)
             _finish_phase(conn, pid, resp); spent += resp["cost"]; _guard(spent, budget)
             triage_text = _content(resp)
@@ -303,7 +312,7 @@ def run_pipeline(repo: str, issue_number: int, *,
         if _skip("verify"):
             verify_text = prior.get("verify", "")
         else:
-            pid = _start_phase(conn, "verify")
+            pid = _start_phase(conn, "verify", model=_resolve_model(pcfg.get("verify", {}), kw.get("model_ov")))
             resp = _call("verify", pcfg.get("verify", {}), prior=prior, **kw)
             _finish_phase(conn, pid, resp); spent += resp["cost"]; _guard(spent, budget)
             verify_text = _content(resp)
@@ -373,7 +382,7 @@ def run_pipeline(repo: str, issue_number: int, *,
                         if phase_key in completed_phases:
                             log.info("resuming: skipping %s (completed in prior run)", phase_key)
                             continue
-                        pid = _start_phase(conn, phase_key)
+                        pid = _start_phase(conn, phase_key, model=_resolve_model(pcfg.get(ph, {}), kw.get("model_ov")))
                         futs[pool.submit(_call, ph, pcfg.get(ph, {}), prior=tp, **kw)] = (ph, t["id"], pid)
                 done, _ = wait(futs, return_when=FIRST_EXCEPTION)
                 for f in done:
@@ -394,7 +403,7 @@ def run_pipeline(repo: str, issue_number: int, *,
         if _skip("wave-planner"):
             wave_text = prior.get("wave_plan", "")
         else:
-            pid = _start_phase(conn, "wave-planner")
+            pid = _start_phase(conn, "wave-planner", model=_resolve_model(pcfg.get("wave-planner", {}), kw.get("model_ov")))
             resp = _call("wave-planner", pcfg.get("wave-planner", {}), prior=prior, **kw)
             _finish_phase(conn, pid, resp); spent += resp["cost"]
             if spent > budget:
@@ -426,7 +435,7 @@ def run_pipeline(repo: str, issue_number: int, *,
                         ep = {**prior, "_current_task": t,
                               "_current_plan": plan_r.get(tid, ""),
                               "_current_test_plan": tp_r.get(tid, "")}
-                        pid = _start_phase(conn, f"execute-task-{tid}")
+                        pid = _start_phase(conn, f"execute-task-{tid}", model=_resolve_model(pcfg.get("execute", {}), kw.get("model_ov")))
                         efuts[pool.submit(_call, "execute", pcfg.get("execute", {}), prior=ep, **kw)] = (tid, pid)
                     for f in as_completed(efuts):
                         tid, pid = efuts[f]
@@ -468,7 +477,7 @@ def run_pipeline(repo: str, issue_number: int, *,
         if _skip("review"):
             pass  # prior["review"] already populated from resume state
         else:
-            pid = _start_phase(conn, "review")
+            pid = _start_phase(conn, "review", model=_resolve_model(pcfg.get("review", {}), kw.get("model_ov")))
             resp = _call("review", pcfg.get("review", {}),
                           prior={**prior, "_combined_diff": diff}, **kw)
             _finish_phase(conn, pid, resp); spent += resp["cost"]
@@ -491,7 +500,7 @@ def run_pipeline(repo: str, issue_number: int, *,
                     json.dumps(prior, indent=2, default=str))
                 improve_cfg = pcfg.get("improve", {"model": "haiku", "max_turns": 5})
                 model = model_override or improve_cfg.get("model", "haiku")
-                pid = _start_phase(conn, "improve")
+                pid = _start_phase(conn, "improve", model=_resolve_model(improve_cfg, kw.get("model_ov")))
                 log.info("[improve] model=%s max_turns=%d", model, improve_cfg.get("max_turns", 5))
                 resp = runtime.call_agent(improve_prompt, model=model, cwd=wt,
                                           max_turns=improve_cfg.get("max_turns", 5))

@@ -19,8 +19,8 @@ def main() -> None:
     parser.add_argument("issue", help="Issue ref: owner/repo#NNN")
     parser.add_argument("--budget", type=float, default=1.00,
                         help="Max spend in USD (default: 1.00)")
-    parser.add_argument("--model", default="sonnet",
-                        help="Default model (default: sonnet)")
+    parser.add_argument("--model", default=None,
+                        help="Default model override (default: None → use workflow.yaml per-phase routing)")
     parser.add_argument("--repo-path", default=None,
                         help="Local filesystem path to the repo (default: cwd)")
     parser.add_argument("--workflow", default=None,
