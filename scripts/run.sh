@@ -33,8 +33,11 @@ case "$ENGINE" in
     three-step)
         MODULE="engines.three_step.__main__"
         ;;
+    minimax)
+        MODULE="engines.github_minimax.__main__"
+        ;;
     *)
-        echo "Unknown engine: $ENGINE (valid: claude, openhands, three-step)" >&2
+        echo "Unknown engine: $ENGINE (valid: claude, openhands, three-step, minimax)" >&2
         exit 1
         ;;
 esac
