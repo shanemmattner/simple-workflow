@@ -37,9 +37,7 @@ log = logging.getLogger(__name__)
 _DEFAULT_SYSTEM_PROMPT = (
     "You are a coding agent working in a repository. You have tools to run "
     "commands, read files, write files, edit files, glob for paths, and grep "
-    "for patterns. Be concise and action-oriented. Do NOT over-explore — read "
-    "only what you need, then act. When your task is done, STOP calling tools "
-    "and write your final response as a plain text message. Reason in English."
+    "for patterns. Make progress every turn; read only what you need, then act."
 )
 
 # Endpoint fix: the second research report (2026-06-29-minimax-prompt-templates)
