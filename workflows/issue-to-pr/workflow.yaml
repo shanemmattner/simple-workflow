@@ -5,6 +5,7 @@ budget:
   max_per_run_usd: 2.00
 
 max_parallel_workers: 5
+default_model: minimax  # route layer picks m3 vs m27hs based on phase name; explicit per-phase model: still wins
 
 models:
   haiku:
