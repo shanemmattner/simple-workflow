@@ -623,10 +623,23 @@ def call_agent(
                     **sampling_kwargs,
                 )
             except Exception as e:
+                # Retry transient errors with exponential backoff (1s, 2s, 4s).
+                # Matches the pattern in engines/github_claude/runtime.py so
+                # the two engines behave consistently under 429/5xx storms.
                 error_str = str(e).lower()
-                if any(x in error_str for x in ("429", "rate limit", "timeout", "502", "503")):
-                    log.warning("transient error on turn %d, retrying once: %s", turn + 1, e)
-                    time.sleep(5)
+                transient = any(x in error_str for x in (
+                    "429", "rate limit", "timeout", "502", "503", "overloaded",
+                ))
+                if not transient:
+                    raise
+                delay = 1.0
+                response = None
+                for attempt in range(3):
+                    log.warning(
+                        "transient error on turn %d (attempt %d/3), sleeping %.1fs: %s",
+                        turn + 1, attempt + 1, delay, e,
+                    )
+                    time.sleep(delay)
                     try:
                         response = client.chat.completions.create(
                             model=model,
@@ -637,14 +650,16 @@ def call_agent(
                             parallel_tool_calls=False,
                             **sampling_kwargs,
                         )
+                        break
                     except Exception as e2:
-                        log.error("retry failed: %s", e2)
-                        return _error_response(
-                            f"API call failed after retry: {e2}",
-                            time.monotonic() - start,
-                        )
-                else:
-                    raise
+                        last_err = e2
+                        delay *= 2
+                if response is None:
+                    log.error("retry exhausted: %s", last_err)
+                    return _error_response(
+                        f"API call failed after retries: {last_err}",
+                        time.monotonic() - start,
+                    )
 
             # Track tokens
             if response.usage:
@@ -657,17 +672,19 @@ def call_agent(
 
             choice = response.choices[0]
             message = choice.message
+            finish_reason = (choice.finish_reason or "").strip().lower() or None
 
             # Append assistant message to history (clean think tags from context)
             serialized = _serialize_message(message)
             if cfg and cfg.get("strip_think_tags") and serialized.get("content"):
                 from models import clean_output
                 serialized["content"] = clean_output(serialized["content"], cfg)
-            messages.append(serialized)
 
             # Check if model wants to call tools
             if not message.tool_calls:
-                # Done — model returned a regular message
+                # Done — model returned a regular message. Surface the API's
+                # `finish_reason` so the orchestrator can distinguish a clean
+                # stop from a length-truncation or content-filter hit.
                 elapsed = time.monotonic() - start
                 content = message.content or ""
                 # Clean output (strip <think> tags etc.) per model config
@@ -675,16 +692,39 @@ def call_agent(
                     from models import clean_output
                     content = clean_output(content, cfg)
                 cost = (total_in * price_in + total_out * price_out) / 1_000_000
-                log.info("[done] %d turns, %d in / %d out tokens, $%.4f, %.1fs",
-                         turn + 1, total_in, total_out, cost, elapsed)
+                # Map OpenAI finish_reason values to our internal vocabulary.
+                # "length" → "truncated" (partial output, may have been cut).
+                # "content_filter" → "error" (output was filtered, treat as failure).
+                # anything else (incl. None / "stop" / "tool_calls") → "end_turn".
+                if finish_reason == "length":
+                    effective_finish = "truncated"
+                    log.warning(
+                        "[done] %d turns, finish_reason=length (output truncated), "
+                        "%d in / %d out tokens, $%.4f, %.1fs",
+                        turn + 1, total_in, total_out, cost, elapsed,
+                    )
+                elif finish_reason == "content_filter":
+                    effective_finish = "error"
+                    log.error(
+                        "[done] %d turns, finish_reason=content_filter, "
+                        "%d in / %d out tokens, $%.4f, %.1fs",
+                        turn + 1, total_in, total_out, cost, elapsed,
+                    )
+                else:
+                    effective_finish = "end_turn"
+                    log.info(
+                        "[done] %d turns, %d in / %d out tokens, $%.4f, %.1fs",
+                        turn + 1, total_in, total_out, cost, elapsed,
+                    )
                 return {
                     "content": content,
                     "tokens_in": total_in,
                     "tokens_out": total_out,
                     "cost": cost,
                     "duration_s": elapsed,
-                    "finish_reason": "end_turn",
+                    "finish_reason": effective_finish,
                     "tool_stats": tool_stats,
+                    "num_turns": turn + 1,
                 }
 
             # Execute tool calls
@@ -741,6 +781,7 @@ def call_agent(
             "duration_s": elapsed,
             "finish_reason": "max_iterations",
             "tool_stats": tool_stats,
+            "num_turns": max_turns,
         }
 
     except Exception as e:
@@ -752,6 +793,7 @@ def call_agent(
         resp["tokens_out"] = total_out
         resp["cost"] = cost
         resp["tool_stats"] = tool_stats
+        resp["num_turns"] = turn if "turn" in locals() else 0
         return resp
 
 
@@ -760,11 +802,19 @@ def call_agent(
 # ---------------------------------------------------------------------------
 
 def _serialize_message(message) -> dict:
-    """Convert an OpenAI ChatCompletionMessage to a plain dict for the messages list."""
+    """Convert an OpenAI ChatCompletionMessage to a plain dict for the messages list.
+
+    Strict-gateway conformance: when the message has tool_calls but no text
+    content, set `content` to None explicitly. Some OpenAI-compat gateways
+    (and the OpenAI spec itself) require the `content` field to be present
+    on every assistant message — string OR null. Omitting the field on a
+    tool-call turn triggers HTTP 400 from strict implementations.
+    """
     msg: dict[str, Any] = {"role": "assistant"}
-    if message.content:
-        msg["content"] = message.content
     if message.tool_calls:
+        # Tool-call turn: explicit null content. Set this BEFORE the truthy
+        # check below so it's never silently omitted.
+        msg["content"] = message.content if message.content else None
         msg["tool_calls"] = [
             {
                 "id": tc.id,
@@ -776,6 +826,8 @@ def _serialize_message(message) -> dict:
             }
             for tc in message.tool_calls
         ]
+    elif message.content:
+        msg["content"] = message.content
     return msg
 
 
