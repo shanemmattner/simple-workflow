@@ -58,6 +58,10 @@ def _lookup_rc_env(var_names: list[str]) -> str | None:
     Mirrors scripts/minimax.py lines 67-86 — some users store API keys in
     ~/.zshrc rather than exporting them in their shell init. We parse that
     file as a fallback when the env var is unset.
+
+    Hardening (ENG-04): shell command-substitution markers (`$`, backticks,
+    parens) are rejected outright. See adapters/minimax.py for the full
+    rationale; the two regexes are intentionally identical.
     """
     rcfile = Path.home() / ".zshrc"
     if not rcfile.is_file():
@@ -68,13 +72,17 @@ def _lookup_rc_env(var_names: list[str]) -> str | None:
         return None
     # Match `export NAME=...` or bare `NAME=...` in a shell rcfile. Captures
     # the name in group 1 and the value in group 2 (strips surrounding quotes).
+    # Value class explicitly excludes `$`, backticks, and parens.
     _RC_VAR_RE = re.compile(
-        r"""^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)\s*=\s*['"]?([^'"\s#]+)['"]?\s*(?:#.*)?$""",
+        r"""^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)\s*=\s*['"]?([^'"\s$`()#]+)['"]?\s*(?:#.*)?$""",
         re.MULTILINE,
     )
     matches: dict[str, str] = {}
     for m in _RC_VAR_RE.finditer(text):
-        matches[m.group(1)] = m.group(2)
+        name, value = m.group(1), m.group(2)
+        if any(ch in value for ch in ("$", "`", "(", ")")):
+            continue
+        matches[name] = value
     for name in var_names:
         if name in matches:
             return matches[name]
