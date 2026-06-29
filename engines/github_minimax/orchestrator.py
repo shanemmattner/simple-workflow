@@ -785,8 +785,20 @@ def _call_agent(prompt: str, *, phase: str, cwd: str, model: str | None = None) 
     compat, or m3/m27hs/minimax short names, or full MiniMax IDs — is sent
     through the same OpenAI-compat path. The MiniMax runtime is responsible
     for resolving short names and rejecting unknown models.
+
+    Per-phase routing: PHASE_MODELS maps phase name → short model name. When
+    the caller passes `model=None` we honour the per-phase routing (cheap
+    m27hs for investigate/review, M3 for implement/deep_review/etc.). When
+    the caller passes an explicit `model`, that override wins — this is the
+    CLI `--model` flag path.
     """
-    effective_model = model or PHASE_MODELS.get(phase, "m3")
+    if model:
+        effective_model = model
+    else:
+        # Per-phase routing via PHASE_MODELS. `model_override` is consulted
+        # by callers that want to force a single model for the whole run;
+        # we resolve it here so the orchestrator no longer needs to.
+        effective_model = PHASE_MODELS.get(phase, "m3")
     return _call_openai_compat(prompt, phase=phase, cwd=cwd, model=effective_model)
 
 
@@ -833,40 +845,12 @@ def _call_claude(prompt: str, *, phase: str, cwd: str, model: str | None = None)
         f"phase={phase!r} model={model!r}"
     )
 
-    # --- Unreachable stub below: documents the original shape in case the
-    # --- engine ever grows a Claude path. Do not call this code.
-    phase_model = model or PHASE_MODELS.get(phase, "sonnet")
-    max_turns = PHASE_MAX_TURNS.get(phase, 25)
-
-    raw = claude_runtime.run_phase_agent(
-        worktree=cwd,
-        prompt=prompt,
-        phase=phase,
-        max_turns=max_turns,
-        model=phase_model,
-    )
-
-    # Map stop_reason to finish_reason
-    stop = raw.get("stop_reason", "")
-    if stop in ("end_turn", ""):
-        finish_reason = "end_turn"
-    elif stop == "max_turns" or raw.get("hit_turn_limit"):
-        finish_reason = "max_iterations"
-    elif stop in ("error", "timeout") or raw.get("hit_timeout"):
-        finish_reason = "error"
-    else:
-        finish_reason = stop or "end_turn"
-
-    return {
-        "content": raw.get("result", ""),
-        "cost": raw.get("cost_usd", 0.0),
-        "tokens_in": raw.get("tokens_in", 0),
-        "tokens_out": raw.get("tokens_out", 0),
-        "duration_s": raw.get("duration_ms", 0) / 1000.0,
-        "finish_reason": finish_reason,
-        "session_id": raw.get("session_id", ""),
-        "num_turns": raw.get("num_turns", 0),
-    }
+    # NOTE: there is intentionally NO Claude-CLI stub here. An earlier
+    # version of this file kept a 30-line skeleton calling
+    # claude_runtime.run_phase_agent() as "documentation" — but the symbol
+    # was never imported, so any future agent that removed the raise above
+    # would hit a NameError on first call. Delete it; raise RuntimeError is
+    # the entire contract.
 
 
 def _extract_audit_verdict(text: str) -> dict:
@@ -1213,8 +1197,8 @@ def _run_learning_phase(
         "learning_cost": 0.0,
     }
 
-    # ---- Step 1: Extract lessons with Opus ----
-    log.info("[learn] extracting lessons (model=opus)")
+    # ---- Step 1: Extract lessons ----
+    log.info("[learn] extracting lessons (model=m3)")
     pid = _start_phase(conn, "extract_lessons")
 
     prompt = EXTRACT_LESSONS_PROMPT.format(
@@ -1250,7 +1234,7 @@ def _run_learning_phase(
         summary["learning_cost"] = learning_spent
         return summary
 
-    # ---- Step 2: Adversarial review each lesson with Sonnet ----
+    # ---- Step 2: Adversarial review each lesson ----
     accepted: list[dict] = []
     rejected: list[dict] = []
 
@@ -1276,7 +1260,11 @@ def _run_learning_phase(
             pipeline_outcome=pipeline_outcome,
         )
 
-        adv_resp = _call_agent(review_prompt, phase="adversarial_review", cwd=wt, model="sonnet")
+        # NOTE: was previously model=\"sonnet\" — that alias lives in the
+        # Claude CLI adapter, not in the MiniMax adapter, so the call raised
+        # KeyError 'api_key' and the adversarial review phase hung
+        # forever. Use m27hs (cheap; review-class per PHASE_MODELS).
+        adv_resp = _call_agent(review_prompt, phase="adversarial_review", cwd=wt, model="m27hs")
         adv_resp["_prompt"] = review_prompt
         learning_spent += adv_resp.get("cost", 0.0)
         _finish_phase(conn, pid, adv_resp, failed=(adv_resp.get("finish_reason") == "error"))
@@ -1386,6 +1374,27 @@ def run_pipeline(
     """
     model = model_override or "m3"
 
+    # Parse requested phases filter (XPR-02). When phases kwarg is None or
+    # empty, every phase runs (default). When set, only phases whose name
+    # is in the list run; everything else is silently skipped (no phase row
+    # is written, no cost incurred).
+    requested_phases: set[str] | None = None
+    if phases:
+        requested_phases = {p.strip() for p in phases.split(",") if p.strip()}
+        log.info("[init] phase filter active: %s", sorted(requested_phases))
+
+    # Resolve workflow_dir override. Default location is workflows/issue-to-pr
+    # relative to the repo root; the kwarg lets callers point at an
+    # alternative workflow bundle (e.g. for A/B testing a frozen prompt set).
+    # The github_minimax engine embeds its prompts in the orchestrator
+    # module so workflow_dir is currently only logged here; wiring it to
+    # prompt loading is a follow-up if frozen-prompt repos appear.
+    if workflow_dir is not None:
+        log.info("[init] workflow_dir override: %s", workflow_dir)
+
+    def _phase_allowed(name: str) -> bool:
+        return requested_phases is None or name in requested_phases
+
     # Fetch issue
     issue = source.fetch_issue(repo, issue_number)
     issue_body = f"# {issue['title']}\n\n{issue['body']}"
@@ -1453,253 +1462,146 @@ def run_pipeline(
     try:
         # ---- Phase 1: Investigate ----
         current_phase = "investigate"
-        log.info("[investigate] starting (max_turns=%d, model=%s)",
-                 PHASE_MAX_TURNS["investigate"], model_override or PHASE_MODELS["investigate"])
-        pid = _start_phase(conn, "investigate")
-        prompt = INVESTIGATE_PROMPT.format(
-            issue_number=issue_number, issue_body=issue_body,
-        )
-        resp = _call_agent(prompt, phase="investigate", cwd=wt,
-                          model=model_override)
-        resp["_prompt"] = prompt
-        spent += resp["cost"]
-        _finish_phase(conn, pid, resp,
-                      failed=(resp.get("finish_reason") == "error"))
-        _guard(spent, budget)
-
-        phase_stats["investigate"] = {
-            "turns": resp.get("num_turns", 0),
-            "cost": resp.get("cost", 0.0),
-            "duration": resp.get("duration_s", 0.0),
-            "finish": resp.get("finish_reason", ""),
-        }
-
-        phase_cost = resp["cost"]
-        if phase_cost > PHASE_BUDGET["investigate"]:
-            log.warning("[investigate] phase cost $%.2f exceeded cap $%.2f", phase_cost, PHASE_BUDGET["investigate"])
-
-        investigation_report = _content(resp)
-        log.info("[investigate] done (%.1fs, $%.4f, %d chars)",
-                 resp["duration_s"], resp["cost"], len(investigation_report))
-
-        log.info("[investigate] report quality: %d chars, %d sections found",
-                 len(investigation_report),
-                 investigation_report.count("**"))
-        if len(investigation_report) < 500:
-            log.warning("[investigate] thin report (%d chars) — implement phase may re-investigate", len(investigation_report))
-            pipeline_outcome = "investigation_failed"
-            pipeline_outcome_detail = (
-                f"Investigation report too thin ({len(investigation_report)} chars). "
-                "Required: >500 chars with Root Cause and Affected Files sections. "
-                "Pipeline aborted to avoid wasting $3-5 on implement+review that will fail."
+        if not _phase_allowed("investigate"):
+            log.info("[investigate] skipped (not in --phases filter)")
+            investigation_report = "(skipped via --phases filter)"
+        else:
+            log.info("[investigate] starting (max_turns=%d, model=%s)",
+                     PHASE_MAX_TURNS["investigate"], model_override or PHASE_MODELS["investigate"])
+            pid = _start_phase(conn, "investigate")
+            prompt = INVESTIGATE_PROMPT.format(
+                issue_number=issue_number, issue_body=issue_body,
             )
-            raise RuntimeError(pipeline_outcome_detail)
-
-        # Validate required sections exist
-        report_lower = investigation_report.lower()
-        missing_sections = []
-        if "root cause" not in report_lower:
-            missing_sections.append("Root Cause")
-        if "affected files" not in report_lower:
-            missing_sections.append("Affected Files")
-        if missing_sections:
-            pipeline_outcome = "investigation_failed"
-            pipeline_outcome_detail = (
-                f"Investigation report missing required sections: {missing_sections}. "
-                "Report must contain 'Root Cause' and 'Affected Files' sections."
-            )
-            raise RuntimeError(pipeline_outcome_detail)
-
-        if resp.get("finish_reason") == "error" and len(investigation_report) < 200:
-            pipeline_outcome = "investigation_failed"
-            pipeline_outcome_detail = f"Investigate phase errored with thin output: {investigation_report[:500]}"
-            raise RuntimeError(f"Investigate phase failed: {investigation_report[:500]}")
-        if resp.get("finish_reason") in ("error", "max_iterations"):
-            log.warning("[investigate] finished with %s but has %d chars of content — continuing",
-                        resp.get("finish_reason"), len(investigation_report))
-
-        # ---- Phase 2: Implement ----
-        current_phase = "implement"
-        log.info("[implement] starting (max_turns=%d, model=%s)",
-                 PHASE_MAX_TURNS["implement"], model_override or PHASE_MODELS["implement"])
-        pid = _start_phase(conn, "implement")
-        prompt = IMPLEMENT_PROMPT.format(
-            issue_number=issue_number,
-            issue_body=issue_body,
-            investigation_report=investigation_report,
-        )
-        resp = _call_agent(prompt, phase="implement", cwd=wt,
-                          model=model_override)
-        resp["_prompt"] = prompt
-        spent += resp["cost"]
-        phase_stats["implement"] = {
-            "turns": resp.get("num_turns", 0),
-            "cost": resp.get("cost", 0.0),
-            "duration": resp.get("duration_s", 0.0),
-            "finish": resp.get("finish_reason", ""),
-        }
-        phase_cost = resp["cost"]
-        if phase_cost > PHASE_BUDGET["implement"]:
-            log.warning("[implement] phase cost $%.2f exceeded cap $%.2f", phase_cost, PHASE_BUDGET["implement"])
-        _finish_phase(conn, pid, resp,
-                      failed=(resp.get("finish_reason") == "error"))
-        _guard(spent, budget)
-
-        log.info("[implement] done (%.1fs, $%.4f)",
-                 resp["duration_s"], resp["cost"])
-
-        # Safety-net commit: catch changes the agent failed to commit
-        porcelain = subprocess.run(
-            ["git", "status", "--porcelain"], cwd=wt,
-            capture_output=True, text=True,
-        ).stdout.strip()
-        commits = subprocess.run(
-            ["git", "log", "origin/dev..HEAD", "--oneline"], cwd=wt,
-            capture_output=True, text=True,
-        ).stdout.strip()
-
-        if porcelain:
-            log.warning("implement phase left uncommitted changes -- safety-net commit")
-            subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
-            subprocess.run(
-                ["git", "commit", "-m", f"fix: resolve #{issue_number}"],
-                cwd=wt, check=True,
-            )
-            storage.log_event(conn, "safety_net_commit", {"files": porcelain})
-        elif not commits:
-            pipeline_outcome = "implement_failed"
-            pipeline_outcome_detail = (
-                "Implement phase produced no changes — "
-                "no commits on branch and no uncommitted files."
-            )
-            raise RuntimeError(
-                "Implement phase produced no changes -- "
-                "no commits on branch and no uncommitted files"
-            )
-
-        # ---- Phase 3: Review + PR ----
-        current_phase = "review"
-        diff = workspace.get_diff(wt)[:50_000]
-        log.info("[review] starting (max_turns=%d, model=%s)",
-                 PHASE_MAX_TURNS["review"], model_override or PHASE_MODELS["review"])
-        pid = _start_phase(conn, "review")
-        prompt = REVIEW_PROMPT.format(
-            issue_number=issue_number,
-            issue_body=issue_body,
-            investigation_report=investigation_report,
-            diff=diff,
-        )
-        resp = _call_agent(prompt, phase="review", cwd=wt,
-                          model=model_override)
-        resp["_prompt"] = prompt
-        spent += resp["cost"]
-        phase_stats["review"] = {
-            "turns": resp.get("num_turns", 0),
-            "cost": resp.get("cost", 0.0),
-            "duration": resp.get("duration_s", 0.0),
-            "finish": resp.get("finish_reason", ""),
-        }
-        phase_cost = resp["cost"]
-        if phase_cost > PHASE_BUDGET["review"]:
-            log.warning("[review] phase cost $%.2f exceeded cap $%.2f", phase_cost, PHASE_BUDGET["review"])
-        _finish_phase(conn, pid, resp,
-                      failed=(resp.get("finish_reason") == "error"))
-
-        review_text = _content(resp)
-        log.info("[review] done (%.1fs, $%.4f)", resp["duration_s"], resp["cost"])
-
-        # ---- Review gate: check verdict, retry if REQUEST_CHANGES ----
-        review_attempt = 0
-        while "REQUEST_CHANGES" in review_text:
-            review_attempt += 1
-            if review_attempt > review_retries:
-                # Exhausted retries — block PR creation
-                log.warning("[review] verdict is REQUEST_CHANGES after %d attempt(s) — blocking PR creation",
-                            review_attempt)
-                storage.log_event(conn, "review_blocked", {
-                    "text": review_text,
-                    "attempts": review_attempt,
-                })
-                try:
-                    source.post_comment(repo, issue_number,
-                        f"**Pipeline review blocked PR creation ({review_attempt} attempt(s)).**\n\n{review_text[:3000]}")
-                except Exception:
-                    log.warning("failed to post review_blocked comment on %s#%d", repo, issue_number)
-                pipeline_outcome = "review_blocked"
-                pipeline_outcome_detail = (
-                    f"Review phase returned REQUEST_CHANGES verdict after {review_attempt} attempt(s). "
-                    "PR was NOT created. The review identified problems that need fixing before the code ships."
-                )
-                storage.finish_run(conn, "review_blocked", total_cost=spent, branch=branch)
-                pipeline_result = {
-                    "status": "review_blocked",
-                    "review_text": review_text,
-                    "spent_usd": spent,
-                    "run_id": run_id,
-                }
-                # fall through to audit in finally block
-                return pipeline_result
-
-            # ---- Retry: feed review findings back into a new implement attempt ----
-            log.info("[review] REQUEST_CHANGES on attempt %d — retrying implement (max retries: %d)",
-                     review_attempt, review_retries)
-            storage.log_event(conn, "review_retry", {
-                "attempt": review_attempt,
-                "review_findings": review_text[:5000],
-            })
-
-            rejected_diff = diff
-
-            # Re-implement with review feedback
-            current_phase = f"implement_retry_{review_attempt}"
-            log.info("[implement_retry_%d] starting", review_attempt)
-            pid = _start_phase(conn, f"implement_retry_{review_attempt}")
-            retry_prompt = IMPLEMENT_RETRY_PROMPT.format(
-                issue_number=issue_number,
-                issue_body=issue_body,
-                investigation_report=investigation_report,
-                review_findings=review_text,
-                rejected_diff=rejected_diff,
-            )
-            resp = _call_agent(retry_prompt, phase="implement", cwd=wt,
+            resp = _call_agent(prompt, phase="investigate", cwd=wt,
                               model=model_override)
-            resp["_prompt"] = retry_prompt
+            resp["_prompt"] = prompt
             spent += resp["cost"]
-            phase_stats[f"implement_retry_{review_attempt}"] = {
+            _finish_phase(conn, pid, resp,
+                          failed=(resp.get("finish_reason") == "error"))
+            _guard(spent, budget)
+
+            phase_stats["investigate"] = {
                 "turns": resp.get("num_turns", 0),
                 "cost": resp.get("cost", 0.0),
                 "duration": resp.get("duration_s", 0.0),
                 "finish": resp.get("finish_reason", ""),
             }
+
+            phase_cost = resp["cost"]
+            if phase_cost > PHASE_BUDGET["investigate"]:
+                log.warning("[investigate] phase cost $%.2f exceeded cap $%.2f", phase_cost, PHASE_BUDGET["investigate"])
+
+            investigation_report = _content(resp)
+            log.info("[investigate] done (%.1fs, $%.4f, %d chars)",
+                     resp["duration_s"], resp["cost"], len(investigation_report))
+
+            log.info("[investigate] report quality: %d chars, %d sections found",
+                     len(investigation_report),
+                     investigation_report.count("**"))
+            if len(investigation_report) < 500:
+                log.warning("[investigate] thin report (%d chars) — implement phase may re-investigate", len(investigation_report))
+                pipeline_outcome = "investigation_failed"
+                pipeline_outcome_detail = (
+                    f"Investigation report too thin ({len(investigation_report)} chars). "
+                    "Required: >500 chars with Root Cause and Affected Files sections. "
+                    "Pipeline aborted to avoid wasting $3-5 on implement+review that will fail."
+                )
+                raise RuntimeError(pipeline_outcome_detail)
+
+            # Validate required sections exist
+            report_lower = investigation_report.lower()
+            missing_sections = []
+            if "root cause" not in report_lower:
+                missing_sections.append("Root Cause")
+            if "affected files" not in report_lower:
+                missing_sections.append("Affected Files")
+            if missing_sections:
+                pipeline_outcome = "investigation_failed"
+                pipeline_outcome_detail = (
+                    f"Investigation report missing required sections: {missing_sections}. "
+                    "Report must contain 'Root Cause' and 'Affected Files' sections."
+                )
+                raise RuntimeError(pipeline_outcome_detail)
+
+            if resp.get("finish_reason") == "error" and len(investigation_report) < 200:
+                pipeline_outcome = "investigation_failed"
+                pipeline_outcome_detail = f"Investigate phase errored with thin output: {investigation_report[:500]}"
+                raise RuntimeError(f"Investigate phase failed: {investigation_report[:500]}")
+            if resp.get("finish_reason") in ("error", "max_iterations"):
+                log.warning("[investigate] finished with %s but has %d chars of content — continuing",
+                            resp.get("finish_reason"), len(investigation_report))
+
+        # ---- Phase 2: Implement ----
+        current_phase = "implement"
+        if not _phase_allowed("implement"):
+            log.info("[implement] skipped (not in --phases filter)")
+        else:
+            log.info("[implement] starting (max_turns=%d, model=%s)",
+                     PHASE_MAX_TURNS["implement"], model_override or PHASE_MODELS["implement"])
+            pid = _start_phase(conn, "implement")
+            prompt = IMPLEMENT_PROMPT.format(
+                issue_number=issue_number,
+                issue_body=issue_body,
+                investigation_report=investigation_report,
+            )
+            resp = _call_agent(prompt, phase="implement", cwd=wt,
+                              model=model_override)
+            resp["_prompt"] = prompt
+            spent += resp["cost"]
+            phase_stats["implement"] = {
+                "turns": resp.get("num_turns", 0),
+                "cost": resp.get("cost", 0.0),
+                "duration": resp.get("duration_s", 0.0),
+                "finish": resp.get("finish_reason", ""),
+            }
+            phase_cost = resp["cost"]
+            if phase_cost > PHASE_BUDGET["implement"]:
+                log.warning("[implement] phase cost $%.2f exceeded cap $%.2f", phase_cost, PHASE_BUDGET["implement"])
             _finish_phase(conn, pid, resp,
                           failed=(resp.get("finish_reason") == "error"))
             _guard(spent, budget)
-            log.info("[implement_retry_%d] done (%.1fs, $%.4f)",
-                     review_attempt, resp["duration_s"], resp["cost"])
 
-            # Safety-net commit for retry
+            log.info("[implement] done (%.1fs, $%.4f)",
+                     resp["duration_s"], resp["cost"])
+
+            # Safety-net commit: catch changes the agent failed to commit
             porcelain = subprocess.run(
                 ["git", "status", "--porcelain"], cwd=wt,
                 capture_output=True, text=True,
             ).stdout.strip()
+            commits = subprocess.run(
+                ["git", "log", "origin/dev..HEAD", "--oneline"], cwd=wt,
+                capture_output=True, text=True,
+            ).stdout.strip()
+
             if porcelain:
-                log.warning("implement_retry_%d left uncommitted changes -- safety-net commit",
-                            review_attempt)
+                log.warning("implement phase left uncommitted changes -- safety-net commit")
                 subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
                 subprocess.run(
-                    ["git", "commit", "-m",
-                     f"fix: address review feedback for #{issue_number} (retry {review_attempt})"],
+                    ["git", "commit", "-m", f"fix: resolve #{issue_number}"],
                     cwd=wt, check=True,
                 )
-                storage.log_event(conn, "safety_net_commit_retry", {
-                    "attempt": review_attempt, "files": porcelain,
-                })
+                storage.log_event(conn, "safety_net_commit", {"files": porcelain})
+            elif not commits:
+                pipeline_outcome = "implement_failed"
+                pipeline_outcome_detail = (
+                    "Implement phase produced no changes — "
+                    "no commits on branch and no uncommitted files."
+                )
+                raise RuntimeError(
+                    "Implement phase produced no changes -- "
+                    "no commits on branch and no uncommitted files"
+                )
 
-            # Re-review the updated diff
-            current_phase = f"review_retry_{review_attempt}"
+        # ---- Phase 3: Review + PR ----
+        current_phase = "review"
+        if not _phase_allowed("review"):
+            log.info("[review] skipped (not in --phases filter)")
+        else:
             diff = workspace.get_diff(wt)[:50_000]
-            log.info("[review_retry_%d] starting", review_attempt)
-            pid = _start_phase(conn, f"review_retry_{review_attempt}")
+            log.info("[review] starting (max_turns=%d, model=%s)",
+                     PHASE_MAX_TURNS["review"], model_override or PHASE_MODELS["review"])
+            pid = _start_phase(conn, "review")
             prompt = REVIEW_PROMPT.format(
                 issue_number=issue_number,
                 issue_body=issue_body,
@@ -1710,68 +1612,191 @@ def run_pipeline(
                               model=model_override)
             resp["_prompt"] = prompt
             spent += resp["cost"]
-            phase_stats[f"review_retry_{review_attempt}"] = {
+            phase_stats["review"] = {
                 "turns": resp.get("num_turns", 0),
                 "cost": resp.get("cost", 0.0),
                 "duration": resp.get("duration_s", 0.0),
                 "finish": resp.get("finish_reason", ""),
             }
+            phase_cost = resp["cost"]
+            if phase_cost > PHASE_BUDGET["review"]:
+                log.warning("[review] phase cost $%.2f exceeded cap $%.2f", phase_cost, PHASE_BUDGET["review"])
             _finish_phase(conn, pid, resp,
                           failed=(resp.get("finish_reason") == "error"))
+
+            review_text = _content(resp)
+            log.info("[review] done (%.1fs, $%.4f)", resp["duration_s"], resp["cost"])
+
+            # ---- Review gate: check verdict, retry if REQUEST_CHANGES ----
+            review_attempt = 0
+            while "REQUEST_CHANGES" in review_text:
+                review_attempt += 1
+                if review_attempt > review_retries:
+                    # Exhausted retries — block PR creation
+                    log.warning("[review] verdict is REQUEST_CHANGES after %d attempt(s) — blocking PR creation",
+                                review_attempt)
+                    storage.log_event(conn, "review_blocked", {
+                        "text": review_text,
+                        "attempts": review_attempt,
+                    })
+                    try:
+                        source.post_comment(repo, issue_number,
+                            f"**Pipeline review blocked PR creation ({review_attempt} attempt(s)).**\n\n{review_text[:3000]}")
+                    except Exception:
+                        log.warning("failed to post review_blocked comment on %s#%d", repo, issue_number)
+                    pipeline_outcome = "review_blocked"
+                    pipeline_outcome_detail = (
+                        f"Review phase returned REQUEST_CHANGES verdict after {review_attempt} attempt(s). "
+                        "PR was NOT created. The review identified problems that need fixing before the code ships."
+                    )
+                    storage.finish_run(conn, "review_blocked", total_cost=spent, branch=branch)
+                    pipeline_result = {
+                        "status": "review_blocked",
+                        "review_text": review_text,
+                        "spent_usd": spent,
+                        "run_id": run_id,
+                    }
+                    # fall through to audit in finally block
+                    return pipeline_result
+
+                # ---- Retry: feed review findings back into a new implement attempt ----
+                log.info("[review] REQUEST_CHANGES on attempt %d — retrying implement (max retries: %d)",
+                         review_attempt, review_retries)
+                storage.log_event(conn, "review_retry", {
+                    "attempt": review_attempt,
+                    "review_findings": review_text[:5000],
+                })
+
+                rejected_diff = diff
+
+                # Re-implement with review feedback
+                current_phase = f"implement_retry_{review_attempt}"
+                log.info("[implement_retry_%d] starting", review_attempt)
+                pid = _start_phase(conn, f"implement_retry_{review_attempt}")
+                retry_prompt = IMPLEMENT_RETRY_PROMPT.format(
+                    issue_number=issue_number,
+                    issue_body=issue_body,
+                    investigation_report=investigation_report,
+                    review_findings=review_text,
+                    rejected_diff=rejected_diff,
+                )
+                resp = _call_agent(retry_prompt, phase="implement", cwd=wt,
+                                  model=model_override)
+                resp["_prompt"] = retry_prompt
+                spent += resp["cost"]
+                phase_stats[f"implement_retry_{review_attempt}"] = {
+                    "turns": resp.get("num_turns", 0),
+                    "cost": resp.get("cost", 0.0),
+                    "duration": resp.get("duration_s", 0.0),
+                    "finish": resp.get("finish_reason", ""),
+                }
+                _finish_phase(conn, pid, resp,
+                              failed=(resp.get("finish_reason") == "error"))
+                _guard(spent, budget)
+                log.info("[implement_retry_%d] done (%.1fs, $%.4f)",
+                         review_attempt, resp["duration_s"], resp["cost"])
+
+                # Safety-net commit for retry
+                porcelain = subprocess.run(
+                    ["git", "status", "--porcelain"], cwd=wt,
+                    capture_output=True, text=True,
+                ).stdout.strip()
+                if porcelain:
+                    log.warning("implement_retry_%d left uncommitted changes -- safety-net commit",
+                                review_attempt)
+                    subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
+                    subprocess.run(
+                        ["git", "commit", "-m",
+                         f"fix: address review feedback for #{issue_number} (retry {review_attempt})"],
+                        cwd=wt, check=True,
+                    )
+                    storage.log_event(conn, "safety_net_commit_retry", {
+                        "attempt": review_attempt, "files": porcelain,
+                    })
+
+                # Re-review the updated diff
+                current_phase = f"review_retry_{review_attempt}"
+                diff = workspace.get_diff(wt)[:50_000]
+                log.info("[review_retry_%d] starting", review_attempt)
+                pid = _start_phase(conn, f"review_retry_{review_attempt}")
+                prompt = REVIEW_PROMPT.format(
+                    issue_number=issue_number,
+                    issue_body=issue_body,
+                    investigation_report=investigation_report,
+                    diff=diff,
+                )
+                resp = _call_agent(prompt, phase="review", cwd=wt,
+                                  model=model_override)
+                resp["_prompt"] = prompt
+                spent += resp["cost"]
+                phase_stats[f"review_retry_{review_attempt}"] = {
+                    "turns": resp.get("num_turns", 0),
+                    "cost": resp.get("cost", 0.0),
+                    "duration": resp.get("duration_s", 0.0),
+                    "finish": resp.get("finish_reason", ""),
+                }
+                _finish_phase(conn, pid, resp,
+                              failed=(resp.get("finish_reason") == "error"))
 
             review_text = _content(resp)
             log.info("[review_retry_%d] done (%.1fs, $%.4f)",
                      review_attempt, resp["duration_s"], resp["cost"])
             # Loop back to check if this review also says REQUEST_CHANGES
 
-        # Push and create PR
-        destination.push_branch(wt, branch)
-        body = destination.format_pr_body(issue_number, review_text, db_path, [])
-        pr = destination.create_pr(repo, branch, f"fix: resolve #{issue_number}", body)
-        pr_url = pr["url"]
+        # Push and create PR (only if review was allowed and ran)
+        if _phase_allowed("review"):
+            destination.push_branch(wt, branch)
+            body = destination.format_pr_body(issue_number, review_text, db_path, [])
+            pr = destination.create_pr(repo, branch, f"fix: resolve #{issue_number}", body)
+            pr_url = pr["url"]
+        else:
+            pr_url = "(no PR — review phase skipped)"
 
-        # ---- Phase 4: Deep Review (Opus) — adversarial review after PR ----
+        # ---- Phase 4: Deep Review — adversarial review after PR ----
         try:
             current_phase = "deep_review"
-            log.info("[deep_review] starting (max_turns=%d, model=%s)",
-                     PHASE_MAX_TURNS["deep_review"], PHASE_MODELS["deep_review"])
-            pid = _start_phase(conn, "deep_review")
-            prompt = DEEP_REVIEW_PROMPT.format(
-                issue_number=issue_number,
-                issue_body=issue_body,
-                investigation_report=investigation_report,
-                diff=diff,
-                review_text=review_text,
-                pr_url=pr["url"],
-            )
-            dr_resp = _call_agent(prompt, phase="deep_review", cwd=wt)
-            dr_resp["_prompt"] = prompt
-            spent += dr_resp["cost"]
-            phase_stats["deep_review"] = {
-                "turns": dr_resp.get("num_turns", 0),
-                "cost": dr_resp.get("cost", 0.0),
-                "duration": dr_resp.get("duration_s", 0.0),
-                "finish": dr_resp.get("finish_reason", ""),
-            }
-            _finish_phase(conn, pid, dr_resp,
-                          failed=(dr_resp.get("finish_reason") == "error"))
+            if not _phase_allowed("deep_review"):
+                log.info("[deep_review] skipped (not in --phases filter)")
+            else:
+                log.info("[deep_review] starting (max_turns=%d, model=%s)",
+                         PHASE_MAX_TURNS["deep_review"], PHASE_MODELS["deep_review"])
+                pid = _start_phase(conn, "deep_review")
+                prompt = DEEP_REVIEW_PROMPT.format(
+                    issue_number=issue_number,
+                    issue_body=issue_body,
+                    investigation_report=investigation_report,
+                    diff=diff,
+                    review_text=review_text,
+                    pr_url=pr["url"],
+                )
+                dr_resp = _call_agent(prompt, phase="deep_review", cwd=wt)
+                dr_resp["_prompt"] = prompt
+                spent += dr_resp["cost"]
+                phase_stats["deep_review"] = {
+                    "turns": dr_resp.get("num_turns", 0),
+                    "cost": dr_resp.get("cost", 0.0),
+                    "duration": dr_resp.get("duration_s", 0.0),
+                    "finish": dr_resp.get("finish_reason", ""),
+                }
+                _finish_phase(conn, pid, dr_resp,
+                              failed=(dr_resp.get("finish_reason") == "error"))
 
-            deep_review_text = _content(dr_resp)
-            storage.log_event(conn, "deep_review_text", {"text": deep_review_text})
-            log.info("[deep_review] done (%.1fs, $%.4f)", dr_resp["duration_s"], dr_resp["cost"])
+                deep_review_text = _content(dr_resp)
+                storage.log_event(conn, "deep_review_text", {"text": deep_review_text})
+                log.info("[deep_review] done (%.1fs, $%.4f)", dr_resp["duration_s"], dr_resp["cost"])
 
-            # If deep review blocks, post corrections on both issue and PR
-            if "BLOCK" in deep_review_text or "CONCERNS" in deep_review_text:
-                dr_verdict = "BLOCK" if "BLOCK" in deep_review_text else "CONCERNS"
-                log.warning("[deep_review] verdict is %s", dr_verdict)
-                try:
-                    comment = f"**Deep review verdict: {dr_verdict}**\n\n{deep_review_text[:3000]}"
-                    source.post_comment(repo, issue_number, comment)
-                    source.post_comment(repo, pr["number"], comment)
-                except Exception:
-                    log.warning("failed to post deep_review comment")
+                # If deep review blocks, post corrections on both issue and PR
+                if "BLOCK" in deep_review_text or "CONCERNS" in deep_review_text:
+                    dr_verdict = "BLOCK" if "BLOCK" in deep_review_text else "CONCERNS"
+                    log.warning("[deep_review] verdict is %s", dr_verdict)
+                    try:
+                        comment = f"**Deep review verdict: {dr_verdict}**\n\n{deep_review_text[:3000]}"
+                        source.post_comment(repo, issue_number, comment)
+                        source.post_comment(repo, pr["number"], comment)
+                    except Exception:
+                        log.warning("failed to post deep_review comment")
 
-            _guard(spent, budget)
+                _guard(spent, budget)
         except BudgetExceeded:
             log.warning("[deep_review] budget exceeded after PR creation — skipping")
             storage.log_event(conn, "deep_review_skipped", {"reason": "budget_exceeded"})

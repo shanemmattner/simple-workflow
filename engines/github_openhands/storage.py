@@ -243,8 +243,33 @@ def finish_run(conn: sqlite3.Connection, status: str, **kwargs) -> None:
 
     Accepted kwargs: finished_at, total_cost, total_tokens_in, total_tokens_out,
     review_verdict, review_summary, branch.
+
+    A-02/A-03 fix: if the caller did not pass total_cost / total_tokens_in /
+    total_tokens_out, recompute them from the phase table. Previously the
+    run row captured aggregates at a single point in time and they drifted
+    from the truth as audit + extract_lessons phases added rows after the
+    terminal phase. Now the run row is always consistent with the phase sum.
+    Callers can still override by passing the kwarg explicitly.
     """
     run_id = _get_run_id(conn)
+
+    if "total_cost" not in kwargs or "total_tokens_in" not in kwargs or "total_tokens_out" not in kwargs:
+        agg = conn.execute(
+            """SELECT
+                 COALESCE(SUM(cost), 0.0),
+                 COALESCE(SUM(tokens_in), 0),
+                 COALESCE(SUM(tokens_out), 0)
+               FROM phase
+               WHERE run_id = ? AND status IN ('completed', 'failed')""",
+            (run_id,),
+        ).fetchone()
+        if "total_cost" not in kwargs:
+            kwargs["total_cost"] = float(agg[0] or 0.0)
+        if "total_tokens_in" not in kwargs:
+            kwargs["total_tokens_in"] = int(agg[1] or 0)
+        if "total_tokens_out" not in kwargs:
+            kwargs["total_tokens_out"] = int(agg[2] or 0)
+
     kwargs.setdefault("finished_at", _now_iso())
     sets = ["status = ?"] + [f"{k} = ?" for k in kwargs]
     vals = [status] + list(kwargs.values()) + [run_id]
