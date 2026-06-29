@@ -88,6 +88,10 @@ def call_agent(
         system_prompt if system_prompt is not None else _DEFAULT_SYSTEM_PROMPT
     )
 
+    if model.lower() == "minimax":
+        from adapters.minimax import resolve_auto
+        model = resolve_auto("search")  # default; explicit m3/m27hs unchanged
+
     if _is_minimax_model(model):
         return _call_minimax(
             prompt,

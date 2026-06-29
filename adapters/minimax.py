@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-BASE_URL = "https://api.minimaxi.chat/v1"
+BASE_URL = "https://api.minimax.io/v1"
 
 AVAILABLE_MODELS: set[str] = {
     "MiniMax-M3",
@@ -69,3 +69,41 @@ def get_config(model: str) -> dict:
         "model": resolved,
         **_DEFAULT_PARAMS,
     }
+
+
+# ---------------------------------------------------------------------------
+# Interchangeability layer: resolve_auto() picks M3 vs M2.7-highspeed based
+# on a task-type heuristic. Callers say `model: minimax` (the wildcard alias)
+# and the runtime picks the right concrete model for the phase. Explicit
+# m3/m27hs/MiniMax-M3/MiniMax-M2.7-highspeed aliases bypass this — they keep
+# their original resolve_model() mapping.
+#
+# Override with MINIMAX_TASK_DEFAULT (env var) for ad-hoc swaps.
+# Format: "code=m3;bulk=m27hs" (semicolon-delimited key=value pairs).
+# Unknown task type → m27hs (cheap default).
+# ---------------------------------------------------------------------------
+
+_TASK_DEFAULT: dict[str, str] = {
+    "search":    "m27hs",  # M2.7-highspeed: 100 TPS, cheap
+    "classify":  "m27hs",
+    "summarize": "m3",     # 1M context — only M3 has it
+    "code":      "m3",     # Thinkwright: M3 ties GLM-5.2 here
+    "plan":      "m3",     # architecture needs reasoning
+    "bulk":      "m27hs",  # cost-sensitive
+    "tool":      "m3",     # native tool call
+}
+_ENV_DEFAULT = os.environ.get("MINIMAX_TASK_DEFAULT", "")
+for _kv in _ENV_DEFAULT.split(";"):
+    if "=" in _kv:
+        _k, _v = _kv.split("=", 1)
+        _TASK_DEFAULT[_k.strip()] = _v.strip()
+
+
+def resolve_auto(task: str) -> str:
+    """Pick the right MiniMax model for a task type. task ∈ {search, classify,
+    summarize, code, plan, bulk, tool}. Honors MINIMAX_TASK_DEFAULT override.
+    Unknown task → m27hs (cheap default). Returns the full model id, ready
+    to be passed to the API.
+    """
+    short = _TASK_DEFAULT.get(task, "m27hs")
+    return resolve_model(short)
