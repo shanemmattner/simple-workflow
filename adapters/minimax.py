@@ -3,8 +3,47 @@
 from __future__ import annotations
 
 import os
+import re
+from pathlib import Path
 
 BASE_URL = "https://api.minimax.io/v1"
+
+
+def _lookup_rc_env(var_names: list[str]) -> str | None:
+    """Return the first matching var value from ~/.zshrc, or None.
+
+    Mirrors engines/github_minimax/runtime.py — some users store API keys
+    in ~/.zshrc rather than exporting them in their shell init. We parse
+    that file as a fallback when the env var is unset.
+    """
+    rcfile = Path.home() / ".zshrc"
+    if not rcfile.is_file():
+        return None
+    try:
+        text = rcfile.read_text()
+    except OSError:
+        return None
+    # Match `export NAME=...` or bare `NAME=...` in a shell rcfile. Captures
+    # the name in group 1 and the value in group 2 (strips surrounding quotes).
+    _RC_VAR_RE = re.compile(
+        r"""^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)\s*=\s*['"]?([^'"\s#]+)['"]?\s*(?:#.*)?$""",
+        re.MULTILINE,
+    )
+    matches: dict[str, str] = {}
+    for m in _RC_VAR_RE.finditer(text):
+        matches[m.group(1)] = m.group(2)
+    for name in var_names:
+        if name in matches:
+            return matches[name]
+    return None
+
+
+def _resolve_api_key() -> str | None:
+    """Return the MiniMax API key from env, with ~/.zshrc fallback."""
+    key = os.environ.get("MINIMAX_API_KEY")
+    if key:
+        return key
+    return _lookup_rc_env(["MINIMAX_API_KEY"])
 
 AVAILABLE_MODELS: set[str] = {
     "MiniMax-M3",
@@ -59,9 +98,12 @@ def get_config(model: str) -> dict:
     resolved = resolve_model(model)
     validate_model(resolved)
 
-    api_key = os.environ.get("MINIMAX_API_KEY")
+    api_key = _resolve_api_key()
     if not api_key:
-        raise EnvironmentError("MINIMAX_API_KEY env var not set")
+        raise EnvironmentError(
+            "MINIMAX_API_KEY not set (and ~/.zshrc has no export — "
+            "run `export MINIMAX_API_KEY=...` or add it to ~/.zshrc)"
+        )
 
     return {
         "api_key": api_key,
