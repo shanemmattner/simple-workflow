@@ -112,11 +112,6 @@ def _price_for_model(model: str) -> tuple[float, float]:
         return (float(info.get("cost_in", 0.30)), float(info.get("cost_out", 1.20)))
     return (0.30, 1.20)  # M3 default
 
-
-# Pricing per million tokens (USD) — overwritten per call from the adapter.
-_PRICE_IN = 0.30
-_PRICE_OUT = 1.20
-
 # ---------------------------------------------------------------------------
 # Tool definitions (OpenAI function-calling format) — Claude-style names
 # ---------------------------------------------------------------------------
