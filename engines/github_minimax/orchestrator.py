@@ -1197,8 +1197,8 @@ def _run_learning_phase(
         "learning_cost": 0.0,
     }
 
-    # ---- Step 1: Extract lessons with Opus ----
-    log.info("[learn] extracting lessons (model=opus)")
+    # ---- Step 1: Extract lessons ----
+    log.info("[learn] extracting lessons (model=m3)")
     pid = _start_phase(conn, "extract_lessons")
 
     prompt = EXTRACT_LESSONS_PROMPT.format(
@@ -1234,7 +1234,7 @@ def _run_learning_phase(
         summary["learning_cost"] = learning_spent
         return summary
 
-    # ---- Step 2: Adversarial review each lesson with Sonnet ----
+    # ---- Step 2: Adversarial review each lesson ----
     accepted: list[dict] = []
     rejected: list[dict] = []
 
@@ -1260,7 +1260,11 @@ def _run_learning_phase(
             pipeline_outcome=pipeline_outcome,
         )
 
-        adv_resp = _call_agent(review_prompt, phase="adversarial_review", cwd=wt, model="sonnet")
+        # NOTE: was previously model=\"sonnet\" — that alias lives in the
+        # Claude CLI adapter, not in the MiniMax adapter, so the call raised
+        # KeyError 'api_key' and the adversarial review phase hung
+        # forever. Use m27hs (cheap; review-class per PHASE_MODELS).
+        adv_resp = _call_agent(review_prompt, phase="adversarial_review", cwd=wt, model="m27hs")
         adv_resp["_prompt"] = review_prompt
         learning_spent += adv_resp.get("cost", 0.0)
         _finish_phase(conn, pid, adv_resp, failed=(adv_resp.get("finish_reason") == "error"))
