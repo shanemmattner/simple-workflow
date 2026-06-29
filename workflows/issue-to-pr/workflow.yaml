@@ -5,7 +5,13 @@ budget:
   max_per_run_usd: 2.00
 
 max_parallel_workers: 5
-default_model: minimax  # route layer picks m3 vs m27hs based on phase name; explicit per-phase model: still wins
+# NOTE: there is intentionally no `default_model` field here. The
+# orchestrator resolves model per-phase via PHASE_MODELS (in
+# engines/github_minimax/orchestrator.py) which already maps each
+# phase to m3 or m27hs. A top-level default_model would create a
+# second source of truth and risk drift; the per-phase map is the
+# single source of truth. Explicit per-phase model: in the CLI
+# --model flag still wins.
 
 models:
   haiku:
