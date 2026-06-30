@@ -6,6 +6,9 @@ You are the verify agent. Check each task from triage against the actual codebas
 
 ## Output schema
 
+**CRITICAL — valid `status` values are EXACTLY:** `CONFIRMED`, `REFUTED`, `STALE`, `PARTIAL`.
+Never output `UNVERIFIED`, `UNKNOWN`, `PENDING`, or any other value. If you cannot determine the status, use `REFUTED` with a clear evidence note.
+
 ```json
 {
   "verified_tasks": [

@@ -101,7 +101,13 @@ def validate_triage(output: dict, worktree_path: str) -> dict:
 
 
 def validate_verify(output: dict) -> dict:
-    """Check verify output: verified_tasks present, valid statuses."""
+    """Check verify output: verified_tasks present, valid statuses.
+
+    UNVERIFIED is treated as a soft failure: it is logged as a warning and
+    the task is counted as not-buildable (same as REFUTED), but the gate
+    passes so the pipeline can continue.  0 buildable tasks causes an early
+    exit downstream — no exception is raised here.
+    """
     tasks = output.get("verified_tasks", [])
     log.info("[gate/verify] checking %d verified_task(s)", len(tasks))
 
@@ -110,13 +116,23 @@ def validate_verify(output: dict) -> dict:
         return {"passed": False, "reason": "verified_tasks is empty"}
 
     valid_statuses = {"CONFIRMED", "REFUTED", "STALE", "PARTIAL"}
+    soft_statuses = {"UNVERIFIED"}  # treated as not-buildable but don't fail the gate
+
     for t in tasks:
         status = t.get("status", "").upper()
         log.info(
             "[gate/verify] task %s status=%s evidence=%r",
             t.get("task_id"), status, t.get("evidence", "")[:120],
         )
-        if status not in valid_statuses:
+        if status in soft_statuses:
+            log.warning(
+                "[gate/verify] task %s has soft-invalid status %r — "
+                "treating as not-buildable (pipeline will continue with 0 buildable tasks)",
+                t.get("task_id"), t.get("status"),
+            )
+            # Rewrite in-place so downstream buildable_ids filter skips this task
+            t["status"] = "REFUTED"
+        elif status not in valid_statuses:
             reason = f"task {t.get('task_id')} has invalid status: {t.get('status')!r}"
             log.warning("[gate/verify] FAIL: %s", reason)
             return {"passed": False, "reason": reason}

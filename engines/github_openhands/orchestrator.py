@@ -226,7 +226,7 @@ def run_pipeline(repo: str, issue_number: int, *,
         if r.get("review_summary"):
             prior_review = r["review_summary"]
 
-    branch = f"sw/issue-{issue_number}"
+    branch = f"oh/issue-{issue_number}"
     wt = workspace.create_workspace(repo_path or os.getcwd(), branch)
     repo_context = _load_repo_context(wt)
     if repo_context:
