@@ -4,15 +4,20 @@ Pipeline that transforms GitHub issues into tested, reviewed PRs. Reads an issue
 
 ## Run
 
-```bash
-# Claude engine (default)
-./scripts/run.sh owner/repo#123
-./scripts/run.sh owner/repo#123 --budget 2.00 --model opus
-python -m engine owner/repo#123
+Primary input is a local repo path + git ref, not an issue. Issue context is
+optional (`--issue`) — owner/repo is auto-derived from the repo's git remote.
 
-# Three-step engine (Claude subscription via CLI)
-./scripts/run.sh owner/repo#123 --engine three-step
-python -m engines.three_step owner/repo#123 --budget 3.00
+```bash
+# Claude engine (default), domain workflow (workflows/<name>/workflow.md)
+./scripts/run.sh workflows/shftty-web /path/to/repos/shftty abc123f
+./scripts/run.sh workflows/shftty-web /path/to/repos/shftty main --issue 896 --budget 2.00 --model opus
+python -m engine --repo-path /path/to/repos/shftty --base abc123f --workflow shftty-web
+
+# Legacy issue-to-pr pipeline (no --workflow): still requires owner/repo + --issue
+python -m engine owner/repo --issue 123 --repo-path /path/to/repo
+
+# Three-step engine (Claude subscription via CLI) -- unaffected, still issue-driven
+./scripts/run-bg.sh owner/repo#123 --budget 3.00
 python -m engines.three_step owner/repo#123 --model opus  # override all phases
 ```
 

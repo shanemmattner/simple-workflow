@@ -77,15 +77,30 @@ def _run_glab(args: list[str], *, timeout: int = 30) -> subprocess.CompletedProc
     return result
 
 
-def fetch_issue(repo: str, issue_number: int, provider: str = "github") -> dict:
+_EMPTY_ISSUE: dict = {
+    "title": "",
+    "body": "",
+    "state": "",
+    "labels": [],
+    "assignees": [],
+    "author": "",
+    "url": "",
+    "comments": [],
+}
+
+
+def fetch_issue(repo: str | None, issue_number: int | None, provider: str = "github") -> dict:
     """Fetch an issue with its metadata, body, and comments.
 
     Parameters
     ----------
-    repo : str
-        Full repo slug, e.g. ``"owner/repo"``.
-    issue_number : int
-        Issue number.
+    repo : str | None
+        Full repo slug, e.g. ``"owner/repo"``. May be ``None`` when no issue
+        is being fetched (``issue_number`` is also ``None`` in that case).
+    issue_number : int | None
+        Issue number. If ``None``, no fetch is performed and an empty issue
+        dict is returned (the pipeline runs without issue context — the
+        task is defined entirely by the workflow's own prompts).
     provider : str
         "github" (default) or "gitlab".
 
@@ -94,6 +109,9 @@ def fetch_issue(repo: str, issue_number: int, provider: str = "github") -> dict:
     dict with keys:
         title, body, state, labels, assignees, author, url, comments
     """
+    if issue_number is None:
+        log.info("fetch_issue: issue_number is None — returning empty issue context")
+        return dict(_EMPTY_ISSUE)
     if provider == "gitlab":
         return _fetch_issue_gitlab(repo, issue_number)
     return _fetch_issue_github(repo, issue_number)

@@ -109,11 +109,16 @@ def _set_pragmas(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA page_size = 8192")
 
 
-def _db_filename(repo: str, issue_number: int) -> str:
-    """Build <repo>-<issue>-<YYYYMMDD-HHMM>.db filename."""
-    safe_repo = repo.replace("/", "-")
+def _db_filename(repo: str | None, issue_number: int | None) -> str:
+    """Build <repo>-<issue>-<YYYYMMDD-HHMM>.db filename.
+
+    repo/issue_number may be None for repo-path+git-ref runs that have no
+    associated GitHub/GitLab issue — falls back to "local"/"noissue".
+    """
+    safe_repo = (repo or "local").replace("/", "-")
+    issue_part = str(issue_number) if issue_number is not None else "noissue"
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
-    return f"{safe_repo}-{issue_number}-{ts}.db"
+    return f"{safe_repo}-{issue_part}-{ts}.db"
 
 
 # ---------------------------------------------------------------------------
@@ -122,8 +127,8 @@ def _db_filename(repo: str, issue_number: int) -> str:
 
 
 def create_run_db(
-    repo: str,
-    issue_number: int,
+    repo: str | None,
+    issue_number: int | None,
     *,
     issue_url: str | None = None,
     model: str | None = None,
@@ -151,11 +156,16 @@ def create_run_db(
             pass  # Column already exists
     conn.commit()
 
+    # `run.repo`/`run.issue_number` are NOT NULL columns — coerce missing
+    # values to sentinels for repo-path+git-ref runs with no GitHub/GitLab
+    # issue. Callers (orchestrator) still treat issue_number as Optional[int]
+    # everywhere else; this sentinel is purely a storage-layer concern.
     run_id = uuid.uuid4().hex[:12]
     conn.execute(
         """INSERT INTO run (id, repo, issue_number, issue_url, model, started_at, prompt_sha)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (run_id, repo, issue_number, issue_url, model, _now_iso(), prompt_sha),
+        (run_id, repo or "local", issue_number if issue_number is not None else 0,
+         issue_url, model, _now_iso(), prompt_sha),
     )
     conn.commit()
     return db_path, conn

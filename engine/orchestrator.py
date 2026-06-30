@@ -131,7 +131,7 @@ def _commit_step(
     wt: str,
     step_num: int,
     step_title: str,
-    issue_number: int,
+    issue_number: int | None,
     workflow: str,
 ) -> list[str]:
     """Git add + commit changes from a single step. Returns list of changed files.
@@ -154,7 +154,8 @@ def _commit_step(
 
     # Sanitize title for commit message (no issue refs from triage)
     safe_title = step_title[:60]
-    msg = f"feat(step-{step_num}): {safe_title} (#{issue_number})"
+    issue_suffix = f" (#{issue_number})" if issue_number is not None else ""
+    msg = f"feat(step-{step_num}): {safe_title}{issue_suffix}"
 
     result = subprocess.run(
         ["git", "commit", "-m", msg],
@@ -177,7 +178,7 @@ def _execute_steps(
     wt: str,
     execute_cfg: dict,
     execute_model: str,
-    issue_number: int,
+    issue_number: int | None,
     issue_body: str,
     triage_text: str,
     repo_context: str,
@@ -217,7 +218,7 @@ def _execute_steps(
         step_prompt = step_prompt.replace("{step_changes}", step.changes)
         step_prompt = step_prompt.replace("{step_verify}", step.verify)
         step_prompt = step_prompt.replace("{prior_steps}", prior_step_summaries or "This is the first step.")
-        step_prompt = step_prompt.replace("{issue_number}", str(issue_number))
+        step_prompt = step_prompt.replace("{issue_number}", str(issue_number) if issue_number is not None else "N/A")
         step_prompt = step_prompt.replace("{issue_body}", issue_body)
         step_prompt = step_prompt.replace("{repo_context}", repo_context)
         step_prompt = step_prompt.replace("{recent_learnings}", recent_learnings or "No prior learnings available.")
@@ -840,9 +841,19 @@ def load_resume_state(db_path: str) -> dict:
     }
 
 
-def _post_failure(repo: str, num: int, err: str, provider: str = "github"):
+def _post_failure(repo: str | None, num: int | None, err: str, provider: str = "github"):
+    if num is None:
+        log.info("[failure] no issue_number — skipping failure comment (repo=%s)", repo)
+        return
     try: source.post_comment(repo, num, f"Pipeline failed.\n\n```\n{err[:2000]}\n```", provider=provider)
     except Exception: log.warning("failed to post failure comment on %s#%d", repo, num)
+
+
+def _sanitize_branch_ref(ref: str) -> str:
+    """Sanitize a git ref (branch/tag/commit hash) for embedding in a generated
+    branch name, e.g. ``feature/foo bar`` -> ``feature-foo-bar``."""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", ref).strip("-")
+    return safe[:24] or "ref"
 
 
 def run_pipeline(repo: str, issue_number: int, *,
@@ -1265,12 +1276,19 @@ def run_pipeline(repo: str, issue_number: int, *,
         conn.close()
 
 
-def run_domain_pipeline(repo: str, issue_number: int, *,
+def run_domain_pipeline(repo: str | None, issue_number: int | None, *,
                         workflow: str,
+                        base_ref: str = "main",
                         budget: float = 10.00,
                         model_override: str | None = None,
                         repo_path: str | None = None) -> dict:
     """Simplified 3-phase pipeline for domain-specific workflows (shftty-web, shftty-ios, etc).
+
+    Primary input is a local repo path + git ref (``base_ref``), not a GitHub
+    issue. ``repo`` (owner/repo slug) and ``issue_number`` are both optional —
+    when ``issue_number`` is provided, triage gets the issue body as extra
+    context and status comments are posted back to it; when omitted, the
+    pipeline runs purely off the workflow's own prompts and repo state.
 
     Unlike run_pipeline(), this function:
     - Loads prompts from a domain workflow dir (e.g. workflows/shftty-web/prompts/)
@@ -1281,15 +1299,19 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
       with commits is the output of this pipeline; a separate `pr.sh` step
       (see destination.py) opens the PR from that branch when desired.
     - No wave planning, no parallel task execution, no JSON gates, no validate
-      or improve phases (those were post-PR polish and preview-URL polling).
+      phase (post-PR preview-URL polling — duplicates review's own gates).
+    - Runs triage -> execute -> review -> improve (informational retrospective,
+      non-blocking) -> push.
+    - Worktree branches from ``base_ref`` (default "main"); the final diff
+      gate also diffs against ``base_ref``, not a hardcoded "main".
     """
     healthy, detail = runtime._check_cli_health()
     if not healthy:
         log.error("aborting run_domain_pipeline: claude CLI health check failed: %s", detail)
         raise RuntimeError(f"claude CLI health check failed before run start: {detail}")
     wf_dir = _resolve_workflow_dir(workflow)
-    log.info("run_domain_pipeline start repo=%s issue=%d workflow=%s wf_dir=%s budget=%.2f",
-             repo, issue_number, workflow, wf_dir, budget)
+    log.info("run_domain_pipeline start repo=%s issue=%s workflow=%s wf_dir=%s budget=%.2f base_ref=%s",
+             repo, issue_number if issue_number is not None else "none", workflow, wf_dir, budget, base_ref)
 
     # Load workflow config from domain dir (falls back gracefully if missing)
     wf = _load_workflow_config(wf_dir)
@@ -1317,7 +1339,7 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
 
     def render_domain(template: str, prior: dict, repo_context: str = "",
                       recent_learnings: str = "", extra: dict | None = None) -> str:
-        out = template.replace("{issue_number}", str(issue_number))
+        out = template.replace("{issue_number}", str(issue_number) if issue_number is not None else "N/A")
         out = out.replace("{issue_body}", issue_body)
         out = out.replace("{repo_context}", repo_context)
         out = out.replace("{prior_phases}", build_prior_text(prior))
@@ -1333,7 +1355,14 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
         return out
 
     issue = source.fetch_issue(repo, issue_number, provider=provider)
-    issue_body = f"# {issue['title']}\n\n{issue['body']}"
+    if issue_number is not None:
+        issue_body = f"# {issue['title']}\n\n{issue['body']}"
+    else:
+        issue_body = (
+            "No issue provided — task is defined entirely by the workflow's "
+            "own prompts and current repo state."
+        )
+        log.info("[domain] no issue_number provided — triage runs without issue context")
 
     db_path, conn = storage.create_run_db(repo, issue_number, model=model_override)
     run_id = db_path.stem if hasattr(db_path, "stem") else str(db_path)
@@ -1381,9 +1410,10 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
 
     # Resolve the worktree path ONCE here and use this same `wt` value for every
     # subsequent phase (execute, review, push, PR) — never re-derive it.
-    branch = f"sw/{workflow}-{issue_number}"
-    wt = workspace.create_workspace(effective_repo_path, branch)
-    log.info("worktree created at wt=%s (branch=%s, repo=%s)", wt, branch, effective_repo_path)
+    branch_suffix = str(issue_number) if issue_number is not None else _sanitize_branch_ref(base_ref)
+    branch = f"sw/{workflow}-{branch_suffix}"
+    wt = workspace.create_workspace(effective_repo_path, branch, base=base_ref)
+    log.info("worktree created at wt=%s (branch=%s, repo=%s, base_ref=%s)", wt, branch, effective_repo_path, base_ref)
     workspace.neutralize_claude_md(wt)
     repo_context = _load_repo_context(wt)
     if repo_context:
@@ -1430,7 +1460,10 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
                 f"(workflow: {workflow}).\n\n"
                 f"Triage output:\n\n{triage_text[:3000]}"
             )
-            source.post_comment(repo, issue_number, msg, provider=provider)
+            if issue_number is not None:
+                source.post_comment(repo, issue_number, msg, provider=provider)
+            else:
+                log.info("[domain/triage] no issue_number — skipping early-exit comment")
             storage.finish_run(conn, f"triage_{triage_signal.lower()}", total_cost=spent)
             log.info("[domain/triage] early exit signal=%s", triage_signal)
             return {"status": f"triage_{triage_signal.lower()}", "spent_usd": spent, "run_id": run_id}
@@ -1513,13 +1546,14 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
             ["git", "status", "--porcelain"], cwd=wt, capture_output=True, text=True,
         ).stdout.strip()
         _commits = subprocess.run(
-            ["git", "log", "origin/main..HEAD", "--oneline"], cwd=wt, capture_output=True, text=True,
+            ["git", "log", f"origin/{base_ref}..HEAD", "--oneline"], cwd=wt, capture_output=True, text=True,
         ).stdout.strip()
         if _porcelain:
             log.warning("[domain] execute phase left uncommitted changes — safety-net commit")
             subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
+            _issue_suffix = f" #{issue_number}" if issue_number is not None else ""
             subprocess.run(
-                ["git", "commit", "-m", f"feat: resolve #{issue_number} ({workflow})"],
+                ["git", "commit", "-m", f"feat: resolve{_issue_suffix} ({workflow})"],
                 cwd=wt, check=True,
             )
             storage.log_event(conn, "safety_net_commit", {"files": _porcelain})
@@ -1529,7 +1563,7 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
             )
 
         # ---- Review phase -------------------------------------------------------
-        diff = workspace.get_diff(wt)[:50_000]
+        diff = workspace.get_diff(wt, base=f"origin/{base_ref}")[:50_000]
         review_cfg = pcfg.get("review", {"model": "sonnet", "max_turns": 10})
         review_model = _resolve_model(review_cfg, model_override)
         pid = _start_phase(conn, "review", model=review_model)
@@ -1558,8 +1592,61 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
         log.info("[domain/review] signal=%s spent=%.4f", review_signal, spent)
         storage.log_event(conn, "review_signal", {"signal": review_signal})
 
+        # ---- Improve (informational retrospective — does not block push) --------
+        try:
+            improve_cfg = pcfg.get("improve", {"model": "sonnet", "max_turns": 10})
+            improve_model = _resolve_model(improve_cfg, model_override)
+            cost_summary = json.dumps({
+                "total_spent_usd": round(spent, 4),
+                "budget_usd": budget,
+                "utilization_pct": round(spent / budget * 100, 1) if budget else 0,
+            })
+            improve_prompt = render_domain(
+                load_prompt("improve"), prior,
+                repo_context=repo_context, recent_learnings=recent_learnings_text,
+                extra={"cost_summary": cost_summary, "combined_diff": diff[:30_000]},
+            )
+            pid = _start_phase(conn, "improve", model=improve_model)
+            log.info("[domain/improve] start model=%s max_turns=%d", improve_model, improve_cfg.get("max_turns", 10))
+            improve_resp = runtime.call_agent(
+                improve_prompt, model=improve_model, cwd=wt,
+                max_turns=improve_cfg.get("max_turns", 10),
+            )
+            improve_resp["_prompt"] = improve_prompt
+            _finish_phase(conn, pid, improve_resp)
+            spent += improve_resp["cost"]
+            improve_text = _content(improve_resp)
+            prior["improve"] = improve_text
+            try:
+                improve_data = json.loads(improve_text) if improve_text.strip().startswith("{") \
+                    else _extract_json(improve_text, (
+                        '{"overall_score": 0, "phase_scores": {"triage": 0, "execute": 0, "review": 0}, '
+                        '"recommendations": [], "context_gaps": [], "code_quality_issues": [], '
+                        '"cost_analysis": "", "pipeline_health": "", "summary": ""}'
+                    ), cwd=wt)
+                storage.log_event(conn, "improvement_suggestions", improve_data)
+                log.info("[domain/improve] overall_score=%s phase_scores=%s",
+                         improve_data.get("overall_score"), improve_data.get("phase_scores", {}))
+                try:
+                    n_learnings = capture_learnings(
+                        improve_output=improve_data,
+                        run_id=run_id,
+                        repo=repo,
+                        issue_number=issue_number,
+                    )
+                    log.info("[domain/improve] learning_capture count=%d", n_learnings)
+                except Exception as le:
+                    log.warning("[domain/improve] learning_capture_failed error=%s", le)
+            except (json.JSONDecodeError, Exception) as je:
+                log.warning("[domain/improve] could not extract structured JSON: %s", je)
+                storage.log_event(conn, "improvement_suggestions", {"raw": improve_text[:5000]})
+        except Exception as ie:
+            log.warning("[domain/improve] phase failed (non-blocking): %s", ie)
+            if "pid" in dir():
+                _finish_phase(conn, pid, None, failed=True)
+
         # ---- Push ------------------------------------------------------------
-        diff_ok, diff_reason = gates.validate_pr_diff(wt, base="main")
+        diff_ok, diff_reason = gates.validate_pr_diff(wt, base=base_ref)
         storage.log_event(conn, "pr_diff_gate", {"passed": diff_ok, "reason": diff_reason})
         if not diff_ok:
             log.error("[domain/pr-diff-gate] FAIL: %s", diff_reason)
@@ -1576,11 +1663,14 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
             "spent_usd": spent,
             "run_id": run_id,
         }
-        source.post_comment(
-            repo, issue_number,
-            f"Branch pushed: {branch}, review: {review_signal}",
-            provider=provider,
-        )
+        if issue_number is not None:
+            source.post_comment(
+                repo, issue_number,
+                f"Branch pushed: {branch}, review: {review_signal}",
+                provider=provider,
+            )
+        else:
+            log.info("[domain] no issue_number — skipping completion comment")
         log.info("[domain] complete branch=%s review=%s spent=$%.2f", branch, review_signal, spent)
         return result
 

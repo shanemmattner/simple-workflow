@@ -1,8 +1,12 @@
 """CLI entry point for the github_claude engine.
 
 Usage:
-    python -m engine owner/repo#123
-    python -m engine owner/repo#123 --budget 2.00 --model opus
+    # Domain workflows (run.sh primary path): repo path + git ref, issue optional.
+    python -m engine --repo-path /path/to/repo --base abc123f --workflow shftty-web [--issue 896]
+    python -m engine --repo-path /path/to/repo --base main --workflow shftty-web --budget 5.00
+
+    # Legacy issue-to-pr pipeline (no --workflow): still requires owner/repo + --issue.
+    python -m engine owner/repo --issue 123 --repo-path /path/to/repo
 """
 from __future__ import annotations
 
@@ -15,9 +19,16 @@ from pathlib import Path
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="engine",
-        description="GitHub issue -> tested PR pipeline (Claude engine)",
+        description="Repo path + git ref -> tested branch (or issue -> PR) pipeline (Claude engine)",
     )
-    parser.add_argument("issue", help="Issue ref: owner/repo#NNN")
+    parser.add_argument("repo", nargs="?", default=None,
+                        help="owner/repo slug (derived from git remote by run.sh; "
+                             "used for issue comments/context when --issue is set)")
+    parser.add_argument("--issue", type=int, default=None,
+                        help="Issue number for context (optional). When omitted, "
+                             "the pipeline runs without issue context.")
+    parser.add_argument("--base", default="main",
+                        help="Git ref (branch/tag/commit) to start the worktree from (default: main)")
     parser.add_argument("--budget", type=float, default=1.00,
                         help="Max spend in USD (default: 1.00)")
     parser.add_argument("--model", default=None,
@@ -37,38 +48,33 @@ def main() -> None:
         stream=sys.stdout,
     )
 
-    # Parse repo#issue format
-    if "#" not in args.issue:
-        parser.error("Issue ref must be owner/repo#NNN")
-    repo_part, number_str = args.issue.rsplit("#", 1)
-    try:
-        issue_number = int(number_str)
-    except ValueError:
-        parser.error(f"Invalid issue number: {number_str}")
-
-    parts = repo_part.split("/")
-    if len(parts) != 2:
-        parser.error(f"Invalid repo format: {repo_part} (expected owner/repo)")
-    owner, repo = parts
+    repo = args.repo
+    issue_number = args.issue
 
     # Import here to avoid top-level side effects
     from engine.orchestrator import run_pipeline, run_domain_pipeline
 
-    print(f"github_claude: {owner}/{repo}#{issue_number}")
+    print(f"github_claude: repo={repo or '(none)'} issue={issue_number if issue_number is not None else '(none)'} base={args.base}")
     print(f"  budget: ${args.budget:.2f}  model: {args.model}")
 
     if args.workflow:
         print(f"  workflow: {args.workflow}  (domain pipeline)")
         result = run_domain_pipeline(
-            f"{owner}/{repo}", issue_number,
+            repo, issue_number,
             workflow=args.workflow,
+            base_ref=args.base,
             budget=args.budget,
             model_override=args.model,
             repo_path=args.repo_path,
         )
     else:
+        if not repo or issue_number is None:
+            parser.error(
+                "the legacy issue-to-pr pipeline (no --workflow) requires both "
+                "a repo positional arg (owner/repo) and --issue NNN"
+            )
         result = run_pipeline(
-            f"{owner}/{repo}", issue_number,
+            repo, issue_number,
             budget=args.budget,
             model_override=args.model,
             repo_path=args.repo_path,
