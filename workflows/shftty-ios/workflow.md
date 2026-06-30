@@ -94,7 +94,7 @@ Domain-specific issue-to-PR workflow for the shftty iOS app (Swift/SwiftUI healt
 ## Run
 
 ```
-python -m engine shanemmattner/shftty <issue> --workflow shftty-ios
+./scripts/run.sh workflows/shftty-ios shanemmattner/shftty-ios#<issue>
 ```
 
 ## Reusable

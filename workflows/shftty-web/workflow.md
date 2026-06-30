@@ -70,7 +70,7 @@ Issue-to-PR workflow for the shftty healthcare staffing web app (Next.js + Supab
 ## Run
 
 ```
-python -m engine shanemmattner/shftty <issue> --workflow shftty-web
+./scripts/run.sh workflows/shftty-web shanemmattner/shftty#<issue>
 ```
 
 ## Reusable

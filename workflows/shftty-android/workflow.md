@@ -53,14 +53,6 @@ phases:
     model: opus
     max_turns: 30
 
-gates:
-  triage:
-    - decision_keyword_present
-  execute:
-    - commits_on_branch
-    - build_passes
-  review:
-    - verdict_keyword_present
 ---
 
 # shftty-android
@@ -70,9 +62,9 @@ Domain-specific issue-to-PR workflow for the shftty Android app (Kotlin/Jetpack 
 ## Run
 
 ```
-python -m engine shanemmattner/shftty <issue> --workflow shftty-android
+./scripts/run.sh workflows/shftty-android shanemmattner/shftty-android#<issue>
 ```
 
 ## Reusable
 
-The `build_passes` execute gate (gradlew assembleDebug) is portable to any Android/Gradle project. The triage/review keyword-signal pattern works for any code workflow with text-based decision output.
+The `scripts/check-build.sh` gradlew assembleDebug check is portable to any Android/Gradle project.

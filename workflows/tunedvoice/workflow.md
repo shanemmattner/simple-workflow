@@ -54,14 +54,6 @@ phases:
     model: opus
     max_turns: 30
 
-gates:
-  triage:
-    - decision_keyword_present
-  execute:
-    - commits_on_branch
-  review:
-    - verdict_keyword_present
-
 context_files:
   - .workflows/context.md
   - .workflows/testing.md
@@ -74,7 +66,7 @@ Domain-specific issue-to-PR workflow for the TunedVoice macOS push-to-talk dicta
 ## Run
 
 ```
-python -m engine shanemmattner/tunedvoice-monorepo <issue> --workflow tunedvoice
+./scripts/run.sh workflows/tunedvoice shanemmattner/tunedvoice-monorepo#<issue>
 ```
 
 ## Reusable

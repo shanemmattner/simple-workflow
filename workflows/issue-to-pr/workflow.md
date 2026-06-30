@@ -101,8 +101,7 @@ Generic issue-to-PR pipeline that transforms any GitHub issue into a tested, rev
 ## Run
 
 ```
-python -m engine owner/repo <issue> --workflow issue-to-pr
-./scripts/run.sh owner/repo#<issue>
+./scripts/run.sh workflows/issue-to-pr owner/repo#<issue>
 ```
 
 ## Reusable
