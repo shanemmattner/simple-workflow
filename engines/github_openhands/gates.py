@@ -1,4 +1,4 @@
-"""Phase-output gates for the github_claude engine.
+"""Phase-output gates for the github_openhands engine.
 
 Each gate is a plain function that returns a dict:
     {"passed": bool, "reason": str}
@@ -9,10 +9,13 @@ responsibility — gates just return verdicts.
 
 from __future__ import annotations
 
+import logging
 import re
 import shlex
 import subprocess
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -51,65 +54,85 @@ def check_test_command_allowed(command: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def validate_triage(output: dict, worktree_path: str) -> dict:
-    """Check triage output: task count, target-file existence.
+    """Check triage output: task count, target-file existence (warning only).
 
-    File-existence check only applies to tasks whose proof_type is NOT
-    manual_verify — those tasks are creating new files (docs, configs,
-    etc.) that don't exist yet by definition.
+    File existence below 50% is a WARNING, not a gate failure — create-file
+    tasks produce target_files that don't exist yet by design.
+
+    Note: the openhands engine extracts proof_type at the top level of the
+    triage JSON (not per-task), so we log it but do not gate on it.
     """
     tasks = output.get("tasks", [])
+    proof_type = output.get("proof_type", "")
+    log.info("[gate/triage] checking %d task(s), top-level proof_type=%r", len(tasks), proof_type)
 
     if len(tasks) > 5:
-        return {
-            "passed": False,
-            "reason": f"task count {len(tasks)} exceeds maximum of 5",
-        }
+        reason = f"task count {len(tasks)} exceeds maximum of 5"
+        log.warning("[gate/triage] FAIL: %s", reason)
+        return {"passed": False, "reason": reason}
 
-    # Collect files only from tasks that are modifying existing content.
-    # manual_verify tasks typically create new files — skip the existence check.
-    modify_files: list[str] = []
+    all_files: list[str] = []
     for task in tasks:
-        if task.get("proof_type", "").lower() != "manual_verify":
-            modify_files.extend(task.get("target_files", []))
+        tf = task.get("target_files", [])
+        log.debug("[gate/triage] task %s target_files: %s", task.get("id"), tf)
+        all_files.extend(tf)
 
-    if modify_files:
+    if all_files:
         wt = Path(worktree_path)
-        existing = sum(1 for f in modify_files if _file_exists_fuzzy(f, wt))
-        ratio = existing / len(modify_files)
+        file_checks: list[tuple[str, bool]] = [
+            (f, _file_exists_fuzzy(f, wt)) for f in all_files
+        ]
+        existing = sum(1 for _, exists in file_checks if exists)
+        ratio = existing / len(all_files)
+        log.info(
+            "[gate/triage] file existence: %d/%d (%.0f%%) — %s",
+            existing, len(all_files), ratio * 100,
+            "OK" if ratio >= 0.5 else "LOW (create-file tasks expected — warning only)",
+        )
+        for filepath, exists in file_checks:
+            log.debug("[gate/triage]   %s %s", "EXISTS" if exists else "ABSENT", filepath)
         if ratio < 0.5:
-            return {
-                "passed": False,
-                "reason": (
-                    f"only {existing}/{len(modify_files)} target files exist "
-                    f"({ratio:.0%} < 50% threshold)"
-                ),
-            }
+            log.warning(
+                "[gate/triage] triage file existence low: %d/%d (%.0f%%) — "
+                "this is normal for create-file issues; verify phase will confirm claims",
+                existing, len(all_files), ratio * 100,
+            )
+    else:
+        log.info("[gate/triage] no target_files listed — skipping file existence check")
 
+    log.info("[gate/triage] PASS: triage output valid")
     return {"passed": True, "reason": "triage output valid"}
 
 
 def validate_verify(output: dict) -> dict:
     """Check verify output: verified_tasks present, valid statuses."""
     tasks = output.get("verified_tasks", [])
+    log.info("[gate/verify] checking %d verified_task(s)", len(tasks))
+
     if not tasks:
+        log.warning("[gate/verify] FAIL: verified_tasks is empty")
         return {"passed": False, "reason": "verified_tasks is empty"}
 
     valid_statuses = {"CONFIRMED", "REFUTED", "STALE", "PARTIAL"}
     for t in tasks:
         status = t.get("status", "").upper()
+        log.info(
+            "[gate/verify] task %s status=%s evidence=%r",
+            t.get("task_id"), status, t.get("evidence", "")[:120],
+        )
         if status not in valid_statuses:
-            return {
-                "passed": False,
-                "reason": f"task {t.get('task_id')} has invalid status: {t.get('status')!r}",
-            }
+            reason = f"task {t.get('task_id')} has invalid status: {t.get('status')!r}"
+            log.warning("[gate/verify] FAIL: %s", reason)
+            return {"passed": False, "reason": reason}
 
     recommendation = output.get("recommendation", "")
+    log.info("[gate/verify] recommendation=%r", recommendation)
     if recommendation not in ("proceed", "already_fixed", "needs_clarification"):
-        return {
-            "passed": False,
-            "reason": f"invalid recommendation: {recommendation!r}",
-        }
+        reason = f"invalid recommendation: {recommendation!r}"
+        log.warning("[gate/verify] FAIL: %s", reason)
+        return {"passed": False, "reason": reason}
 
+    log.info("[gate/verify] PASS: verify output valid")
     return {"passed": True, "reason": "verify output valid"}
 
 

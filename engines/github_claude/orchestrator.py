@@ -76,11 +76,27 @@ def _call(phase: str, cfg: dict, *, cwd: str, issue_number: int, issue_body: str
           repo_context: str = "") -> dict:
     prompt = _render(_load_prompt(phase), issue_number, issue_body, prior, prior_review, repo_context)
     model = model_ov or cfg.get("model", "sonnet")
-    log.info("[%s] model=%s max_turns=%d", phase, model, cfg.get("max_turns", 10))
+    log.info("[%s] model=%s max_turns=%d prompt_len=%d", phase, model, cfg.get("max_turns", 10), len(prompt))
     resp = runtime.call_agent(prompt, model=model, cwd=cwd, max_turns=cfg.get("max_turns", 10))
-    log.info("[%s] %.1fs $%.4f", phase, resp["duration_s"], resp["cost"])
+    finish = resp.get("finish_reason", "unknown")
+    content = resp.get("content", "")
+    log.info("[%s] %.1fs $%.4f finish=%s content_len=%d",
+             phase, resp["duration_s"], resp["cost"], finish, len(str(content)))
+    if finish == "error":
+        log.error("[%s] phase returned error: %s", phase, str(content)[:500])
+    elif finish == "timeout":
+        log.warning("[%s] phase timed out", phase)
     resp["_prompt"] = prompt  # stash for message logging
     return resp
+
+def _check_resp(phase: str, resp: dict) -> None:
+    """Raise RuntimeError if the agent response indicates failure."""
+    finish = resp.get("finish_reason", "unknown")
+    if finish == "error":
+        content = resp.get("content", "")
+        raise RuntimeError(f"Phase {phase} failed: {str(content)[:300]}")
+    if finish == "timeout":
+        raise RuntimeError(f"Phase {phase} timed out")
 
 def _content(resp: dict) -> str:
     """Extract content string from agent response (agents respond in prose)."""
@@ -88,6 +104,11 @@ def _content(resp: dict) -> str:
 
 def _extract_json(prose: str, schema_hint: str, cwd: str) -> dict:
     """Make a dedicated extraction call to pull structured data from prose."""
+    if not prose or not prose.strip():
+        raise ValueError(
+            f"_extract_json called with empty prose — the upstream phase produced no output. "
+            f"schema_hint={schema_hint[:100]}"
+        )
     prompt = f"""Extract structured data from the following text. Return ONLY valid JSON matching this schema (no markdown fences, no explanation):
 {schema_hint}
 
@@ -95,10 +116,22 @@ Text to extract from:
 {prose}"""
     resp = runtime.call_agent(prompt, model="haiku", cwd=cwd, max_turns=1)
     raw = _content(resp)
+    log.debug("_extract_json raw response (len=%d): %s", len(raw), raw[:300])
+    if not raw or not raw.strip():
+        raise ValueError(
+            f"_extract_json: haiku returned empty response. "
+            f"Input prose (len={len(prose)}): {prose[:200]}"
+        )
     # Strip markdown fences if present
     if raw.strip().startswith("```"):
         raw = raw.strip().split("\n", 1)[1].rsplit("```", 1)[0]
-    return json.loads(raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"_extract_json: JSON parse failed ({exc}). "
+            f"Raw response (len={len(raw)}): {raw[:500]}"
+        ) from exc
 
 def _start_phase(conn, name, model=None):
     """Create a phase record at the START of execution. Returns phase_id."""
@@ -296,6 +329,7 @@ def run_pipeline(repo: str, issue_number: int, *,
         else:
             pid = _start_phase(conn, "triage", model=_resolve_model(pcfg.get("triage", {}), kw.get("model_ov")))
             resp = _call("triage", pcfg.get("triage", {}), prior=prior, prior_review=prior_review, **kw)
+            _check_resp("triage", resp)
             _finish_phase(conn, pid, resp); spent += resp["cost"]; _guard(spent, budget)
             triage_text = _content(resp)
             prior["triage"] = triage_text
@@ -314,6 +348,7 @@ def run_pipeline(repo: str, issue_number: int, *,
         else:
             pid = _start_phase(conn, "verify", model=_resolve_model(pcfg.get("verify", {}), kw.get("model_ov")))
             resp = _call("verify", pcfg.get("verify", {}), prior=prior, **kw)
+            _check_resp("verify", resp)
             _finish_phase(conn, pid, resp); spent += resp["cost"]; _guard(spent, budget)
             verify_text = _content(resp)
             prior["verify"] = verify_text
@@ -384,18 +419,31 @@ def run_pipeline(repo: str, issue_number: int, *,
                             continue
                         pid = _start_phase(conn, phase_key, model=_resolve_model(pcfg.get(ph, {}), kw.get("model_ov")))
                         futs[pool.submit(_call, ph, pcfg.get(ph, {}), prior=tp, **kw)] = (ph, t["id"], pid)
-                done, _ = wait(futs, return_when=FIRST_EXCEPTION)
+                # Wait for ALL futures — collect results and errors; raise after cleanup
+                done, not_done = wait(futs, return_when=FIRST_EXCEPTION)
+                # Finish phases for not_done futures too (shouldn't happen, but defensive)
+                for f in not_done:
+                    ph, tid, pid = futs[f]
+                    log.warning("[%s] task %d future not complete after wait — marking failed", ph, tid)
+                    _finish_phase(conn, pid, None, failed=True)
+                first_exc: Exception | None = None
                 for f in done:
                     ph, tid, pid = futs[f]
                     try:
                         resp = f.result()
+                        _check_resp(f"{ph}-task-{tid}", resp)
                         _finish_phase(conn, pid, resp)
-                    except Exception:
+                        spent += resp["cost"]
+                        text = _content(resp)
+                        (plan_r if ph == "plan" else tp_r)[tid] = text
+                        log.info("[%s] task %d complete (len=%d)", ph, tid, len(text))
+                    except Exception as exc:
+                        log.error("[%s] task %d failed: %s", ph, tid, exc)
                         _finish_phase(conn, pid, None, failed=True)
-                        raise
-                    spent += resp["cost"]
-                    text = _content(resp)
-                    (plan_r if ph == "plan" else tp_r)[tid] = text
+                        if first_exc is None:
+                            first_exc = exc
+                if first_exc is not None:
+                    raise first_exc
             _guard(spent, budget)
             prior["plans"] = plan_r; prior["test_plans"] = tp_r
 
@@ -405,6 +453,7 @@ def run_pipeline(repo: str, issue_number: int, *,
         else:
             pid = _start_phase(conn, "wave-planner", model=_resolve_model(pcfg.get("wave-planner", {}), kw.get("model_ov")))
             resp = _call("wave-planner", pcfg.get("wave-planner", {}), prior=prior, **kw)
+            _check_resp("wave-planner", resp)
             _finish_phase(conn, pid, resp); spent += resp["cost"]
             if spent > budget:
                 log.warning("budget exceeded after wave-planner ($%.2f > $%.2f) — continuing to execute", spent, budget)

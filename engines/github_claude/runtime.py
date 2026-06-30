@@ -279,6 +279,17 @@ def _call_minimax(
     effective_timeout = timeout if timeout is not None else 600
     start = time.monotonic()
 
+    # Pre-flight: verify minimax script and cwd exist before launching subprocess.
+    # Gives a clear error instead of a generic FileNotFoundError.
+    if not _MINIMAX_SCRIPT.exists():
+        msg = f"minimax.py not found at {_MINIMAX_SCRIPT} (set MINIMAX_SCRIPT_PATH to override)"
+        log.error("_call_minimax: %s", msg)
+        return _error_response(msg, 0)
+    if cwd and not Path(cwd).exists():
+        msg = f"minimax cwd does not exist: {cwd}"
+        log.error("_call_minimax: %s", msg)
+        return _error_response(msg, 0)
+
     # Write system prompt to a temp file for --system-file. Empty file is fine.
     try:
         with tempfile.NamedTemporaryFile(
@@ -298,6 +309,8 @@ def _call_minimax(
         prompt,
     ]
 
+    log.debug("_call_minimax: model=%s cwd=%s prompt_len=%d", model, cwd, len(prompt))
+
     try:
         for attempt in range(_MAX_RETRIES):
             try:
@@ -312,6 +325,10 @@ def _call_minimax(
 
                 if proc.returncode != 0:
                     stderr = proc.stderr.strip()
+                    log.warning(
+                        "_call_minimax returncode=%d stderr=%s",
+                        proc.returncode, stderr[:300],
+                    )
                     if (
                         attempt < _MAX_RETRIES - 1
                         and _RETRYABLE_PATTERNS.search(stderr)
@@ -324,9 +341,15 @@ def _call_minimax(
                         )
                         time.sleep(delay)
                         continue
-                    return _error_response(stderr, elapsed)
+                    return _error_response(stderr or f"minimax.py exited {proc.returncode}", elapsed)
 
-                return _parse_minimax_response(proc.stdout, _elapsed=elapsed)
+                result = _parse_minimax_response(proc.stdout, _elapsed=elapsed)
+                if result.get("finish_reason") == "error":
+                    log.warning(
+                        "_call_minimax parse error: content=%s",
+                        str(result.get("content", ""))[:300],
+                    )
+                return result
 
             except subprocess.TimeoutExpired:
                 elapsed = time.monotonic() - start
@@ -338,13 +361,15 @@ def _call_minimax(
                     "duration_s": elapsed,
                     "finish_reason": "timeout",
                 }
-            except FileNotFoundError:
+            except FileNotFoundError as exc:
                 elapsed = time.monotonic() - start
-                return _error_response(
-                    f"minimax.py not found at {_MINIMAX_SCRIPT}", elapsed
-                )
+                # subprocess raises FileNotFoundError for both missing executable
+                # AND missing cwd — log the actual OS message for clarity.
+                log.error("_call_minimax FileNotFoundError: %s", exc)
+                return _error_response(f"subprocess launch failed: {exc}", elapsed)
             except Exception as exc:
                 elapsed = time.monotonic() - start
+                log.error("_call_minimax unexpected error: %s", exc)
                 return _error_response(str(exc), elapsed)
 
         elapsed = time.monotonic() - start
