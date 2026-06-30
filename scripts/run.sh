@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Usage: ./scripts/run.sh owner/repo#123 [--engine openhands] [--budget 2.00] [--model opus]
+# Usage: ./scripts/run.sh owner/repo#123 [--budget 2.00] [--model opus]
 #
 # --engine claude     (default) uses engines/github_claude (Claude CLI subprocess)
-# --engine openhands  uses engines/github_openhands (OpenHands SDK + OpenRouter)
 
 cd "$(dirname "$0")/.."
 
@@ -27,17 +26,11 @@ case "$ENGINE" in
     claude)
         MODULE="engines.github_claude.__main__"
         ;;
-    openhands)
-        MODULE="engines.github_openhands.__main__"
-        ;;
     three-step)
         MODULE="engines.three_step.__main__"
         ;;
-    minimax)
-        MODULE="engines.github_minimax.__main__"
-        ;;
     *)
-        echo "Unknown engine: $ENGINE (valid: claude, openhands, three-step, minimax)" >&2
+        echo "Unknown engine: $ENGINE (valid: claude, three-step)" >&2
         exit 1
         ;;
 esac

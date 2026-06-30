@@ -12,11 +12,7 @@ def _resolve_api_key() -> str | None:
     key = os.environ.get("MINIMAX_API_KEY")
     if key:
         return key
-    # Canonical implementation lives in engines/github_minimax/runtime.py.
-    # Import lazily to avoid a top-level circular import (runtime imports
-    # MODELS and resolve_model from this module).
-    from engines.github_minimax.runtime import _lookup_rc_env
-    return _lookup_rc_env(["MINIMAX_API_KEY"])
+    return None
 
 AVAILABLE_MODELS: set[str] = {
     "MiniMax-M3",

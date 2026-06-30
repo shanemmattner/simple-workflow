@@ -34,9 +34,6 @@ cd simple-workflow
 ./scripts/run.sh owner/repo#123 --model opus
 ./scripts/run.sh owner/repo#123 --budget 3.00
 
-# OpenHands engine (experimental — DeepSeek via OpenRouter)
-./scripts/run.sh owner/repo#123 --engine openhands
-
 # Reference engine (8-phase with gates)
 ./scripts/run.sh owner/repo#123 --engine claude
 ```
@@ -51,14 +48,12 @@ The script auto-detects the repo path. If your checkout lives at `../repo` relat
 |--------|------|--------|-------------|
 | `three-step` | `--engine three-step` | investigate → implement → review + PR (+ retry, deep review, audit, learning) | Production engine. Uses Claude CLI subscription. Default when no engine is specified via `./scripts/run.sh`. |
 | `github_claude` | `--engine claude` | triage → verify → plan → test-plan → wave-planner → execute → review → improve | Reference design. 8-phase pipeline with per-phase gates and parallel execution waves. SQLite logging. |
-| `github_openhands` | `--engine openhands` | Delegates to OpenHands SDK | Experimental. Uses DeepSeek V4 Flash via OpenRouter. Requires `OPENROUTER_API_KEY`. |
 
 Run any engine directly with Python if you need to pass extra flags:
 
 ```bash
 python -m engines.three_step owner/repo#123 --budget 3.00 --model opus
 python -m engines.github_claude owner/repo#123
-python -m engines.github_openhands owner/repo#123
 ```
 
 ---
@@ -133,7 +128,7 @@ Run `.db` files are stored in `engines/github_claude/runs/` (gitignored). Each f
 |-----------|-------------|
 | `engines/github_claude/` | Reference 8-phase engine: orchestrator, runtime, storage, gates, workspace, destination |
 | `engines/three_step/` | Production 3-phase engine using Claude CLI subscription runtime |
-| `engines/github_openhands/` | Experimental OpenHands SDK engine |
+| `engines/shared/` | Shared modules (source, storage, workspace, destination) used by three_step and github_minimax |
 | `adapters/` | Provider adapters: claude_cli, openrouter, zai, minimax |
 | `workflows/issue-to-pr/` | Phase definitions (`workflow.yaml`) and frozen prompt templates (`prompts/`) |
 | `workspace/` | Temporary git worktrees (cleaned up after each run) |

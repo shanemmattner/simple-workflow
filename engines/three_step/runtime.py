@@ -4,10 +4,9 @@ Supports any OpenAI-compatible endpoint: Z.ai (GLM), DeepSeek, MiniMax, local
 Qwen, or OpenRouter. The caller (orchestrator._call_openai_compat) resolves the
 api_key and base_url via adapters.get_config(model) and passes them directly.
 
-Copied and genericized from engines/github_minimax/runtime.py — same agent loop,
-same tool set (Read/Edit/Write/Bash/Glob/Grep), same return shape. The MiniMax-
-specific key/URL resolution and pricing tables have been replaced with caller-
-supplied values from the adapter and model_config.
+Generic OpenAI-compatible agent loop — same tool set (Read/Edit/Write/Bash/Glob/Grep),
+same return shape. Key/URL resolution and pricing tables come from the caller
+via adapters.get_config(model).
 
 Requirements:
     pip install openai

@@ -12,7 +12,11 @@ def get_adapter(model: str) -> ModuleType:
     if m.startswith("glm"):
         return importlib.import_module("adapters.zai")
     if m.startswith("claude") or m in ("sonnet", "opus", "haiku"):
-        return importlib.import_module("adapters.claude_cli")
+        raise ValueError(
+            f"Claude models are not supported via the adapter router. "
+            f"Use engines/github_claude (CLI subprocess) or engines/three_step instead. "
+            f"Got: {model!r}"
+        )
     if m.startswith("minimax") or m in ("m3", "m27hs", "minimax-m2.7-highspeed"):
         return importlib.import_module("adapters.minimax")
     # Everything else → OpenRouter (with approved-model gate inside)

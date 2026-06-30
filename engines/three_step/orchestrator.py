@@ -2,7 +2,7 @@
 
 Uses the Claude CLI subscription runtime (engines.three_step.claude_runtime)
 which invokes `claude` with --output-format json. Reuses shared modules from
-github_openhands for source, storage, workspace, and destination.
+shared for source, storage, workspace, and destination.
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from engines.three_step import claude_runtime
-from engines.github_openhands import source, storage, workspace, destination
+from engines.shared import source, storage, workspace, destination
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")

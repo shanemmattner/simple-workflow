@@ -27,9 +27,9 @@ _SHORT_NAMES: dict[str, str] = {
 def _lookup_rc_env(var_names: list[str]) -> str | None:
     """Return the first matching var value from ~/.zshrc, or None.
 
-    Mirrors engines/github_minimax/runtime.py — some users store API keys in
-    ~/.zshrc rather than exporting them. We parse that file as a fallback when
-    the env var is unset. Shell command-substitution markers are rejected.
+    Some users store API keys in ~/.zshrc rather than exporting them.
+    We parse that file as a fallback when the env var is unset.
+    Shell command-substitution markers are rejected.
     """
     rcfile = Path.home() / ".zshrc"
     if not rcfile.is_file():
