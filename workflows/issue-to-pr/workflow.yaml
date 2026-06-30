@@ -60,9 +60,10 @@ phases:
     model: sonnet
     max_turns: 10
     optional: true  # skipped when no UI changes or no preview URL
+  # Improve: Opus only — this phase reviews all prior work and feeds learnings back. Worth the cost.
   - name: improve
-    model: m27hs
-    max_turns: 5
+    model: opus
+    max_turns: 10
 
 review:
   enabled: true

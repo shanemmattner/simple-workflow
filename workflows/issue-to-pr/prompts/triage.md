@@ -71,6 +71,12 @@ Issue: "Add invite flow for workers: server action + modal UI"
 3. More than 5 tasks → `escalate: true` with reason
 4. Issue is a docs-only change → single task, `proof_type: manual_verify`
 
+## Prior run learnings
+
+The following learnings were captured from recent pipeline retrospectives. Use them to inform your triage decision — especially flagging issues that match known context gaps or code quality patterns.
+
+{recent_learnings}
+
 ## Repo context
 
 {repo_context}
