@@ -23,19 +23,15 @@ models:
     name: claude-opus-4-6
     max_tokens: 16384
     cost: {input_per_mtok: 15.00, output_per_mtok: 75.00}
-  m27hs:
-    name: MiniMax-M2.7-highspeed
-    max_tokens: 16384
-    cost: {input_per_mtok: 0.20, output_per_mtok: 0.80}
-  m3:
-    name: MiniMax-M3
-    max_tokens: 16384
-    cost: {input_per_mtok: 0.30, output_per_mtok: 1.20}
 
 phases:
   - name: triage
     model: sonnet
     max_turns: 30
+
+  - name: plan
+    model: sonnet
+    max_turns: 20
 
   - name: execute
     model: sonnet
@@ -45,14 +41,9 @@ phases:
     model: sonnet
     max_turns: 20
 
-  - name: validate
+  - name: improve
     model: sonnet
     max_turns: 10
-    optional: true
-
-  - name: improve
-    model: opus
-    max_turns: 30
 
 context_files:
   - .workflows/context.md
@@ -61,7 +52,7 @@ context_files:
 
 # tunedvoice
 
-Domain-specific issue-to-PR workflow for the TunedVoice macOS push-to-talk dictation app (Swift/SwiftUI, FluidAudio, ANE).
+Domain-specific issue-to-PR workflow for the TunedVoice macOS push-to-talk dictation app (Swift/SwiftUI, FluidAudio, ANE). Five-phase design: triage (read-only localization + risk assessment) → plan (implementation steps) → execute → review → improve.
 
 ## Run
 

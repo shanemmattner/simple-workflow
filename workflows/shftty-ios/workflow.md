@@ -22,36 +22,30 @@ models:
     name: claude-opus-4-6
     max_tokens: 16384
     cost: {input_per_mtok: 15.00, output_per_mtok: 75.00}
-  m27hs:
-    name: MiniMax-M2.7-highspeed
-    max_tokens: 16384
-    cost: {input_per_mtok: 0.20, output_per_mtok: 0.80}
-  m3:
-    name: MiniMax-M3
-    max_tokens: 16384
-    cost: {input_per_mtok: 0.30, output_per_mtok: 1.20}
 
 phases:
   - name: triage
     model: sonnet
     max_turns: 30
 
+  - name: plan
+    model: sonnet
+    max_turns: 20
+
   - name: execute
     model: sonnet
     max_turns: 50
+    requires: [triage, plan]
 
   - name: review
     model: sonnet
     max_turns: 20
-
-  - name: validate
-    model: sonnet
-    max_turns: 10
-    optional: true
+    requires: [triage, plan, execute]
 
   - name: improve
-    model: opus
-    max_turns: 30
+    model: sonnet
+    max_turns: 10
+    requires: [triage, plan, execute, review]
 
 decision_parsing:
   triage:
@@ -89,7 +83,7 @@ template_vars:
 
 # shftty-ios
 
-Domain-specific issue-to-PR workflow for the shftty iOS app (Swift/SwiftUI healthcare staffing).
+Domain-specific issue-to-PR workflow for the shftty iOS app (Swift/SwiftUI healthcare staffing). 5-phase design: triage (read-only localization) → plan (implementation steps) → execute → review → improve. Triage no longer produces a plan — it localizes the issue to files/functions, assesses root cause/risk/impact, and decides PROCEED/SKIP/ESCALATE. The plan phase reads triage's localization and risk assessment and turns it into numbered, dependency-ordered implementation steps for execute to follow.
 
 ## Run
 
@@ -99,4 +93,4 @@ Domain-specific issue-to-PR workflow for the shftty iOS app (Swift/SwiftUI healt
 
 ## Reusable
 
-The triage/execute/review/improve phase pattern and decision_parsing config are portable to any Swift/SwiftUI project. The `commits_on_branch` execute gate works for any git-based code workflow.
+The triage/plan/execute/review/improve phase pattern and decision_parsing config are portable to any Swift/SwiftUI project. The `commits_on_branch` execute gate works for any git-based code workflow.

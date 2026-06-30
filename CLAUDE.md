@@ -37,7 +37,7 @@ python3 -m pytest tests/
 
 ## Key Files
 
-- `engine/orchestrator.py` -- CLI entry point, phase sequencing, context assembly. `run_pipeline()` is the full issue-to-PR flow (wave planning, gates, PR creation). `run_domain_pipeline()` is the simplified domain-workflow flow (triage → execute → review → push) used for shftty-web, shftty-ios, etc. — it pushes the reviewed branch and stops; it does NOT create a PR. A separate `pr.sh` step (using `destination.create_pr`) opens the PR from the pushed branch when desired.
+- `engine/orchestrator.py` -- CLI entry point, phase sequencing, context assembly. `run_pipeline()` is the full issue-to-PR flow (wave planning, gates, PR creation). `run_domain_pipeline()` is the 5-phase domain-workflow flow (triage → plan → execute → review → improve → push) used for shftty-web, shftty-ios, etc. — it pushes the reviewed branch and stops; it does NOT create a PR. A separate `pr.sh` step (using `destination.create_pr`) opens the PR from the pushed branch when desired. The plan phase is optional — if `prompts/plan.md` doesn't exist, steps are parsed from triage output (legacy fallback).
 - `engine/source.py` -- fetches GitHub issues via `gh` CLI, posts status comments
 - `engine/runtime.py` -- calls Claude CLI as subprocess, parses response JSON, tracks tokens/cost
 - `engine/storage.py` -- per-run SQLite .db file (tables: run, phase, message, tool_call, event)

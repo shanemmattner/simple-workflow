@@ -1282,7 +1282,7 @@ def run_domain_pipeline(repo: str | None, issue_number: int | None, *,
                         budget: float = 10.00,
                         model_override: str | None = None,
                         repo_path: str | None = None) -> dict:
-    """Simplified 3-phase pipeline for domain-specific workflows (shftty-web, shftty-ios, etc).
+    """Simplified 5-phase pipeline for domain-specific workflows (shftty-web, shftty-ios, etc).
 
     Primary input is a local repo path + git ref (``base_ref``), not a GitHub
     issue. ``repo`` (owner/repo slug) and ``issue_number`` are both optional —
@@ -1292,7 +1292,7 @@ def run_domain_pipeline(repo: str | None, issue_number: int | None, *,
 
     Unlike run_pipeline(), this function:
     - Loads prompts from a domain workflow dir (e.g. workflows/shftty-web/prompts/)
-    - Runs only 3 core phases: triage → execute → review
+    - Runs 5 core phases: triage → plan → execute → review → improve
     - Passes phase outputs as formatted markdown text via {prior_phases} (no JSON extraction)
     - Exits early on SKIP/ESCALATE triage signal
     - Pushes the reviewed branch and stops — it does NOT create a PR. The branch
@@ -1300,8 +1300,8 @@ def run_domain_pipeline(repo: str | None, issue_number: int | None, *,
       (see destination.py) opens the PR from that branch when desired.
     - No wave planning, no parallel task execution, no JSON gates, no validate
       phase (post-PR preview-URL polling — duplicates review's own gates).
-    - Runs triage -> execute -> review -> improve (informational retrospective,
-      non-blocking) -> push.
+    - Runs triage -> plan -> execute -> review -> improve (informational
+      retrospective, non-blocking) -> push.
     - Worktree branches from ``base_ref`` (default "main"); the final diff
       gate also diffs against ``base_ref``, not a hardcoded "main".
     """
@@ -1470,15 +1470,48 @@ def run_domain_pipeline(repo: str | None, issue_number: int | None, *,
 
         _guard(spent, budget)
 
+        # ---- Plan phase (optional — runs if prompts/plan.md exists) --------------
+        plan_prompt_path = wf_dir / "prompts" / "plan.md"
+        if plan_prompt_path.is_file():
+            plan_cfg = pcfg.get("plan", {"model": "sonnet", "max_turns": 20})
+            plan_model = _resolve_model(plan_cfg, model_override)
+            pid = _start_phase(conn, "plan", model=plan_model)
+            log.info("[domain/plan] start model=%s", plan_model)
+
+            plan_prompt = render_domain(
+                load_prompt("plan"), prior,
+                repo_context=repo_context, recent_learnings=recent_learnings_text,
+            )
+            plan_resp = runtime.call_agent(
+                plan_prompt, model=plan_model, cwd=wt,
+                max_turns=plan_cfg.get("max_turns", 20),
+            )
+            plan_resp["_prompt"] = plan_prompt
+            _check_resp("plan", plan_resp)
+            _finish_phase(conn, pid, plan_resp)
+            spent += plan_resp["cost"]
+            plan_text = _content(plan_resp)
+            prior["plan"] = plan_text
+            storage.log_event(conn, "plan_complete", {
+                "cost": plan_resp["cost"], "content_len": len(plan_text),
+            })
+            log.info("[domain/plan] complete spent=%.4f content_len=%d", spent, len(plan_text))
+
+            _guard(spent, budget)
+
+            # Parse steps from plan output (plan now owns the Steps section)
+            steps = _parse_triage_steps(plan_text)
+        else:
+            log.info("[domain/plan] no plan.md found in %s — skipping plan phase", wf_dir)
+            # Legacy fallback: parse steps from triage output directly
+            steps = _parse_triage_steps(triage_text)
+
         # ---- Execute phase -------------------------------------------------------
         execute_cfg = pcfg.get("execute", {"model": "sonnet", "max_turns": 30})
         execute_model = _resolve_model(execute_cfg, model_override)
 
-        # Parse steps from triage output
-        steps = _parse_triage_steps(triage_text)
-
         if steps:
-            log.info("[domain/execute] step mode: %d steps parsed from triage", len(steps))
+            log.info("[domain/execute] step mode: %d steps parsed from plan", len(steps))
             spent, step_results = _execute_steps(
                 steps,
                 conn=conn,
@@ -1504,7 +1537,7 @@ def run_domain_pipeline(repo: str | None, issue_number: int | None, *,
             })
         else:
             # Fallback: monolithic execute (no steps parsed from triage)
-            log.warning("[domain/execute] no steps found in triage — falling back to monolithic execute")
+            log.warning("[domain/execute] no steps found in plan/triage — falling back to monolithic execute")
             pid = _start_phase(conn, "execute", model=execute_model)
             log.info("[domain/execute] start model=%s prior_phases=%s", execute_model, list(prior.keys()))
 
@@ -1620,7 +1653,7 @@ def run_domain_pipeline(repo: str | None, issue_number: int | None, *,
             try:
                 improve_data = json.loads(improve_text) if improve_text.strip().startswith("{") \
                     else _extract_json(improve_text, (
-                        '{"overall_score": 0, "phase_scores": {"triage": 0, "execute": 0, "review": 0}, '
+                        '{"overall_score": 0, "phase_scores": {"triage": 0, "plan": 0, "execute": 0, "review": 0}, '
                         '"recommendations": [], "context_gaps": [], "code_quality_issues": [], '
                         '"cost_analysis": "", "pipeline_health": "", "summary": ""}'
                     ), cwd=wt)

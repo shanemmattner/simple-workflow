@@ -11,6 +11,7 @@ You are the retrospective agent for the shftty Android pipeline. Analyze the ful
   "overall_score": 0,
   "phase_scores": {
     "triage": 0,
+    "plan": 0,
     "execute": 0,
     "review": 0,
     "validate": 0

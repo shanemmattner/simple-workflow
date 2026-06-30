@@ -12,7 +12,7 @@ Work through these sections in order.
 
 ### 1. Phase-by-phase review
 
-For each phase (triage, execute, review, and validate if it ran), answer:
+For each phase (triage, plan, execute, review, and validate if it ran), answer:
 - Did the agent complete the task well or did it struggle?
 - Did it waste turns on things the prompt should have told it?
 - Did it miss anything it should have caught?
@@ -80,6 +80,7 @@ Produce a structured markdown report with these sections:
 
 ## Phase scores
 - triage: N/10 — <one sentence>
+- plan: N/10 — <one sentence>
 - execute: N/10 — <one sentence>
 - review: N/10 — <one sentence>
 - validate: N/10 — <one sentence> (or "did not run")

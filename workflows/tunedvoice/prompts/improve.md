@@ -8,7 +8,7 @@ You have **15 turns**. Read all phases carefully. Think about what went well, wh
 
 ### Step 1: Read the full run
 
-Review all prior phases: triage output, execute summary, validate results, review verdict. Note:
+Review all prior phases: triage output, plan output, execute summary, validate results, review verdict. Note:
 - Did triage correctly assess scope? Did it miss anything?
 - Did execute follow the triage plan? Where did it deviate and why?
 - Did tests pass on first attempt or did execute struggle?

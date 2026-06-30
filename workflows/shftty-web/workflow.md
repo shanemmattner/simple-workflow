@@ -23,17 +23,23 @@ phases:
     on_skip: post_issue_comment
     on_escalate: post_issue_comment
 
+  - name: plan
+    model: sonnet
+    max_turns: 20
+    prompt: prompts/plan.md
+    requires: [triage]
+
   - name: execute
     model: sonnet
     max_turns: 50
     prompt: prompts/execute.md
-    requires: [triage]
+    requires: [triage, plan]
 
   - name: review
     model: sonnet
     max_turns: 20
     prompt: prompts/review.md
-    requires: [triage, execute]
+    requires: [triage, plan, execute]
     verdict_signal:
       section: "## Verdict"
       keywords:
@@ -41,19 +47,12 @@ phases:
         warn: "WARN"
         fail: "FAIL"
 
-  - name: validate
+  - name: improve
     model: sonnet
     max_turns: 10
-    prompt: prompts/validate.md
-    optional: true
-    requires: [execute, review]
-
-  - name: improve
-    model: opus
-    max_turns: 30
     prompt: prompts/improve.md
     optional: true
-    requires: [triage, execute, review]
+    requires: [triage, plan, execute, review]
 
 template_variables:
   - repo_context
