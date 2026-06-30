@@ -45,8 +45,8 @@ done
 if ! $HAS_REPO_PATH; then
     ISSUE_REF="${ARGS[0]:-}"
     if [[ "$ISSUE_REF" == *"#"* ]]; then
-        REPO_NAME="${ISSUE_REF%#*}"      # owner/repo
-        REPO_NAME="${REPO_NAME##*/}"     # repo (strip owner/)
+        FULL_REPO="${ISSUE_REF%#*}"      # owner/repo
+        REPO_NAME="${FULL_REPO##*/}"     # repo (strip owner/)
         PA_ROOT="$(cd "$PWD/.." && pwd)" # parent of simple-workflow = PA root
         CANDIDATE="$PA_ROOT/$REPO_NAME"
         if [[ -e "$CANDIDATE/.git" ]]; then
@@ -56,6 +56,28 @@ if ! $HAS_REPO_PATH; then
             echo "[run.sh] WARNING: could not auto-detect repo path for '$REPO_NAME' — looked at $CANDIDATE" >&2
         fi
     fi
+fi
+
+# Auto-detect --workflow from the issue ref's owner/repo (matches `repo:` field
+# in workflows/*/workflow.md). Skips issue-to-pr (generic fallback) and any
+# run that already specifies --workflow explicitly.
+HAS_WORKFLOW=false
+for arg in "${ARGS[@]}"; do
+    [[ "$arg" == "--workflow" ]] && HAS_WORKFLOW=true
+done
+
+if ! $HAS_WORKFLOW && [[ -n "${FULL_REPO:-}" ]]; then
+    for wf_dir in workflows/*/; do
+        wf_file="$wf_dir/workflow.md"
+        [[ -f "$wf_file" ]] || continue
+        wf_name="$(basename "$wf_dir")"
+        [[ "$wf_name" == "issue-to-pr" ]] && continue
+        if grep -q "repo: $FULL_REPO" "$wf_file" 2>/dev/null; then
+            echo "[run.sh] auto-detected workflow: $wf_name" >&2
+            ARGS+=("--workflow" "$wf_name")
+            break
+        fi
+    done
 fi
 
 # Layer 2: hard wall-clock cap via gtimeout (brew install coreutils).
