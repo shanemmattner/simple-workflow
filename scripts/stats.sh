@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# stats.sh
+# Description: Query the pipeline runs SQLite database for cost, performance, and review statistics.
+# Usage: bash scripts/stats.sh <query> [args]
+#   Queries: expensive-phase, turn-limit, cost-by-phase, parse-failures,
+#            review-findings, total-runs, avg-cost, run-details <run_id>
+# Outputs: Formatted table output to stdout via sqlite3 -header -column
+# Dependencies: sqlite3 (must be installed and in PATH); runs/runs.db must exist
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
