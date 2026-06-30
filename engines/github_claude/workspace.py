@@ -9,72 +9,28 @@ log = logging.getLogger(__name__)
 
 
 def neutralize_claude_md(worktree_path: str) -> None:
-    """Hide CLAUDE.md and .claude/ from auto-discovery without git-tracked renames.
+    """Hide CLAUDE.md and .claude/ from claude CLI auto-discovery.
 
-    Strategy:
-    1. Rename the files/dirs so the claude CLI doesn't auto-discover them.
-    2. Add the renamed names to the worktree-local git exclude so they don't
-       appear as untracked files.
-    3. Tell git to skip-worktree on the originals so they don't appear as
-       deletions in git status / diff, and therefore won't be committed.
+    Strategy: delete the files from the worktree filesystem, then mark them
+    skip-worktree so git doesn't see the deletion. The files remain in the
+    index (git thinks they're unchanged) but don't exist on disk, so the
+    claude CLI can't find them and `git add .` can't stage them.
     """
     wt = Path(worktree_path)
 
-    # Step 1: rename files so claude CLI doesn't find them
-    renamed = []
+    neutralized = []
     for name in ["CLAUDE.md", ".claude"]:
         src = wt / name
-        dst = wt / f"{name}.pipeline-hidden"
-        if src.exists():
-            src.rename(dst)
-            renamed.append(name)
-            log.info("neutralized %s", src)
+        if not src.exists():
+            continue
 
-    if not renamed:
-        return
-
-    # Step 2: resolve the worktree's git exclude file
-    # In a worktree, .git is a *file* (not a dir) containing "gitdir: <path>"
-    git_entry = wt / ".git"
-    if git_entry.is_file():
-        gitdir_line = git_entry.read_text().strip()
-        if gitdir_line.startswith("gitdir:"):
-            gitdir = Path(gitdir_line.split(":", 1)[1].strip())
-        else:
-            gitdir = Path(gitdir_line)
-    else:
-        gitdir = git_entry  # main repo .git dir
-
-    exclude_file = gitdir / "info" / "exclude"
-    exclude_file.parent.mkdir(parents=True, exist_ok=True)
-    existing = exclude_file.read_text() if exclude_file.exists() else ""
-    additions = [
-        f"{name}.pipeline-hidden"
-        for name in renamed
-        if f"{name}.pipeline-hidden" not in existing
-    ]
-    if additions:
-        with open(exclude_file, "a") as f:
-            f.write("\n".join([""] + additions + [""]))
-        log.info("added %d entries to worktree exclude: %s", len(additions), additions)
-
-    # Step 3: mark original paths as skip-worktree so git doesn't see them as
-    # deleted (they won't show in diff, won't be staged, won't appear in the PR)
-    for name in renamed:
+        # First, mark skip-worktree BEFORE deleting so git never sees the removal
         if name == ".claude":
-            # Expand directory to individual files for update-index
             result = subprocess.run(
-                ["git", "ls-files", "--error-unmatch", ".claude"],
+                ["git", "ls-files", ".claude"],
                 cwd=str(wt), capture_output=True, text=True, timeout=10,
             )
             files = result.stdout.strip().splitlines() if result.returncode == 0 else []
-            # Fall back to ls-files without error-unmatch
-            if not files:
-                result = subprocess.run(
-                    ["git", "ls-files", ".claude"],
-                    cwd=str(wt), capture_output=True, text=True, timeout=10,
-                )
-                files = result.stdout.strip().splitlines()
             if files:
                 subprocess.run(
                     ["git", "update-index", "--skip-worktree"] + files,
@@ -87,6 +43,17 @@ def neutralize_claude_md(worktree_path: str) -> None:
                 cwd=str(wt), capture_output=True, timeout=10,
             )
             log.info("skip-worktree on %s", name)
+
+        # Now delete from disk — git won't notice because of skip-worktree
+        if src.is_dir():
+            shutil.rmtree(str(src))
+        else:
+            src.unlink()
+        neutralized.append(name)
+        log.info("neutralized %s (deleted from worktree, skip-worktree set)", src)
+
+    if not neutralized:
+        log.info("no CLAUDE.md or .claude/ found in %s", wt)
 
 
 def create_workspace(repo_path: str, branch: str, base: str = "main") -> str:

@@ -31,6 +31,9 @@ class BranchNotFound(RuntimeError):
 def push_branch(workspace_path: str, branch: str) -> None:
     """Push *branch* to origin from the given workspace (worktree) path.
 
+    If the remote branch already exists and a normal push fails with
+    non-fast-forward, retries with --force-with-lease.
+
     Raises PushFailed on auth/network errors, BranchNotFound if the
     branch doesn't exist locally.
     """
@@ -48,7 +51,18 @@ def push_branch(workspace_path: str, branch: str) -> None:
     )
     if result.returncode != 0:
         stderr = result.stderr.strip()
-        raise PushFailed(f"git push failed: {stderr}")
+        # Check if this is a non-fast-forward rejection (branch exists remotely)
+        if "non-fast-forward" in stderr.lower() or "rejected" in stderr.lower():
+            log.warning("Non-fast-forward on %s, retrying with --force-with-lease", branch)
+            result = subprocess.run(
+                ["git", "push", "--force-with-lease", "-u", "origin", branch],
+                capture_output=True, text=True, cwd=workspace_path, timeout=60,
+            )
+            if result.returncode != 0:
+                stderr = result.stderr.strip()
+                raise PushFailed(f"git push --force-with-lease failed: {stderr}")
+        else:
+            raise PushFailed(f"git push failed: {stderr}")
 
 
 def create_pr(
