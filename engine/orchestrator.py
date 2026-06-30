@@ -811,10 +811,23 @@ def run_pipeline(repo: str, issue_number: int, *,
             prior_review = r["review_summary"]
 
     branch = resume_state['branch'] if resume_state and resume_state.get('branch') else f"sw/issue-{issue_number}"
+    # Resolve the target repo path ONCE — this generic engine always requires an
+    # explicit repo (no workflow-card lookup, unlike run_domain_pipeline). A bare
+    # os.getcwd() fallback here would silently point at whatever directory the
+    # process happened to be launched from (e.g. simple-workflow's own checkout),
+    # producing a worktree under the wrong repo. Log loudly when it happens.
+    if not repo_path:
+        log.warning(
+            "no --repo-path given for generic pipeline — falling back to cwd=%s. "
+            "This is almost certainly wrong; pass --repo-path explicitly.", os.getcwd(),
+        )
+    effective_repo_path = repo_path or os.getcwd()
+    log.info("run_pipeline effective_repo_path=%s", effective_repo_path)
     if resume_state:
-        wt = workspace.reuse_or_create_workspace(repo_path or os.getcwd(), branch)
+        wt = workspace.reuse_or_create_workspace(effective_repo_path, branch)
     else:
-        wt = workspace.create_workspace(repo_path or os.getcwd(), branch)
+        wt = workspace.create_workspace(effective_repo_path, branch)
+    log.info("worktree created at wt=%s (branch=%s, repo=%s)", wt, branch, effective_repo_path)
     workspace.neutralize_claude_md(wt)
     repo_context = _load_repo_context(wt)
     if repo_context:
@@ -1253,19 +1266,51 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
     run_id = db_path.stem if hasattr(db_path, "stem") else str(db_path)
     log.info("run_domain_pipeline run_id=%s", run_id)
 
-    # Resolve repo path: CLI arg > workflow card > cwd
-    if not repo_path:
+    # Resolve repo path ONCE: CLI arg > workflow card > cwd (last resort, logged loudly).
+    #
+    # This resolution must never fail silently. A silent fallback to os.getcwd()
+    # here is what caused worktrees to be created under repos/simple-workflow/
+    # instead of the target repo (e.g. repos/shftty/) — execute committed to
+    # the wrong-rooted worktree, and push/PR creation later failed because the
+    # branch lived under a path nobody was looking at. See
+    # work/agent-reports/2026-06-30-pipeline-902-v7-review.md (attempt 6).
+    if repo_path:
+        log.info("repo_path resolved from CLI arg: %s", repo_path)
+    else:
         card_path = wf.get("repo_path")
         if card_path and card_path != "from-cli":
-            # repo_path in card is relative to the PA root (two levels up from simple-workflow)
+            # repo_path in card is relative to the PA root (four levels up from
+            # this file: engine/ -> simple-workflow/ -> repos/ -> PA root).
             candidate = Path(__file__).resolve().parent.parent.parent.parent / card_path
             if candidate.exists() and (candidate / ".git").exists():
                 repo_path = str(candidate)
                 log.info("repo_path resolved from workflow card: %s", repo_path)
-    effective_repo_path = repo_path or os.getcwd()
+            else:
+                # Workflow card declared a repo_path but it didn't resolve to a
+                # real git repo — this is a config/environment error, not an
+                # ambiguous case. Fail loud instead of silently falling back to
+                # cwd, which can point at simple-workflow's own checkout.
+                raise FileNotFoundError(
+                    f"workflow '{workflow}' declares repo_path={card_path!r} "
+                    f"but {candidate} does not exist or is not a git repo "
+                    f"(checked {candidate}/.git). Pass --repo-path explicitly "
+                    f"to override, or fix workflow.md."
+                )
+        else:
+            log.warning(
+                "no repo_path in workflow card and no --repo-path given — "
+                "falling back to cwd=%s. This is almost certainly wrong for "
+                "code workflows; pass --repo-path explicitly.", os.getcwd(),
+            )
 
+    effective_repo_path = repo_path or os.getcwd()
+    log.info("run_domain_pipeline effective_repo_path=%s", effective_repo_path)
+
+    # Resolve the worktree path ONCE here and use this same `wt` value for every
+    # subsequent phase (execute, review, push, PR) — never re-derive it.
     branch = f"sw/{workflow}-{issue_number}"
     wt = workspace.create_workspace(effective_repo_path, branch)
+    log.info("worktree created at wt=%s (branch=%s, repo=%s)", wt, branch, effective_repo_path)
     workspace.neutralize_claude_md(wt)
     repo_context = _load_repo_context(wt)
     if repo_context:
@@ -1588,7 +1633,11 @@ def run_ops_pipeline(workflow: str, task_description: str, *,
         log.error("aborting run_ops_pipeline: claude CLI health check failed: %s", detail)
         raise RuntimeError(f"claude CLI health check failed before run start: {detail}")
     wf_dir = _resolve_workflow_dir(workflow)
-    pa_root = Path(__file__).resolve().parents[2]
+    # Same off-by-one class of bug as the worktree path resolution above:
+    # parents[2] from engine/orchestrator.py lands on repos/, not the PA root.
+    # That silently wrote ops outputs to repos/work/outputs/ instead of
+    # work/outputs/ — found while auditing path resolution for the worktree fix.
+    pa_root = Path(__file__).resolve().parents[3]
     log.info("run_ops_pipeline start workflow=%s wf_dir=%s task=%r pa_root=%s",
              workflow, wf_dir, task_description[:80], pa_root)
 
