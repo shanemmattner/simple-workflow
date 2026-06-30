@@ -18,6 +18,7 @@ include = ["engines*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-p no:embedded-agent-bridge"
 
 [project.scripts]
 sw = "engines.github_claude.orchestrator:main"

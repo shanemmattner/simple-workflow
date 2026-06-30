@@ -284,7 +284,7 @@ def run_phase_gates(
     task_ids: list[int] | None = None,
     max_parallel: int = 5,
     test_command: str = "",
-    base_branch: str = "dev",
+    base_branch: str = "main",
 ) -> list[dict]:
     """Run every declared gate for a phase. Returns list of result dicts.
 
