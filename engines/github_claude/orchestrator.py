@@ -15,6 +15,7 @@ from typing import Any
 
 import yaml
 from . import source, runtime, storage, workspace, destination, gates, validate
+from .learnings import capture_learnings, get_recent_learnings, format_learnings_for_prompt
 
 log = logging.getLogger(__name__)
 WORKFLOW_DIR = Path(__file__).resolve().parent.parent.parent / "workflows" / "issue-to-pr"
@@ -62,19 +63,21 @@ def _phase_cfg(workflow: dict) -> dict[str, dict]:
             for p in workflow.get("phases", [])}
 
 def _render(template: str, issue_number: int, issue_body: str,
-            prior: dict, prior_review: str = "", repo_context: str = "") -> str:
+            prior: dict, prior_review: str = "", repo_context: str = "",
+            recent_learnings: str = "") -> str:
     out = template.replace("{issue_number}", str(issue_number))
     out = out.replace("{issue_body}", issue_body)
     out = out.replace("{repo_context}", repo_context)
     out = out.replace("{prior_phases}", json.dumps(prior, indent=2, default=str) if prior else "")
+    out = out.replace("{recent_learnings}", recent_learnings or "No prior learnings available.")
     if prior_review:
         out += f"\n\n## Prior run review\n\n{prior_review}"
     return out
 
 def _call(phase: str, cfg: dict, *, cwd: str, issue_number: int, issue_body: str,
           prior: dict, prior_review: str = "", model_ov: str | None = None,
-          repo_context: str = "") -> dict:
-    prompt = _render(_load_prompt(phase), issue_number, issue_body, prior, prior_review, repo_context)
+          repo_context: str = "", recent_learnings: str = "") -> dict:
+    prompt = _render(_load_prompt(phase), issue_number, issue_body, prior, prior_review, repo_context, recent_learnings)
     model = model_ov or cfg.get("model", "sonnet")
     log.info("[%s] model=%s max_turns=%d prompt_len=%d", phase, model, cfg.get("max_turns", 10), len(prompt))
     resp = runtime.call_agent(prompt, model=model, cwd=cwd, max_turns=cfg.get("max_turns", 10))
@@ -309,8 +312,11 @@ def run_pipeline(repo: str, issue_number: int, *,
     if resume_state:
         prior.update(resume_state['prior'])
     spent = resume_state['spent'] if resume_state else 0.0
+    recent_learnings_text = format_learnings_for_prompt(get_recent_learnings(5))
+    log.info("recent_learnings injected chars=%d", len(recent_learnings_text))
     kw = dict(cwd=wt, issue_number=issue_number, issue_body=issue_body,
-              model_ov=model_override, repo_context=repo_context)
+              model_ov=model_override, repo_context=repo_context,
+              recent_learnings=recent_learnings_text)
 
     # Helper to check if a phase (or any execute-task-*) was completed in a prior run
     def _skip(phase_name: str) -> bool:
@@ -547,12 +553,12 @@ def run_pipeline(repo: str, issue_number: int, *,
                 improve_prompt = improve_prompt.replace("{combined_diff}", diff[:30_000])
                 improve_prompt = improve_prompt.replace("{prior_phases}",
                     json.dumps(prior, indent=2, default=str))
-                improve_cfg = pcfg.get("improve", {"model": "haiku", "max_turns": 5})
-                model = model_override or improve_cfg.get("model", "haiku")
+                improve_cfg = pcfg.get("improve", {"model": "opus", "max_turns": 10})
+                model = model_override or improve_cfg.get("model", "opus")
                 pid = _start_phase(conn, "improve", model=_resolve_model(improve_cfg, kw.get("model_ov")))
-                log.info("[improve] model=%s max_turns=%d", model, improve_cfg.get("max_turns", 5))
+                log.info("[improve] model=%s max_turns=%d", model, improve_cfg.get("max_turns", 10))
                 resp = runtime.call_agent(improve_prompt, model=model, cwd=wt,
-                                          max_turns=improve_cfg.get("max_turns", 5))
+                                          max_turns=improve_cfg.get("max_turns", 10))
                 resp["_prompt"] = improve_prompt
                 _finish_phase(conn, pid, resp); spent += resp["cost"]
                 improve_text = _content(resp)
@@ -561,12 +567,24 @@ def run_pipeline(repo: str, issue_number: int, *,
                 try:
                     improve_data = json.loads(improve_text) if improve_text.strip().startswith("{") \
                         else _extract_json(improve_text, (
-                            '{"stale_claims": [], "missing_knowledge": [], "tool_suggestions": [], '
-                            '"prompt_improvements": [], "preservations": [], '
-                            '"score": {"triage": 0, "plan": 0, "execute": 0, "review": 0, "overall": 0}}'
+                            '{"overall_score": 0, "phase_scores": {"triage": 0, "plan": 0, "execute": 0, "review": 0}, '
+                            '"recommendations": [], "context_gaps": [], "code_quality_issues": [], '
+                            '"cost_analysis": "", "pipeline_health": "", "summary": ""}'
                         ), cwd=wt)
                     storage.log_event(conn, "improvement_suggestions", improve_data)
-                    log.info("[improve] score=%s", improve_data.get("score", {}))
+                    log.info("[improve] overall_score=%s phase_scores=%s",
+                             improve_data.get("overall_score"), improve_data.get("phase_scores", {}))
+                    # Capture learnings for injection into future runs
+                    try:
+                        n_learnings = capture_learnings(
+                            improve_output=improve_data,
+                            run_id=run_id,
+                            repo=repo,
+                            issue_number=issue_number,
+                        )
+                        log.info("learning_capture count=%d", n_learnings)
+                    except Exception as le:
+                        log.warning("learning_capture_failed error=%s", le)
                 except (json.JSONDecodeError, Exception) as je:
                     log.warning("[improve] could not extract structured JSON: %s", je)
                     storage.log_event(conn, "improvement_suggestions", {"raw": improve_text[:5000]})
