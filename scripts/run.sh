@@ -1,10 +1,42 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Usage: ./scripts/run.sh owner/repo#123 [--budget 2.00] [--model opus]
+# Usage: ./scripts/run.sh <workflow-config-path> owner/repo#123 [--budget 2.00] [--model opus]
 #
-# --engine claude     (default) uses engines/github_claude (Claude CLI subprocess)
+# <workflow-config-path>  Required. Path to a workflow.md file or a directory
+#                          containing one, e.g. workflows/shftty-web/workflow.md
+#                          or workflows/shftty-web. Workflow selection is always
+#                          explicit -- there is no auto-detection.
+# --engine claude          (default) uses engines/github_claude (Claude CLI subprocess)
 
 cd "$(dirname "$0")/.."
+
+if [[ $# -lt 1 ]]; then
+    echo "Usage: $0 <workflow-config-path> owner/repo#123 [--budget 2.00] [--model opus] [--engine claude|three-step]" >&2
+    exit 1
+fi
+
+WORKFLOW_PATH="$1"
+shift
+
+# Resolve workflow config path -> workflow dir -> workflow name.
+if [[ -d "$WORKFLOW_PATH" ]]; then
+    WF_DIR="$WORKFLOW_PATH"
+    WF_FILE="$WF_DIR/workflow.md"
+elif [[ -f "$WORKFLOW_PATH" && "$WORKFLOW_PATH" == *workflow.md ]]; then
+    WF_FILE="$WORKFLOW_PATH"
+    WF_DIR="$(dirname "$WORKFLOW_PATH")"
+else
+    echo "[run.sh] ERROR: workflow config path must exist and be a directory containing workflow.md, or a path ending in workflow.md (got: $WORKFLOW_PATH)" >&2
+    exit 1
+fi
+
+if [[ ! -f "$WF_FILE" ]]; then
+    echo "[run.sh] ERROR: workflow.md not found at $WF_FILE" >&2
+    exit 1
+fi
+
+WORKFLOW_NAME="$(basename "$WF_DIR")"
+echo "[run.sh] workflow: $WORKFLOW_NAME (from $WF_FILE)" >&2
 
 # Extract --engine flag before passing remaining args to Python
 ENGINE="claude"
@@ -58,26 +90,19 @@ if ! $HAS_REPO_PATH; then
     fi
 fi
 
-# Auto-detect --workflow from the issue ref's owner/repo (matches `repo:` field
-# in workflows/*/workflow.md). Skips issue-to-pr (generic fallback) and any
-# run that already specifies --workflow explicitly.
+# Workflow is always explicit -- pass the resolved name through.
 HAS_WORKFLOW=false
 for arg in "${ARGS[@]}"; do
     [[ "$arg" == "--workflow" ]] && HAS_WORKFLOW=true
 done
-
-if ! $HAS_WORKFLOW && [[ -n "${FULL_REPO:-}" ]]; then
-    for wf_dir in workflows/*/; do
-        wf_file="$wf_dir/workflow.md"
-        [[ -f "$wf_file" ]] || continue
-        wf_name="$(basename "$wf_dir")"
-        [[ "$wf_name" == "issue-to-pr" ]] && continue
-        if grep -q "repo: $FULL_REPO" "$wf_file" 2>/dev/null; then
-            echo "[run.sh] auto-detected workflow: $wf_name" >&2
-            ARGS+=("--workflow" "$wf_name")
-            break
-        fi
-    done
+if $HAS_WORKFLOW; then
+    echo "[run.sh] ERROR: --workflow is set automatically from the first positional arg; do not pass it explicitly" >&2
+    exit 1
+fi
+if [[ "$ENGINE" == "claude" ]]; then
+    ARGS+=("--workflow" "$WORKFLOW_NAME")
+else
+    echo "[run.sh] NOTE: --engine $ENGINE does not support --workflow; workflow selection ($WORKFLOW_NAME) is only applied to the claude engine" >&2
 fi
 
 # Layer 2: hard wall-clock cap via gtimeout (brew install coreutils).
