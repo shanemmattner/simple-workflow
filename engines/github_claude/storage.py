@@ -47,6 +47,9 @@ CREATE TABLE IF NOT EXISTS phase (
     cost                REAL DEFAULT 0,
     tokens_in           INTEGER DEFAULT 0,
     tokens_out          INTEGER DEFAULT 0,
+    cache_read_tokens   INTEGER DEFAULT 0,
+    cache_creation_tokens INTEGER DEFAULT 0,
+    session_id          TEXT,
     failure_category    TEXT
 );
 
@@ -86,6 +89,14 @@ CREATE INDEX IF NOT EXISTS idx_message_phase ON message(phase_id);
 CREATE INDEX IF NOT EXISTS idx_tool_call_phase ON tool_call(phase_id);
 CREATE INDEX IF NOT EXISTS idx_event_type ON event(event_type);
 """
+
+# Migrations for existing DBs — ADD COLUMN is idempotent via "IF NOT EXISTS" workaround:
+# SQLite does not support IF NOT EXISTS on ALTER TABLE, so we catch the error instead.
+_MIGRATIONS = [
+    "ALTER TABLE phase ADD COLUMN cache_read_tokens INTEGER DEFAULT 0",
+    "ALTER TABLE phase ADD COLUMN cache_creation_tokens INTEGER DEFAULT 0",
+    "ALTER TABLE phase ADD COLUMN session_id TEXT",
+]
 
 
 def _now_iso() -> str:
@@ -130,6 +141,15 @@ def create_run_db(
     conn.row_factory = sqlite3.Row
     _set_pragmas(conn)
     conn.executescript(_SCHEMA)
+
+    # Apply migrations for existing DBs (new columns silently no-op on fresh DBs
+    # because CREATE TABLE IF NOT EXISTS already includes them).
+    for migration in _MIGRATIONS:
+        try:
+            conn.execute(migration)
+        except Exception:
+            pass  # Column already exists
+    conn.commit()
 
     run_id = uuid.uuid4().hex[:12]
     conn.execute(

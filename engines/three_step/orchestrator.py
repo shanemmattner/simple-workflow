@@ -762,6 +762,9 @@ def _finish_phase(conn, phase_id: int, resp: dict | None, failed: bool = False) 
         cost=resp.get("cost", 0) if resp else 0,
         tokens_in=resp.get("tokens_in", 0) if resp else 0,
         tokens_out=resp.get("tokens_out", 0) if resp else 0,
+        cache_read_tokens=resp.get("cache_read_tokens", 0) if resp else 0,
+        cache_creation_tokens=resp.get("cache_creation_tokens", 0) if resp else 0,
+        session_id=resp.get("session_id", "") if resp else "",
     )
 
 
@@ -845,6 +848,8 @@ def _call_claude(prompt: str, *, phase: str, cwd: str, model: str | None = None)
         "cost": raw.get("cost_usd", 0.0),
         "tokens_in": raw.get("tokens_in", 0),
         "tokens_out": raw.get("tokens_out", 0),
+        "cache_read_tokens": raw.get("cache_read", 0),
+        "cache_creation_tokens": raw.get("cache_creation", 0),
         "duration_s": raw.get("duration_ms", 0) / 1000.0,
         "finish_reason": finish_reason,
         "session_id": raw.get("session_id", ""),
@@ -1394,6 +1399,19 @@ def run_pipeline(
     if not repo_path:
         repo_path = _find_repo_path(repo)
     wt = workspace.create_workspace(repo_path, branch)
+    # Log workspace creation for lifecycle traceability
+    try:
+        base_commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=wt, capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+    except Exception:
+        base_commit = ""
+    storage.log_event(conn, "worktree_created", {
+        "path": wt,
+        "branch": branch,
+        "base_commit": base_commit,
+    })
     spent = 0.0
 
     # NOTE: CLAUDE.md hiding is handled per-phase by claude_runtime.py
@@ -1898,6 +1916,12 @@ def run_pipeline(
             os.rename(claude_dir_hidden, claude_dir)
             log.info("[cleanup] restored .claude.pipeline-hidden/ → .claude/")
 
-        # Do NOT clean up the worktree -- just log its location
+        # Log worktree final state (preserved, not cleaned up)
+        wt_exists = os.path.exists(wt)
+        storage.log_event(conn, "worktree_preserved", {
+            "path": wt,
+            "branch": branch,
+            "exists": wt_exists,
+        })
         log.info("worktree preserved at: %s", wt)
         conn.close()

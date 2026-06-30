@@ -22,6 +22,7 @@ LOG_FILE="$LOG_DIR/poll-tasks-${DATE_TAG}.log"
 PA_ROOT="${SW_PA_ROOT:-$HOME/pa/main}"
 BUDGET="${SW_BUDGET:-3.00}"
 INTERVAL="${SW_INTERVAL:-600}"
+DAILY_CAP="${SW_DAILY_CAP:-15.00}"
 ONCE=false
 
 [[ "${1:-}" == "--once" ]] && ONCE=true
@@ -63,6 +64,14 @@ frontmatter_get() {
 
 poll_once() {
     local found=0 skipped=0 processed=0
+
+    # Daily budget cap check
+    PROCESSED_TODAY="$(grep -c "pipeline exit_code" "$LOG_FILE" 2>/dev/null || true)"
+    SPENT_TODAY="$(echo "$PROCESSED_TODAY * $BUDGET" | bc 2>/dev/null || echo 0)"
+    if (( $(echo "$SPENT_TODAY >= $DAILY_CAP" | bc -l 2>/dev/null || echo 0) )); then
+        log "Daily budget cap reached (\$$SPENT_TODAY of \$$DAILY_CAP) — skipping remaining tasks"
+        return 0
+    fi
 
     log "Pulling latest PA repo at $PA_ROOT..."
     if ! git -C "$PA_ROOT" pull --ff-only >> "$LOG_FILE" 2>&1; then
@@ -115,8 +124,17 @@ poll_once() {
             log "  $TASK_ID: gh_issue=$GH_ISSUE already exists"
         fi
 
+        # Retry limit check: count "pipeline: TASK_ID →" commits in PA repo git log
+        RETRY_COUNT="$(git -C "$PA_ROOT" log --oneline --all 2>/dev/null \
+            | grep -c "pipeline: $TASK_ID →" || true)"
+        if [[ "$RETRY_COUNT" -ge 3 ]]; then
+            log "  SKIP $TASK_ID: max retries (3) reached (attempts=$RETRY_COUNT)"
+            skipped=$((skipped + 1))
+            continue
+        fi
+
         ISSUE_REF="${TARGET_REPO}#${GH_ISSUE}"
-        log "  $TASK_ID: starting pipeline for $ISSUE_REF budget=\$$BUDGET"
+        log "  $TASK_ID: starting pipeline for $ISSUE_REF budget=\$$BUDGET (attempt=$((RETRY_COUNT + 1)))"
 
         # Mark in-progress before the run so a crash leaves a visible state
         python3 - "$TASK_FILE" "in-progress" <<'PYEOF' >> "$LOG_FILE" 2>&1
@@ -133,8 +151,8 @@ PYEOF
         log "  $TASK_ID: pipeline exit_code=$RUN_EXIT"
 
         # Find the most-recently modified run DB for this run
-        RUN_DB="$(find "$REPO_ROOT/runs" -name "*.db" -newer "$TASK_FILE" \
-            -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | awk '{print $2}')" || true
+        RUN_DB="$(find "$REPO_ROOT/runs" -name "*.db" -newer "$TASK_FILE" 2>/dev/null \
+            | xargs stat -f '%m %N' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)" || true
 
         if [[ -n "$RUN_DB" ]] && [[ -f "$RUN_DB" ]]; then
             log "  $TASK_ID: calling post-pipeline-update.py run_db=$RUN_DB"
