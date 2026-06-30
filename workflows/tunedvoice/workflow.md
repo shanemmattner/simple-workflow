@@ -3,8 +3,9 @@ name: tunedvoice
 description: Domain-specific workflow for TunedVoice — macOS push-to-talk dictation app (Swift/SwiftUI, FluidAudio, ANE)
 type: code
 
-repo: shanemmattner/tunedvoice
+repo: shanemmattner/tunedvoice-monorepo
 repo_path: repos/tunedvoice
+provider: gitlab
 
 budget:
   max_per_run_usd: 10.00
@@ -73,7 +74,7 @@ Domain-specific issue-to-PR workflow for the TunedVoice macOS push-to-talk dicta
 ## Run
 
 ```
-python -m engine shanemmattner/tunedvoice <issue> --workflow tunedvoice
+python -m engine shanemmattner/tunedvoice-monorepo <issue> --workflow tunedvoice
 ```
 
 ## Reusable

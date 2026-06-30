@@ -61,14 +61,21 @@ def create_pr(
     title: str,
     body: str,
     base: str = "main",
+    provider: str = "github",
 ) -> dict:
-    """Create a GitHub PR via ``gh pr create``.
+    """Create a GitHub PR (``gh pr create``) or GitLab MR (``glab mr create``).
 
     Returns ``{"number": int, "url": str}``.
 
-    Raises PRAlreadyExists if a PR for *branch* already exists,
+    Raises PRAlreadyExists if a PR/MR for *branch* already exists,
     RuntimeError on other failures.
     """
+    if provider == "gitlab":
+        return _create_pr_gitlab(repo, branch, title, body, base)
+    return _create_pr_github(repo, branch, title, body, base)
+
+
+def _create_pr_github(repo: str, branch: str, title: str, body: str, base: str) -> dict:
     result = subprocess.run(
         [
             "gh", "pr", "create",
@@ -90,6 +97,45 @@ def create_pr(
     url = result.stdout.strip()
 
     # Extract PR number from URL (https://github.com/owner/repo/pull/123)
+    number = 0
+    parts = url.rstrip("/").split("/")
+    if parts and parts[-1].isdigit():
+        number = int(parts[-1])
+
+    return {"number": number, "url": url}
+
+
+def _create_pr_gitlab(repo: str, branch: str, title: str, body: str, base: str) -> dict:
+    result = subprocess.run(
+        [
+            "glab", "mr", "create",
+            "--repo", repo,
+            "--source-branch", branch,
+            "--target-branch", base,
+            "--title", title,
+            "--description", body,
+            "--yes",
+        ],
+        capture_output=True, text=True, timeout=30,
+    )
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if "already exists" in stderr.lower():
+            raise PRAlreadyExists(f"MR already exists for branch {branch!r}: {stderr}")
+        raise RuntimeError(f"glab mr create failed: {stderr}")
+
+    # glab prints progress lines and the MR url; the url is the last
+    # line that looks like a URL.
+    url = ""
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("http"):
+            url = line
+    if not url:
+        url = result.stdout.strip()
+
+    # Extract MR IID from URL (https://gitlab.com/owner/repo/-/merge_requests/123)
     number = 0
     parts = url.rstrip("/").split("/")
     if parts and parts[-1].isdigit():

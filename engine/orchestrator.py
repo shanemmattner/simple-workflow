@@ -772,8 +772,8 @@ def load_resume_state(db_path: str) -> dict:
     }
 
 
-def _post_failure(repo: str, num: int, err: str):
-    try: source.post_comment(repo, num, f"Pipeline failed.\n\n```\n{err[:2000]}\n```")
+def _post_failure(repo: str, num: int, err: str, provider: str = "github"):
+    try: source.post_comment(repo, num, f"Pipeline failed.\n\n```\n{err[:2000]}\n```", provider=provider)
     except Exception: log.warning("failed to post failure comment on %s#%d", repo, num)
 
 
@@ -1224,6 +1224,8 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
     wf = _load_workflow_config(wf_dir)
     log.info("loaded workflow config from %s", wf_dir)
     budget = budget or wf.get("budget", {}).get("max_per_run_usd", 10.00)
+    provider = wf.get("provider", "github")
+    log.info("issue/PR provider=%s", provider)
     pcfg = _phase_cfg(wf)
 
     def load_prompt(phase: str) -> str:
@@ -1259,7 +1261,7 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
                 out = out.replace(f"{{{k}}}", str(v))
         return out
 
-    issue = source.fetch_issue(repo, issue_number)
+    issue = source.fetch_issue(repo, issue_number, provider=provider)
     issue_body = f"# {issue['title']}\n\n{issue['body']}"
 
     db_path, conn = storage.create_run_db(repo, issue_number, model=model_override)
@@ -1357,7 +1359,7 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
                 f"(workflow: {workflow}).\n\n"
                 f"Triage output:\n\n{triage_text[:3000]}"
             )
-            source.post_comment(repo, issue_number, msg)
+            source.post_comment(repo, issue_number, msg, provider=provider)
             storage.finish_run(conn, f"triage_{triage_signal.lower()}", total_cost=spent)
             log.info("[domain/triage] early exit signal=%s", triage_signal)
             return {"status": f"triage_{triage_signal.lower()}", "spent_usd": spent, "run_id": run_id}
@@ -1488,7 +1490,7 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
         pr_body = destination.format_pr_body(issue_number, review_text, db_path, [])
         if review_signal == "FAIL":
             pr_body = "**Review flagged issues that need addressing before merge.**\n\n" + pr_body
-        pr = destination.create_pr(repo, branch, pr_title, pr_body)
+        pr = destination.create_pr(repo, branch, pr_title, pr_body, provider=provider)
         log.info("[domain] PR created url=%s review_signal=%s", pr.get("url"), review_signal)
         storage.log_event(conn, "pr_created", {"url": pr.get("url"), "review_signal": review_signal})
 
@@ -1604,13 +1606,13 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
     except BudgetExceeded as e:
         log.error("[domain] budget exceeded: %s", e)
         storage.finish_run(conn, "budget_exceeded", total_cost=spent)
-        _post_failure(repo, issue_number, str(e))
+        _post_failure(repo, issue_number, str(e), provider=provider)
         return {"status": "error", "error": str(e), "spent_usd": spent, "run_id": run_id}
     except Exception as e:
         log.exception("[domain] pipeline failed")
         storage.finish_run(conn, "error", total_cost=spent)
         storage.log_event(conn, "pipeline_error", {"error": str(e)})
-        _post_failure(repo, issue_number, str(e))
+        _post_failure(repo, issue_number, str(e), provider=provider)
         return {"status": "error", "error": str(e), "spent_usd": spent, "run_id": run_id}
     finally:
         log.info("[domain] run complete — worktree preserved at %s (branch: %s)", wt, branch)
