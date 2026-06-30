@@ -16,6 +16,9 @@ openhands = [
 [tool.setuptools.packages.find]
 include = ["engines*"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [project.scripts]
 sw = "engines.github_claude.orchestrator:main"
 sw-openhands = "engines.github_openhands.orchestrator:main"
