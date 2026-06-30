@@ -9,8 +9,7 @@ aliases:
   - minimax
   - m3
   - minimax-m3
-  - m27hs
-  - minimax-m2.7-highspeed
+  - MiniMax-M3
 
 pricing:
   input_per_mtok: 0.30

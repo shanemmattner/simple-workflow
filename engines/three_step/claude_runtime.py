@@ -7,11 +7,168 @@ subscription (no API credits). Adapted from shftty/workflows/src/agent.py.
 import json
 import logging
 import os
+import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Subprocess watchdog constants (battle-tested values — do not change)
+# ---------------------------------------------------------------------------
+_STARTUP_GRACE_S = 300        # Phase 1: max seconds before first assistant token
+_STALL_TIMEOUT_S = 120        # Phase 2: max idle stdout seconds post-token
+_CONTENT_STALL_S = 240        # Phase 2b: stdout flowing but no assistant content
+_RESULT_EXIT_S = 30           # Phase 3: result event seen but process won't exit
+_WATCHDOG_POLL_S = 10         # Poll interval for the wait loop
+
+
+def _run_with_watchdog(
+    cmd: list[str],
+    *,
+    cwd: str,
+    env: dict,
+    timeout: int,
+) -> tuple[str, int, bool]:
+    """Run cmd with phase-aware stall detection watchdog.
+
+    Returns (stdout_text, returncode, hit_timeout).
+    hit_timeout is True when the process was killed (either by wall-clock
+    timeout or by a watchdog phase threshold).
+    stdout_text has a sentinel appended if killed by watchdog:
+    ``\\n[STALL after <info>]``.
+    """
+    lines: list[str] = []
+    stderr_lines: list[str] = []
+    _now = time.monotonic()
+    last_stdout_ts: list[float] = [_now]
+    last_content_ts: list[float] = [_now]
+    first_assistant_token = threading.Event()
+    result_received = threading.Event()
+    stall_info: list[str | None] = [None]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=cwd,
+        env=env,
+        start_new_session=True,
+    )
+
+    def _read_stdout() -> None:
+        try:
+            assert proc.stdout
+            for line in proc.stdout:
+                ts = time.monotonic()
+                lines.append(line)
+                last_stdout_ts[0] = ts
+                if '"type":"assistant"' in line or '"type":"thinking"' in line:
+                    last_content_ts[0] = ts
+                    first_assistant_token.set()
+                if '"type":"result"' in line:
+                    result_received.set()
+        except Exception:
+            pass
+
+    def _read_stderr() -> None:
+        try:
+            assert proc.stderr
+            for line in proc.stderr:
+                stderr_lines.append(line)
+        except Exception:
+            pass
+
+    t_out = threading.Thread(target=_read_stdout, daemon=True)
+    t_err = threading.Thread(target=_read_stderr, daemon=True)
+    t_out.start()
+    t_err.start()
+
+    def _kill(reason: str) -> None:
+        stall_info[0] = reason
+        log.warning("STALL %s — killing pid=%d", reason, proc.pid)
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+    wall_start = time.monotonic()
+
+    while True:
+        if proc.poll() is not None:
+            break
+
+        now = time.monotonic()
+        elapsed = now - wall_start
+
+        if elapsed >= timeout:
+            _kill(f"phase=wall-clock elapsed={elapsed:.0f}s limit={timeout}s")
+            break
+
+        if not first_assistant_token.is_set():
+            idle = now - last_stdout_ts[0]
+            if idle >= _STARTUP_GRACE_S:
+                log.warning(
+                    "STALL phase=pre-token idle=%.0fs limit=%ds",
+                    idle, _STARTUP_GRACE_S,
+                )
+                _kill(f"phase=pre-token idle={idle:.0f}s limit={_STARTUP_GRACE_S}s")
+                break
+        elif result_received.is_set():
+            idle = now - last_stdout_ts[0]
+            if idle >= _RESULT_EXIT_S:
+                log.warning(
+                    "STALL phase=post-result idle=%.0fs limit=%ds",
+                    idle, _RESULT_EXIT_S,
+                )
+                _kill(f"phase=post-result idle={idle:.0f}s limit={_RESULT_EXIT_S}s")
+                break
+        else:
+            idle_stdout = now - last_stdout_ts[0]
+            idle_content = now - last_content_ts[0]
+            if idle_stdout >= _STALL_TIMEOUT_S:
+                log.warning(
+                    "STALL phase=post-token idle_stdout=%.0fs limit=%ds",
+                    idle_stdout, _STALL_TIMEOUT_S,
+                )
+                _kill(
+                    f"phase=post-token idle_stdout={idle_stdout:.0f}s"
+                    f" limit={_STALL_TIMEOUT_S}s"
+                )
+                break
+            elif idle_content >= _CONTENT_STALL_S:
+                log.warning(
+                    "STALL phase=content-stall idle_content=%.0fs limit=%ds",
+                    idle_content, _CONTENT_STALL_S,
+                )
+                _kill(
+                    f"phase=content-stall idle_content={idle_content:.0f}s"
+                    f" limit={_CONTENT_STALL_S}s"
+                )
+                break
+
+        time.sleep(_WATCHDOG_POLL_S)
+
+    t_out.join(timeout=5)
+    t_err.join(timeout=5)
+
+    stdout = "".join(lines)
+    returncode = proc.returncode if proc.returncode is not None else -1
+    hit_timeout = stall_info[0] is not None
+
+    if stall_info[0]:
+        stdout += f"\n[STALL after {stall_info[0]}]"
+
+    return stdout, returncode, hit_timeout
 
 
 def parse_json(text: str) -> dict:
@@ -145,22 +302,15 @@ def run_phase_agent(
     raw_output = ""
     returncode = -1
 
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=worktree,
-        )
-        try:
-            stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout_bytes, stderr_bytes = proc.communicate()
-            hit_timeout = True
+    # Layer 1: env vars — Claude's own byte-level and request-level timeouts.
+    env = os.environ.copy()
+    env["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] = "600000"   # 10 min byte-level watchdog
+    env["API_TIMEOUT_MS"] = "1200000"                   # 20 min per-request timeout
 
-        raw_output = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
-        returncode = proc.returncode
+    try:
+        raw_output, returncode, hit_timeout = _run_with_watchdog(
+            cmd, cwd=worktree, env=env, timeout=timeout
+        )
     except Exception as exc:
         raw_output = str(exc)
     finally:

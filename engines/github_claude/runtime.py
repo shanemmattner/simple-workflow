@@ -16,9 +16,11 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -42,6 +44,15 @@ _RETRY_BASE_DELAY = 2  # seconds; exponential: 2, 4, 8
 _RETRYABLE_PATTERNS = re.compile(
     r"rate limit|429|500|503|overloaded", re.IGNORECASE
 )
+
+# ---------------------------------------------------------------------------
+# Subprocess watchdog constants (battle-tested values — do not change)
+# ---------------------------------------------------------------------------
+_STARTUP_GRACE_S = 300        # Phase 1: max seconds before first assistant token
+_STALL_TIMEOUT_S = 120        # Phase 2: max idle stdout seconds post-token
+_CONTENT_STALL_S = 240        # Phase 2b: stdout flowing but no assistant content
+_RESULT_EXIT_S = 30           # Phase 3: result event seen but process won't exit
+_WATCHDOG_POLL_S = 10         # Poll interval for the wait loop
 
 
 # ---------------------------------------------------------------------------
@@ -121,51 +132,50 @@ def call_agent(
 
     for attempt in range(_MAX_RETRIES):
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=effective_timeout,
-                cwd=cwd or None,
+            returncode, stdout, stderr, stall_info = _run_claude_with_watchdog(
+                cmd, cwd or None, effective_timeout
             )
             elapsed = time.monotonic() - start
 
-            if proc.returncode != 0:
-                stderr = proc.stderr.strip()
+            if stall_info:
+                # Process killed by watchdog — return as timeout, no retry
+                log.warning(
+                    "call_agent: subprocess killed by watchdog: %s", stall_info
+                )
+                return {
+                    "content": stdout,  # partial output with sentinel appended
+                    "tokens_in": 0,
+                    "tokens_out": 0,
+                    "cost": 0.0,
+                    "duration_s": elapsed,
+                    "finish_reason": "timeout",
+                }
+
+            if returncode != 0:
+                stderr_str = stderr.strip()
                 if (
                     attempt < _MAX_RETRIES - 1
-                    and _RETRYABLE_PATTERNS.search(stderr)
+                    and _RETRYABLE_PATTERNS.search(stderr_str)
                 ):
                     delay = _RETRY_BASE_DELAY * (2 ** attempt)
                     log.warning(
                         "call_agent retryable error (attempt %d/%d), "
                         "retrying in %.0fs: %s",
-                        attempt + 1, _MAX_RETRIES, delay, stderr[:200],
+                        attempt + 1, _MAX_RETRIES, delay, stderr_str[:200],
                     )
                     time.sleep(delay)
                     continue
 
-                return _error_response(stderr, elapsed)
+                return _error_response(stderr_str, elapsed)
 
-            result = parse_response(proc.stdout, _elapsed=elapsed)
+            result = parse_response(stdout, _elapsed=elapsed)
             # Log stderr and empty responses for debugging
-            if proc.stderr.strip():
-                log.warning("claude stderr: %s", proc.stderr.strip()[:500])
+            if stderr.strip():
+                log.warning("claude stderr: %s", stderr.strip()[:500])
             if result.get("cost", 0) == 0 and result.get("finish_reason") != "error":
                 log.warning("zero-cost response (possible auth/CLI issue): content=%s",
                            str(result.get("content", ""))[:300])
             return result
-
-        except subprocess.TimeoutExpired:
-            elapsed = time.monotonic() - start
-            return {
-                "content": "",
-                "tokens_in": 0,
-                "tokens_out": 0,
-                "cost": 0.0,
-                "duration_s": elapsed,
-                "finish_reason": "timeout",
-            }
 
         except FileNotFoundError:
             elapsed = time.monotonic() - start
@@ -239,6 +249,166 @@ def parse_response(raw_json: str, *, _elapsed: float = 0.0) -> dict:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _run_claude_with_watchdog(
+    cmd: list[str],
+    cwd: str | None,
+    timeout: int,
+) -> tuple[int, str, str, str | None]:
+    """Run a claude -p subprocess with three-phase stall detection.
+
+    Layer 1 env vars bake Claude's own byte-level idle timeout into the env.
+    Layer 3 watchdog thread monitors stdout events and kills on phase-specific
+    thresholds, handling the case where Claude's self-timeout fails.
+
+    Returns:
+        (returncode, stdout, stderr, stall_info)
+        stall_info is None on clean exit, or a description string when killed
+        by the watchdog. stdout will have a sentinel appended in that case:
+        ``\\n[STALL after <info>]``.
+    """
+    # Layer 1: env vars — Claude's own byte-level and request-level timeouts.
+    env = os.environ.copy()
+    env["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] = "600000"   # 10 min byte-level watchdog
+    env["API_TIMEOUT_MS"] = "1200000"                   # 20 min per-request timeout
+
+    lines: list[str] = []
+    stderr_lines: list[str] = []
+    _now = time.monotonic()
+    last_stdout_ts: list[float] = [_now]
+    last_content_ts: list[float] = [_now]
+    first_assistant_token = threading.Event()
+    result_received = threading.Event()
+    stall_info: list[str | None] = [None]
+
+    # start_new_session=True creates a new process group so os.killpg can
+    # kill claude AND any child processes it spawns.
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=cwd,
+        env=env,
+        start_new_session=True,
+    )
+
+    def _read_stdout() -> None:
+        try:
+            assert proc.stdout
+            for line in proc.stdout:
+                ts = time.monotonic()
+                lines.append(line)
+                last_stdout_ts[0] = ts
+                # Detect content events to distinguish real-work from preamble
+                if '"type":"assistant"' in line or '"type":"thinking"' in line:
+                    last_content_ts[0] = ts
+                    first_assistant_token.set()
+                if '"type":"result"' in line:
+                    result_received.set()
+        except Exception:
+            pass
+
+    def _read_stderr() -> None:
+        try:
+            assert proc.stderr
+            for line in proc.stderr:
+                stderr_lines.append(line)
+        except Exception:
+            pass
+
+    t_out = threading.Thread(target=_read_stdout, daemon=True)
+    t_err = threading.Thread(target=_read_stderr, daemon=True)
+    t_out.start()
+    t_err.start()
+
+    def _kill(reason: str) -> None:
+        stall_info[0] = reason
+        log.warning("STALL %s — killing pid=%d", reason, proc.pid)
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+    wall_start = time.monotonic()
+
+    while True:
+        if proc.poll() is not None:
+            break
+
+        now = time.monotonic()
+        elapsed = now - wall_start
+
+        # Hard wall-clock cap (matches effective_timeout from call_agent)
+        if elapsed >= timeout:
+            _kill(f"phase=wall-clock elapsed={elapsed:.0f}s limit={timeout}s")
+            break
+
+        if not first_assistant_token.is_set():
+            # Phase 1: waiting for first assistant/thinking event
+            idle = now - last_stdout_ts[0]
+            if idle >= _STARTUP_GRACE_S:
+                log.warning(
+                    "STALL phase=pre-token idle=%.0fs limit=%ds",
+                    idle, _STARTUP_GRACE_S,
+                )
+                _kill(f"phase=pre-token idle={idle:.0f}s limit={_STARTUP_GRACE_S}s")
+                break
+        elif result_received.is_set():
+            # Phase 3: result event emitted — process should exit promptly
+            idle = now - last_stdout_ts[0]
+            if idle >= _RESULT_EXIT_S:
+                log.warning(
+                    "STALL phase=post-result idle=%.0fs limit=%ds",
+                    idle, _RESULT_EXIT_S,
+                )
+                _kill(f"phase=post-result idle={idle:.0f}s limit={_RESULT_EXIT_S}s")
+                break
+        else:
+            # Phase 2/2b: token received, result not yet — check two stall axes
+            idle_stdout = now - last_stdout_ts[0]
+            idle_content = now - last_content_ts[0]
+            if idle_stdout >= _STALL_TIMEOUT_S:
+                log.warning(
+                    "STALL phase=post-token idle_stdout=%.0fs limit=%ds",
+                    idle_stdout, _STALL_TIMEOUT_S,
+                )
+                _kill(
+                    f"phase=post-token idle_stdout={idle_stdout:.0f}s"
+                    f" limit={_STALL_TIMEOUT_S}s"
+                )
+                break
+            elif idle_content >= _CONTENT_STALL_S:
+                log.warning(
+                    "STALL phase=content-stall idle_content=%.0fs limit=%ds",
+                    idle_content, _CONTENT_STALL_S,
+                )
+                _kill(
+                    f"phase=content-stall idle_content={idle_content:.0f}s"
+                    f" limit={_CONTENT_STALL_S}s"
+                )
+                break
+
+        time.sleep(_WATCHDOG_POLL_S)
+
+    t_out.join(timeout=5)
+    t_err.join(timeout=5)
+
+    stdout = "".join(lines)
+    stderr = "".join(stderr_lines)
+    returncode = proc.returncode if proc.returncode is not None else -1
+
+    if stall_info[0]:
+        stdout += f"\n[STALL after {stall_info[0]}]"
+
+    return returncode, stdout, stderr, stall_info[0]
+
 
 def _error_response(message: str, elapsed: float) -> dict:
     return {

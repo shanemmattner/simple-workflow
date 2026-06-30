@@ -55,4 +55,24 @@ if ! $HAS_REPO_PATH; then
     fi
 fi
 
-PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" python3 -m "$MODULE" "${ARGS[@]}"
+# Layer 2: hard wall-clock cap via gtimeout (brew install coreutils).
+# Exit code 124 means gtimeout killed the process.
+# Falls back to running without timeout if gtimeout isn't available (e.g. plain macOS).
+WALL_TIMEOUT="${CLAUDE_WALL_TIMEOUT_S:-3600}"  # 60 min default
+
+run_engine() {
+    PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" python3 -m "$MODULE" "${ARGS[@]}"
+}
+
+if command -v gtimeout &>/dev/null; then
+    gtimeout --kill-after=30s "${WALL_TIMEOUT}s" \
+        env PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" python3 -m "$MODULE" "${ARGS[@]}"
+    EXIT_CODE=$?
+    if [[ $EXIT_CODE -eq 124 ]]; then
+        echo "[run.sh] ERROR: pipeline killed by gtimeout after ${WALL_TIMEOUT}s wall-clock limit (exit 124)" >&2
+    fi
+    exit $EXIT_CODE
+else
+    echo "[run.sh] WARNING: gtimeout not found — running without wall-clock cap (install coreutils: brew install coreutils)" >&2
+    run_engine
+fi
