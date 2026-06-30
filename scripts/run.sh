@@ -50,7 +50,10 @@ if ! $HAS_REPO_PATH; then
         PA_ROOT="$(cd "$PWD/.." && pwd)" # parent of simple-workflow = PA root
         CANDIDATE="$PA_ROOT/$REPO_NAME"
         if [[ -d "$CANDIDATE/.git" ]]; then
+            echo "[run.sh] auto-detected repo: $CANDIDATE" >&2
             ARGS+=("--repo-path" "$CANDIDATE")
+        else
+            echo "[run.sh] WARNING: could not auto-detect repo path for '$REPO_NAME' — looked at $CANDIDATE" >&2
         fi
     fi
 fi

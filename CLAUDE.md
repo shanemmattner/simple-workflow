@@ -50,6 +50,29 @@ python3 -m pytest tests/
 - `scripts/run.sh` -- shell entry point
 - `scripts/stats.sh` -- SQLite dashboard queries
 
+## Test run
+
+```bash
+# Quick test with haiku (cheapest)
+./scripts/run.sh owner/repo#123 --budget 1.00 --model haiku --repo-path /path/to/repo
+
+# On Mac Studio (auto-detects repo path)
+./scripts/run.sh shanemmattner/shftty#870 --budget 1.00 --model haiku
+
+# Check status while running
+./scripts/status.sh
+
+# Live tail
+./scripts/tail.sh
+```
+
+## Stall protection
+
+Three layers protect against hung `claude -p` processes:
+1. **Env vars**: `CLAUDE_STREAM_IDLE_TIMEOUT_MS=600000`, `API_TIMEOUT_MS=1200000` (set automatically)
+2. **Wall-clock cap**: `gtimeout` wrapper in run.sh (default 60 min, override via `CLAUDE_WALL_TIMEOUT_S`)
+3. **Phase-aware watchdog**: Monitors stdout for content events, kills on 4 stall patterns (pre-token 300s, post-token 120s, content-stall 240s, post-result 30s)
+
 ## Important
 
 - `engines/github_claude/runs/` holds per-run `.db` files (gitignored). Each `.db` is self-contained -- full replay of every phase, message, tool call, and event.
