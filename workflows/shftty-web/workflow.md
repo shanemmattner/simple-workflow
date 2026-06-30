@@ -1,5 +1,10 @@
+---
 name: shftty-web
-description: Domain-specific workflow for the shftty healthcare staffing web app. 5 phases with markdown output and keyword-based decision signals.
+description: Issue-to-PR workflow for the shftty healthcare staffing web app (Next.js + Supabase monorepo).
+type: code
+
+repo: shanemmattner/shftty
+repo_path: repos/shftty
 
 budget:
   max_per_run_usd: 10.00
@@ -56,3 +61,18 @@ template_variables:
   - issue_number
   - recent_learnings
   - prior_phases
+---
+
+# shftty-web
+
+Issue-to-PR workflow for the shftty healthcare staffing web app (Next.js + Supabase monorepo).
+
+## Run
+
+```
+python -m engine shanemmattner/shftty <issue> --workflow shftty-web
+```
+
+## Reusable
+
+The triage step-decomposition pattern and execute-step.md template work for any Next.js monorepo. The PROCEED/SKIP/ESCALATE decision signal and PASS/WARN/FAIL verdict signal are portable to any code workflow.

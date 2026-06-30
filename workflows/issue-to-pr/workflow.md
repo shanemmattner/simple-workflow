@@ -1,13 +1,15 @@
+---
 name: issue-to-pr
 description: Transform a GitHub issue into a tested, reviewed PR
+type: code
+
+repo: from-cli
+repo_path: from-cli
 
 budget:
   max_per_run_usd: 2.00
 
 max_parallel_workers: 5
-# NOTE: there is intentionally no `default_model` field here.
-# Per-phase model: entries in the phases list below are the single
-# source of truth. Explicit --model CLI flag still wins.
 
 models:
   haiku:
@@ -59,8 +61,7 @@ phases:
   - name: validate
     model: sonnet
     max_turns: 10
-    optional: true  # skipped when no UI changes or no preview URL
-  # Improve: Opus only — this phase reviews all prior work and feeds learnings back. Worth the cost.
+    optional: true
   - name: improve
     model: opus
     max_turns: 10
@@ -91,3 +92,19 @@ gates:
     - red_gate
     - green_gate
     - commit_exists
+---
+
+# issue-to-pr
+
+Generic issue-to-PR pipeline that transforms any GitHub issue into a tested, reviewed PR using parallel wave execution.
+
+## Run
+
+```
+python -m engine owner/repo <issue> --workflow issue-to-pr
+./scripts/run.sh owner/repo#<issue>
+```
+
+## Reusable
+
+This is the canonical template for all code workflows. The triage → verify → plan → wave-planner → execute → review phase sequence, parallel per_task/per_wave execution, and gate definitions are the baseline every domain workflow extends.

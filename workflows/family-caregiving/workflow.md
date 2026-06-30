@@ -1,21 +1,10 @@
-name: cody-business
-description: Professional communications, business development, CTO/advisory role management. Ops workflow — no git worktree, no GitHub source/destination.
-
-# Type: ops (no git, no GitHub — pure text in / markdown out)
-# Routing handled by the orchestrator. No engine-specific module required.
+---
+name: family-caregiving
+description: Alzheimer's caregiving coordination — facility research, caregiver search, call prep, legal/financial tracking
+type: ops
 
 budget:
   max_per_run_usd: 100.00
-
-models:
-  sonnet:
-    name: claude-sonnet-4-6
-    max_tokens: 16384
-    cost: {input_per_mtok: 3.00, output_per_mtok: 15.00}
-  haiku:
-    name: claude-haiku-4-5
-    max_tokens: 8192
-    cost: {input_per_mtok: 0.80, output_per_mtok: 4.00}
 
 phases:
   - name: triage
@@ -26,6 +15,7 @@ phases:
       section: "## Decision"
       keywords:
         proceed: "PROCEED"
+        skip: "SKIP:"
         escalate: "ESCALATE:"
 
   - name: execute
@@ -57,7 +47,18 @@ template_variables:
   - task_description
   - prior_phases
   - recent_learnings
-  - workstream_context
-  - triage_output
-  - execute_output
-  - review_output
+---
+
+# family-caregiving
+
+Ops workflow for Alzheimer's caregiving coordination — facility research, caregiver search, call prep, and legal/financial tracking.
+
+## Run
+
+```
+python -m engine --workflow family-caregiving --task "Research memory care facilities in the East Bay under $8k/month"
+```
+
+## Reusable
+
+The 3-signal triage pattern (PROCEED/SKIP/ESCALATE) with a `## Decision` section is portable to any research or coordination ops workflow. The lightweight template_variables set (task_description, prior_phases, recent_learnings) is the minimal viable context for ops tasks.

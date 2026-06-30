@@ -1,8 +1,7 @@
+---
 name: comms-triage
 description: Scan Gmail + iMessage, prioritize messages, draft replies, produce digest
-
-# Engine: comms_claude (NOT github_claude — no git worktree, no GitHub source/destination)
-# Run: python -m engines.comms_claude [--hours 24] [--budget 0.50] [--model sonnet]
+type: ops
 
 budget:
   max_per_run_usd: 0.50
@@ -39,7 +38,6 @@ phases:
     model: m27hs
     max_turns: 3
 
-# Gates are lightweight for v1 — no code correctness to verify
 gates:
   scan:
     - messages_array_present
@@ -47,5 +45,18 @@ gates:
     - buckets_present
   digest:
     - digest_path_present
+---
 
-# No review phase for v1 — digest IS the review artifact
+# comms-triage
+
+Ops workflow for unified inbox triage — scans Gmail and iMessage, prioritizes messages, drafts replies, and produces a digest.
+
+## Run
+
+```
+python -m engines.comms_claude --hours 24 --budget 0.50 --model sonnet
+```
+
+## Reusable
+
+The scan → prioritize → draft → digest phase pattern is reusable for any multi-source communications triage. The cost-optimized model routing (m27hs for scan/prioritize/digest, m3 only for drafting) is the template for budget-sensitive comms workflows.

@@ -537,8 +537,28 @@ def _parse_review_signal(text: str) -> str:
     return "PASS"
 
 
+def _load_workflow_config(wf_dir: Path) -> dict:
+    """Load workflow config from workflow.md (OKF) or workflow.yaml (legacy)."""
+    wf_md = wf_dir / "workflow.md"
+    wf_yaml = wf_dir / "workflow.yaml"
+
+    if wf_md.is_file():
+        text = wf_md.read_text()
+        if text.startswith("---"):
+            parts = text.split("---", 2)
+            if len(parts) >= 3:
+                return yaml.safe_load(parts[1]) or {}
+        log.warning("workflow.md missing valid frontmatter in %s", wf_dir)
+        return {}
+    elif wf_yaml.is_file():
+        return yaml.safe_load(wf_yaml.read_text()) or {}
+    else:
+        log.warning("no workflow.md or workflow.yaml in %s", wf_dir)
+        return {}
+
+
 def _load_workflow() -> dict:
-    return yaml.safe_load((WORKFLOW_DIR / "workflow.yaml").read_text())
+    return _load_workflow_config(WORKFLOW_DIR)
 
 def _load_prompt(phase: str) -> str:
     return (WORKFLOW_DIR / "prompts" / f"{phase}.md").read_text()
@@ -1173,13 +1193,8 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
              repo, issue_number, workflow, wf_dir, budget)
 
     # Load workflow config from domain dir (falls back gracefully if missing)
-    wf_yaml = wf_dir / "workflow.yaml"
-    if wf_yaml.is_file():
-        wf = yaml.safe_load(wf_yaml.read_text())
-        log.info("loaded workflow.yaml from %s", wf_yaml)
-    else:
-        log.warning("no workflow.yaml in %s — using empty config", wf_dir)
-        wf = {}
+    wf = _load_workflow_config(wf_dir)
+    log.info("loaded workflow config from %s", wf_dir)
     budget = budget or wf.get("budget", {}).get("max_per_run_usd", 10.00)
     pcfg = _phase_cfg(wf)
 
@@ -1223,8 +1238,19 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
     run_id = db_path.stem if hasattr(db_path, "stem") else str(db_path)
     log.info("run_domain_pipeline run_id=%s", run_id)
 
+    # Resolve repo path: CLI arg > workflow card > cwd
+    if not repo_path:
+        card_path = wf.get("repo_path")
+        if card_path and card_path != "from-cli":
+            # repo_path in card is relative to the PA root (two levels up from simple-workflow)
+            candidate = Path(__file__).resolve().parent.parent.parent.parent / card_path
+            if candidate.exists() and (candidate / ".git").exists():
+                repo_path = str(candidate)
+                log.info("repo_path resolved from workflow card: %s", repo_path)
+    effective_repo_path = repo_path or os.getcwd()
+
     branch = f"sw/{workflow}-{issue_number}"
-    wt = workspace.create_workspace(repo_path or os.getcwd(), branch)
+    wt = workspace.create_workspace(effective_repo_path, branch)
     workspace.neutralize_claude_md(wt)
     repo_context = _load_repo_context(wt)
     if repo_context:
@@ -1542,13 +1568,8 @@ def run_ops_pipeline(workflow: str, task_description: str, *,
     log.info("run_ops_pipeline start workflow=%s wf_dir=%s task=%r pa_root=%s",
              workflow, wf_dir, task_description[:80], pa_root)
 
-    wf_yaml = wf_dir / "workflow.yaml"
-    if wf_yaml.is_file():
-        wf = yaml.safe_load(wf_yaml.read_text())
-        log.info("loaded workflow.yaml from %s", wf_yaml)
-    else:
-        log.warning("no workflow.yaml in %s — using empty config", wf_dir)
-        wf = {}
+    wf = _load_workflow_config(wf_dir)
+    log.info("loaded workflow config from %s", wf_dir)
     pcfg = _phase_cfg(wf)
 
     def load_prompt(phase: str) -> str:
@@ -1758,11 +1779,8 @@ def main() -> None:
 
     # Detect ops workflow
     if args.workflow:
-        wf_yaml = _resolve_workflow_dir(args.workflow) / "workflow.yaml"
-        wf_type = None
-        if wf_yaml.is_file():
-            wf_cfg = yaml.safe_load(wf_yaml.read_text()) or {}
-            wf_type = wf_cfg.get("type")
+        wf_cfg = _load_workflow_config(_resolve_workflow_dir(args.workflow))
+        wf_type = wf_cfg.get("type")
 
         if wf_type == "ops" or args.task:
             if not args.task:
