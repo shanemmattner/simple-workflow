@@ -270,6 +270,58 @@ def run_green_gate(
     return {"passed": False, "reason": "tests still failing after implementation"}
 
 
+_PIPELINE_INTERNAL_RE = re.compile(
+    r"(^|/)\.claude\.pipeline-hidden/"
+    r"|(^|/)reviews/"
+    r"|(^|/)\.claude/"
+    r"|(^|/)CLAUDE\.md\.pipeline-hidden$"
+)
+
+
+def validate_pr_diff(workspace_path: str, base: str = "main") -> tuple[bool, str]:
+    """Check that the diff between current branch and base contains real code changes.
+
+    Filters out pipeline-internal files (.claude.pipeline-hidden/, reviews/,
+    .claude/, CLAUDE.md.pipeline-hidden) before counting. A diff with zero
+    remaining files means the PR would ship nothing but pipeline scaffold.
+
+    Returns (is_valid, reason).
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--name-only", f"{base}...HEAD"],
+            capture_output=True, text=True,
+            cwd=workspace_path, timeout=30,
+        )
+    except Exception as exc:
+        log.warning("[gate/pr-diff] git diff failed: %s", exc)
+        return False, f"git diff failed: {exc}"
+
+    if proc.returncode != 0:
+        stderr = proc.stderr.strip()
+        log.warning("[gate/pr-diff] git diff returned %d: %s", proc.returncode, stderr)
+        return False, f"git diff failed: {stderr}"
+
+    all_files = [ln for ln in proc.stdout.strip().splitlines() if ln.strip()]
+    app_files = [f for f in all_files if not _PIPELINE_INTERNAL_RE.search(f)]
+
+    log.info(
+        "[gate/pr-diff] %d total file(s), %d application file(s) (filtered %d pipeline-internal)",
+        len(all_files), len(app_files), len(all_files) - len(app_files),
+    )
+    for f in all_files:
+        log.debug("[gate/pr-diff]   %s %s", "APP" if f in app_files else "internal", f)
+
+    if not app_files:
+        reason = "PR diff contains only pipeline scaffold files, no application code"
+        log.warning("[gate/pr-diff] FAIL: %s", reason)
+        return False, reason
+
+    reason = f"PR diff contains {len(app_files)} application files"
+    log.info("[gate/pr-diff] PASS: %s", reason)
+    return True, reason
+
+
 def check_commits_exist(worktree_path: str, base_branch: str) -> dict:
     """Verify the agent produced at least one commit."""
     try:

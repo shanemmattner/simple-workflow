@@ -1105,6 +1105,11 @@ def run_pipeline(repo: str, issue_number: int, *,
                     _finish_phase(conn, pid, None, failed=True)
 
         # -- Push + PR --
+        diff_ok, diff_reason = gates.validate_pr_diff(wt, base="main")
+        storage.log_event(conn, "pr_diff_gate", {"passed": diff_ok, "reason": diff_reason})
+        if not diff_ok:
+            log.error("[pr-diff-gate] FAIL: %s", diff_reason)
+            raise GateFailure(f"pr-diff gate failed: {diff_reason}")
         destination.push_branch(wt, branch)
         body = destination.format_pr_body(issue_number, prior["review"], db_path, [])
         pr = destination.create_pr(repo, branch, f"fix: resolve #{issue_number}", body)
@@ -1425,6 +1430,11 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
         storage.log_event(conn, "review_signal", {"signal": review_signal})
 
         # ---- Push + PR ----------------------------------------------------------
+        diff_ok, diff_reason = gates.validate_pr_diff(wt, base="main")
+        storage.log_event(conn, "pr_diff_gate", {"passed": diff_ok, "reason": diff_reason})
+        if not diff_ok:
+            log.error("[domain/pr-diff-gate] FAIL: %s", diff_reason)
+            raise GateFailure(f"pr-diff gate failed: {diff_reason}")
         destination.push_branch(wt, branch)
         pr_title = f"fix: resolve #{issue_number} ({workflow})"
         if review_signal == "FAIL":
