@@ -26,16 +26,16 @@ models:
 
 phases:
   - name: scan
-    model: m27hs
+    model: sonnet
     max_turns: 10
   - name: prioritize
-    model: m27hs
+    model: sonnet
     max_turns: 3
   - name: draft-replies
-    model: m3
+    model: sonnet
     max_turns: 5
   - name: digest
-    model: m27hs
+    model: sonnet
     max_turns: 3
 
 gates:

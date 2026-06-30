@@ -35,28 +35,28 @@ models:
 
 phases:
   - name: triage
-    model: m27hs
+    model: sonnet
     max_turns: 5
   - name: verify
-    model: m27hs
+    model: sonnet
     max_turns: 5
   - name: plan
-    model: m3
+    model: sonnet
     max_turns: 10
     parallel: per_task
   - name: test-plan
-    model: m27hs
+    model: sonnet
     max_turns: 5
     parallel: per_task
   - name: wave-planner
-    model: m27hs
+    model: sonnet
     max_turns: 2
   - name: execute
-    model: m3
+    model: sonnet
     max_turns: 30
     parallel: per_wave
   - name: review
-    model: m3
+    model: sonnet
     max_turns: 5
   - name: validate
     model: sonnet
