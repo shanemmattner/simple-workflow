@@ -37,21 +37,12 @@ def push_branch(workspace_path: str, branch: str) -> None:
     Raises PushFailed on auth/network errors, BranchNotFound if the
     branch doesn't exist locally.
     """
-    # Verify the branch exists locally
-    check = subprocess.run(
-        ["git", "rev-parse", "--verify", branch],
-        capture_output=True, text=True, cwd=workspace_path, timeout=10,
-    )
-    if check.returncode != 0:
-        raise BranchNotFound(f"branch {branch!r} not found in {workspace_path}")
-
     result = subprocess.run(
         ["git", "push", "-u", "origin", branch],
         capture_output=True, text=True, cwd=workspace_path, timeout=60,
     )
     if result.returncode != 0:
         stderr = result.stderr.strip()
-        # Check if this is a non-fast-forward rejection (branch exists remotely)
         if "non-fast-forward" in stderr.lower() or "rejected" in stderr.lower():
             log.warning("Non-fast-forward on %s, retrying with --force-with-lease", branch)
             result = subprocess.run(
@@ -59,8 +50,7 @@ def push_branch(workspace_path: str, branch: str) -> None:
                 capture_output=True, text=True, cwd=workspace_path, timeout=60,
             )
             if result.returncode != 0:
-                stderr = result.stderr.strip()
-                raise PushFailed(f"git push --force-with-lease failed: {stderr}")
+                raise PushFailed(f"git push --force-with-lease failed: {result.stderr.strip()}")
         else:
             raise PushFailed(f"git push failed: {stderr}")
 
