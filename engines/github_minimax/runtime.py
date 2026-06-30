@@ -616,23 +616,32 @@ def call_agent(
                     **sampling_kwargs,
                 )
             except Exception as e:
-                # Retry transient errors with exponential backoff (1s, 2s, 4s).
-                # Matches the pattern in engines/github_claude/runtime.py so
-                # the two engines behave consistently under 429/5xx storms.
-                error_str = str(e).lower()
-                transient = any(x in error_str for x in (
-                    "429", "rate limit", "timeout", "502", "503", "overloaded",
-                ))
-                if not transient:
-                    raise
-                delay = 1.0
-                response = None
-                for attempt in range(3):
+                # Defense-in-depth: catch MiniMax error 2013 ("tool_id not found").
+                # The root cause (assistant message not appended before tool results)
+                # is fixed above, but if conversation state ever gets corrupted,
+                # strip orphaned tool-result messages from history and retry once.
+                error_str = str(e)
+                if "2013" in error_str and "tool" in error_str.lower():
                     log.warning(
-                        "transient error on turn %d (attempt %d/3), sleeping %.1fs: %s",
-                        turn + 1, attempt + 1, delay, e,
+                        "MiniMax error 2013 on turn %d: tool_call ID mismatch. "
+                        "Stripping orphaned tool-result messages and retrying.",
+                        turn + 1,
                     )
-                    time.sleep(delay)
+                    # Collect the tool_call IDs that appear in assistant messages
+                    known_ids: set[str] = set()
+                    for msg in messages:
+                        if msg.get("role") == "assistant":
+                            for tc in msg.get("tool_calls") or []:
+                                if isinstance(tc, dict):
+                                    known_ids.add(tc.get("id", ""))
+                    # Remove tool-result messages whose IDs aren't in any assistant msg
+                    messages[:] = [
+                        m for m in messages
+                        if not (
+                            m.get("role") == "tool"
+                            and m.get("tool_call_id") not in known_ids
+                        )
+                    ]
                     try:
                         response = client.chat.completions.create(
                             model=model,
@@ -643,16 +652,49 @@ def call_agent(
                             parallel_tool_calls=False,
                             **sampling_kwargs,
                         )
-                        break
                     except Exception as e2:
-                        last_err = e2
-                        delay *= 2
-                if response is None:
-                    log.error("retry exhausted: %s", last_err)
-                    return _error_response(
-                        f"API call failed after retries: {last_err}",
-                        time.monotonic() - start,
-                    )
+                        log.error("error 2013 recovery failed: %s", e2)
+                        return _error_response(
+                            f"API call failed after error-2013 recovery: {e2}",
+                            time.monotonic() - start,
+                        )
+                else:
+                    # Retry transient errors with exponential backoff (1s, 2s, 4s).
+                    # Matches the pattern in engines/github_claude/runtime.py so
+                    # the two engines behave consistently under 429/5xx storms.
+                    transient = any(x in error_str.lower() for x in (
+                        "429", "rate limit", "timeout", "502", "503", "overloaded",
+                    ))
+                    if not transient:
+                        raise
+                    delay = 1.0
+                    response = None
+                    for attempt in range(3):
+                        log.warning(
+                            "transient error on turn %d (attempt %d/3), sleeping %.1fs: %s",
+                            turn + 1, attempt + 1, delay, e,
+                        )
+                        time.sleep(delay)
+                        try:
+                            response = client.chat.completions.create(
+                                model=model,
+                                messages=messages,
+                                tools=TOOLS,
+                                tool_choice="auto",
+                                stream=False,
+                                parallel_tool_calls=False,
+                                **sampling_kwargs,
+                            )
+                            break
+                        except Exception as e2:
+                            last_err = e2
+                            delay *= 2
+                    if response is None:
+                        log.error("retry exhausted: %s", last_err)
+                        return _error_response(
+                            f"API call failed after retries: {last_err}",
+                            time.monotonic() - start,
+                        )
 
             # Track tokens
             if response.usage:
@@ -672,6 +714,12 @@ def call_agent(
             if cfg and cfg.get("strip_think_tags") and serialized.get("content"):
                 from models import clean_output
                 serialized["content"] = clean_output(serialized["content"], cfg)
+            # CRITICAL: append the assistant message BEFORE any tool results.
+            # MiniMax error 2013 ("tool_id not found") occurs when tool result
+            # messages reference tool_call IDs that don't appear in history.
+            # The fix: always append the assistant message first so its
+            # tool_call IDs are established in conversation history.
+            messages.append(serialized)
 
             # Check if model wants to call tools
             if not message.tool_calls:
