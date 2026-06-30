@@ -516,8 +516,13 @@ def _parse_review_signal(text: str) -> str:
        (not embedded mid-sentence). Prevents "this will FAIL in CI" false-matches.
 
     Returns the first signal found (FAIL > WARN > PASS).
-    Defaults to PASS if none found.
+    Defaults to PASS if none found, EXCEPT an empty/blank response fails closed (FAIL) —
+    an empty review means the phase produced nothing to evaluate, not an implicit pass.
     """
+    if text.strip() == "":
+        log.warning("_parse_review_signal: empty review text — failing closed (FAIL)")
+        return "FAIL"
+
     # Strategy 1: structured header match — "## Verdict\nPASS" (trailing text allowed)
     header_match = re.search(
         r"^##\s*verdict\s*\n+\s*(PASS|WARN|FAIL)\b",
@@ -537,6 +542,69 @@ def _parse_review_signal(text: str) -> str:
 
     log.info("_parse_review_signal: no explicit signal found — defaulting to PASS")
     return "PASS"
+
+
+def _build_phases_summary(
+    *,
+    triage_cost: float,
+    triage_signal: str,
+    step_results: list[dict],
+    review_cost: float,
+    review_signal: str,
+) -> list[dict]:
+    """Assemble the phases-summary list passed to ``destination.format_pr_body``.
+
+    Includes the triage phase, each execution step (from ``step_results``),
+    and the review phase, so the PR body shows what ran, its cost, and the
+    outcome of each phase.
+    """
+    summary: list[dict] = [
+        {"name": "triage", "cost": triage_cost, "result": triage_signal},
+    ]
+    for step in step_results:
+        name = f"step {step.get('step_number', '?')}: {step.get('title', '')}".strip()
+        summary.append({
+            "name": name,
+            "cost": step.get("cost", 0) or 0,
+            "duration_s": step.get("duration_s", 0) or 0,
+            "result": step.get("status", "unknown"),
+        })
+    summary.append(
+        {"name": "review", "cost": review_cost, "result": review_signal}
+    )
+    return summary
+
+
+_DISCOVERY_PATTERNS = (
+    "out of scope",
+    "not fixed",
+    "pre-existing",
+    "discovered",
+)
+
+
+def _extract_discoveries(step_results: list[dict]) -> list[str]:
+    """Scan step summaries for out-of-scope / discovered-but-not-fixed findings.
+
+    Keeps it simple: any paragraph (split on blank lines) in a step's
+    summary text that mentions one of the known marker phrases gets pulled
+    out verbatim and tagged with the originating step, so the PR body
+    surfaces findings that would otherwise die in the run DB.
+    """
+    discoveries: list[str] = []
+    for step in step_results:
+        summary = step.get("summary", "") or ""
+        if not summary:
+            continue
+        lowered = summary.lower()
+        if not any(pattern in lowered for pattern in _DISCOVERY_PATTERNS):
+            continue
+        for paragraph in re.split(r"\n\s*\n", summary):
+            para_lower = paragraph.lower()
+            if any(pattern in para_lower for pattern in _DISCOVERY_PATTERNS):
+                step_label = f"step {step.get('step_number', '?')}: {step.get('title', '')}".strip()
+                discoveries.append(f"**{step_label}** — {paragraph.strip()}")
+    return discoveries
 
 
 def _load_workflow_config(wf_dir: Path) -> dict:
@@ -1424,6 +1492,16 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
             })
             log.info("[domain/execute] monolithic complete spent=%.4f content_len=%d",
                      spent, len(prior["execute"]))
+            # No per-step results in monolithic mode — synthesize a single
+            # entry so phases_summary/discoveries still reflect this phase.
+            step_results = [{
+                "step_number": 1,
+                "title": "execute (monolithic)",
+                "status": "completed",
+                "cost": execute_resp["cost"],
+                "duration_s": execute_resp.get("duration_s", 0),
+                "summary": prior["execute"][:500],
+            }]
 
         _guard(spent, budget)
 
@@ -1464,6 +1542,7 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
             max_turns=review_cfg.get("max_turns", 10),
         )
         review_resp["_prompt"] = review_prompt
+        _check_resp("review", review_resp)
         _finish_phase(conn, pid, review_resp)
         spent += review_resp["cost"]
         review_text = _content(review_resp)
@@ -1487,10 +1566,23 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
         if review_signal == "FAIL":
             pr_title = f"[NEEDS FIXES] fix: resolve #{issue_number} ({workflow})"
             log.warning("[domain/review] FAIL signal — PR will be marked as needing fixes")
-        pr_body = destination.format_pr_body(issue_number, review_text, db_path, [])
+        phases_summary = _build_phases_summary(
+            triage_cost=triage_resp["cost"],
+            triage_signal=triage_signal,
+            step_results=step_results,
+            review_cost=review_resp["cost"],
+            review_signal=review_signal,
+        )
+        discoveries = _extract_discoveries(step_results)
+        if discoveries:
+            log.info("[domain/execute] %d discovered-issue excerpt(s) found across steps", len(discoveries))
+        pr_body = destination.format_pr_body(
+            issue_number, review_text, db_path, phases_summary,
+            notes=discoveries, total_cost_usd=spent,
+        )
         if review_signal == "FAIL":
             pr_body = "**Review flagged issues that need addressing before merge.**\n\n" + pr_body
-        pr = destination.create_pr(repo, branch, pr_title, pr_body, provider=provider)
+        pr = destination.create_pr(repo, branch, pr_title, pr_body, provider=provider, total_cost_usd=spent)
         log.info("[domain] PR created url=%s review_signal=%s", pr.get("url"), review_signal)
         storage.log_event(conn, "pr_created", {"url": pr.get("url"), "review_signal": review_signal})
 

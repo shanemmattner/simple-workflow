@@ -62,14 +62,25 @@ def create_pr(
     body: str,
     base: str = "main",
     provider: str = "github",
+    total_cost_usd: float | None = None,
 ) -> dict:
     """Create a GitHub PR (``gh pr create``) or GitLab MR (``glab mr create``).
 
     Returns ``{"number": int, "url": str}``.
 
+    *total_cost_usd*, when provided, is the in-memory run cost at PR-creation
+    time (the caller's ``spent`` accumulator). It is not embedded in the body
+    here — the caller is expected to have already baked it into *body* via
+    ``format_pr_body(..., total_cost_usd=...)`` — but it is logged so the
+    run's cost-at-PR-time is visible even if the body formatting changes.
+
     Raises PRAlreadyExists if a PR/MR for *branch* already exists,
     RuntimeError on other failures.
     """
+    log.info(
+        "create_pr repo=%s branch=%s provider=%s total_cost_usd=%s",
+        repo, branch, provider, total_cost_usd,
+    )
     if provider == "gitlab":
         return _create_pr_gitlab(repo, branch, title, body, base)
     return _create_pr_github(repo, branch, title, body, base)
@@ -149,6 +160,8 @@ def format_pr_body(
     review_summary: str,
     run_db_path: str,
     phases_summary: list[dict],
+    notes: list[str] | None = None,
+    total_cost_usd: float | None = None,
 ) -> str:
     """Build the PR description body.
 
@@ -159,10 +172,26 @@ def format_pr_body(
     review_summary:
         Formatted review findings text (may be empty).
     run_db_path:
-        Path to the runs.db SQLite database, used to pull cost data.
+        Path to the runs.db SQLite database. Used as a fallback cost source
+        when *total_cost_usd* is not provided (see below).
     phases_summary:
-        List of dicts with at least ``{"phase": str, "cost_usd": float,
-        "duration_s": float}``.
+        List of dicts describing each phase/step that ran. Accepts either
+        ``{"phase": str, "cost_usd": float, "duration_s": float}`` or the
+        looser ``{"name": str, "cost": float, "result": str}`` shape —
+        whichever keys are present are used, with sensible fallbacks.
+    notes:
+        Optional list of excerpts describing out-of-scope or discovered-but-
+        not-fixed findings surfaced during execution. Rendered as a
+        "### Discovered Issues" section when non-empty.
+    total_cost_usd:
+        The caller's in-memory running cost total (e.g. the ``spent``
+        accumulator in ``run_domain_pipeline``), captured at PR-creation
+        time. PR creation happens BEFORE ``finish_run()`` writes the final
+        ``total_cost`` to the run DB, so reading from the DB here always
+        returns the stale default (0.0). Pass this explicitly whenever the
+        caller already tracks cost in memory. Falls back to
+        ``_read_total_cost(run_db_path)`` when omitted, for backwards
+        compatibility with callers that don't.
     """
     lines: list[str] = []
 
@@ -175,14 +204,21 @@ def format_pr_body(
         lines.append("### Pipeline phases")
         lines.append("")
         for phase in phases_summary:
-            name = phase.get("phase", "unknown")
-            cost = phase.get("cost_usd", 0) or 0
+            name = phase.get("phase") or phase.get("name") or "unknown"
+            cost = phase.get("cost_usd", phase.get("cost", 0)) or 0
             duration = phase.get("duration_s", 0) or 0
-            lines.append(f"- **{name}** — ${cost:.4f}, {duration:.0f}s")
+            result = phase.get("result")
+            line = f"- **{name}** — ${cost:.4f}"
+            if duration:
+                line += f", {duration:.0f}s"
+            if result:
+                line += f" — {result}"
+            lines.append(line)
         lines.append("")
 
-    # Total cost from DB
-    total_cost = _read_total_cost(run_db_path)
+    # Total cost: prefer the caller's in-memory value (accurate at PR-creation
+    # time); fall back to the DB read for backwards-compat callers.
+    total_cost = total_cost_usd if total_cost_usd is not None else _read_total_cost(run_db_path)
     if total_cost is not None:
         lines.append(f"**Total cost:** ${total_cost:.4f}")
         lines.append("")
@@ -193,6 +229,14 @@ def format_pr_body(
         lines.append("")
         lines.append(review_summary)
         lines.append("")
+
+    # Discovered out-of-scope issues
+    if notes:
+        lines.append("### Discovered Issues")
+        lines.append("")
+        for note in notes:
+            lines.append(note)
+            lines.append("")
 
     lines.append("---")
     lines.append("*Automated by simple_workflow*")
