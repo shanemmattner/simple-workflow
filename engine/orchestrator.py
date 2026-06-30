@@ -485,9 +485,9 @@ def _parse_triage_signal(text: str) -> str:
     Returns the first signal found (ESCALATE > SKIP > PROCEED).
     Defaults to PROCEED if none found.
     """
-    # Strategy 1: structured header match — "## Decision\nPROCEED"
+    # Strategy 1: structured header match — "## Decision\nPROCEED" (trailing text allowed)
     header_match = re.search(
-        r"^##\s*decision\s*\n+\s*(PROCEED|SKIP|ESCALATE)\s*$",
+        r"^##\s*decision\s*\n+\s*(PROCEED|SKIP|ESCALATE)\b",
         text, re.IGNORECASE | re.MULTILINE,
     )
     if header_match:
@@ -495,9 +495,10 @@ def _parse_triage_signal(text: str) -> str:
         log.info("_parse_triage_signal: header match signal=%s", signal)
         return signal
 
-    # Strategy 2: signal as sole word on its own line (priority: ESCALATE > SKIP > PROCEED)
+    # Strategy 2: signal as the start of its own line (priority: ESCALATE > SKIP > PROCEED)
+    # Allows trailing text, e.g. "SKIP: Already implemented in submodule bump"
     for signal in ("ESCALATE", "SKIP", "PROCEED"):
-        if re.search(rf"^\s*{signal}\s*$", text, re.IGNORECASE | re.MULTILINE):
+        if re.search(rf"^\s*{signal}\b", text, re.IGNORECASE | re.MULTILINE):
             log.info("_parse_triage_signal: standalone-line match signal=%s", signal)
             return signal
 
@@ -517,9 +518,9 @@ def _parse_review_signal(text: str) -> str:
     Returns the first signal found (FAIL > WARN > PASS).
     Defaults to PASS if none found.
     """
-    # Strategy 1: structured header match — "## Verdict\nPASS"
+    # Strategy 1: structured header match — "## Verdict\nPASS" (trailing text allowed)
     header_match = re.search(
-        r"^##\s*verdict\s*\n+\s*(PASS|WARN|FAIL)\s*$",
+        r"^##\s*verdict\s*\n+\s*(PASS|WARN|FAIL)\b",
         text, re.IGNORECASE | re.MULTILINE,
     )
     if header_match:
@@ -527,9 +528,10 @@ def _parse_review_signal(text: str) -> str:
         log.info("_parse_review_signal: header match signal=%s", signal)
         return signal
 
-    # Strategy 2: signal as sole word on its own line (priority: FAIL > WARN > PASS)
+    # Strategy 2: signal as the start of its own line (priority: FAIL > WARN > PASS)
+    # Allows trailing text, e.g. "FAIL: missing test coverage"
     for signal in ("FAIL", "WARN", "PASS"):
-        if re.search(rf"^\s*{signal}\s*$", text, re.IGNORECASE | re.MULTILINE):
+        if re.search(rf"^\s*{signal}\b", text, re.IGNORECASE | re.MULTILINE):
             log.info("_parse_review_signal: standalone-line match signal=%s", signal)
             return signal
 
