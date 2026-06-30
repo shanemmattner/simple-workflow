@@ -1678,7 +1678,11 @@ def run_pipeline(
             }
             _finish_phase(conn, pid, resp,
                           failed=(resp.get("finish_reason") == "error"))
-            _guard(spent, budget)
+            # NOTE: no budget guard here — implement_retry has committed code to the branch.
+            # Once work is committed, we proceed to re-review and PR creation regardless of
+            # budget. Killing here leaves money spent but no deliverable (the exact failure
+            # mode that motivated this change). Budget guards at investigate and implement
+            # are the right gates; post-commit retry must complete.
             log.info("[implement_retry_%d] done (%.1fs, $%.4f)",
                      review_attempt, resp["duration_s"], resp["cost"])
 

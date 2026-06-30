@@ -20,7 +20,7 @@ DATE_TAG="$(date +%Y-%m-%d)"
 LOG_FILE="$LOG_DIR/poll-tasks-${DATE_TAG}.log"
 
 PA_ROOT="${SW_PA_ROOT:-$HOME/pa/main}"
-BUDGET="${SW_BUDGET:-3.00}"
+BUDGET="${SW_BUDGET:-10.00}"
 INTERVAL="${SW_INTERVAL:-600}"
 ONCE=false
 
@@ -142,7 +142,7 @@ PYEOF
         log "  $TASK_ID: pipeline exit_code=$RUN_EXIT"
 
         # Find the most-recently modified run DB for this run
-        RUN_DB="$(find "$REPO_ROOT/runs" -name "*.db" -newer "$TASK_FILE" 2>/dev/null \
+        RUN_DB="$(find "$REPO_ROOT/engines/*/runs" -name "*.db" -newer "$TASK_FILE" 2>/dev/null \
             | xargs stat -f '%m %N' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)" || true
 
         if [[ -n "$RUN_DB" ]] && [[ -f "$RUN_DB" ]]; then

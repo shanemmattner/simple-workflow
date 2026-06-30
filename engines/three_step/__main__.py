@@ -16,8 +16,8 @@ def main() -> None:
         description="GitHub issue -> PR pipeline (3-step: investigate, implement, review)",
     )
     parser.add_argument("issue", help="Issue ref: owner/repo#NNN")
-    parser.add_argument("--budget", type=float, default=5.00,
-                        help="Max spend in USD (default: 5.00)")
+    parser.add_argument("--budget", type=float, default=10.00,
+                        help="Max spend in USD (default: 10.00)")
     parser.add_argument("--model", default=None,
                         help="Override model for all phases (default: haiku for investigate/review, sonnet for implement)")
     parser.add_argument("--repo-path", default=None,
