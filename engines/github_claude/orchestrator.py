@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from . import source, runtime, storage, workspace, destination, gates
+from . import source, runtime, storage, workspace, destination, gates, validate
 
 log = logging.getLogger(__name__)
 WORKFLOW_DIR = Path(__file__).resolve().parent.parent.parent / "workflows" / "issue-to-pr"
@@ -579,8 +579,56 @@ def run_pipeline(repo: str, issue_number: int, *,
         destination.push_branch(wt, branch)
         body = destination.format_pr_body(issue_number, prior["review"], db_path, [])
         pr = destination.create_pr(repo, branch, f"fix: resolve #{issue_number}", body)
+
+        # -- Validate (optional — web preview testing via Playwright) --
+        # Runs AFTER PR creation because Vercel needs the PR to create a preview.
+        validate_result = None
+        if _skip("validate"):
+            validate_result = prior.get("validate")
+        elif validate.check_has_ui_changes(prior.get("triage", ""), issue_body):
+            try:
+                pr_number = pr.get("number", issue_number)
+                log.info("[validate] UI changes detected — polling for Vercel preview URL")
+                preview_url = validate.get_preview_url(repo, pr_number)
+
+                if preview_url:
+                    log.info("[validate] preview ready: %s", preview_url)
+                    validate_prompt = _load_prompt("validate")
+                    validate_prompt = validate_prompt.replace("{pr_number}", str(pr_number))
+                    validate_prompt = validate_prompt.replace("{repo}", repo)
+                    validate_prompt = validate_prompt.replace("{preview_url}", preview_url)
+                    validate_prompt = validate_prompt.replace("{issue_body}", issue_body)
+                    validate_prompt = validate_prompt.replace("{prior_phases}",
+                        json.dumps(prior, indent=2, default=str))
+
+                    validate_cfg = pcfg.get("validate", {"model": "sonnet", "max_turns": 10})
+                    model = model_override or validate_cfg.get("model", "sonnet")
+                    pid = _start_phase(conn, "validate", model=_resolve_model(validate_cfg, kw.get("model_ov")))
+                    log.info("[validate] model=%s max_turns=%d", model, validate_cfg.get("max_turns", 10))
+                    resp = runtime.call_agent(validate_prompt, model=model, cwd=wt,
+                                              max_turns=validate_cfg.get("max_turns", 10))
+                    resp["_prompt"] = validate_prompt
+                    _finish_phase(conn, pid, resp); spent += resp["cost"]
+                    validate_text = _content(resp)
+                    prior["validate"] = validate_text
+                    validate_result = validate_text
+                    storage.log_event(conn, "validate_result", {"preview_url": preview_url, "raw_len": len(validate_text)})
+                    log.info("[validate] complete — %d chars output", len(validate_text))
+                else:
+                    log.warning("[validate] preview URL not available — skipping validation")
+                    storage.log_event(conn, "validate_skipped", {"reason": "preview_url_timeout"})
+            except Exception as ve:
+                log.warning("[validate] phase failed (non-blocking): %s", ve)
+                storage.log_event(conn, "validate_error", {"error": str(ve)})
+        else:
+            log.info("[validate] no UI changes detected — skipping validation")
+            storage.log_event(conn, "validate_skipped", {"reason": "no_ui_changes"})
+
         storage.finish_run(conn, "ok", total_cost=spent, branch=branch)
-        return {"status": "ok", "pr_url": pr["url"], "spent_usd": spent, "run_id": run_id}
+        result = {"status": "ok", "pr_url": pr["url"], "spent_usd": spent, "run_id": run_id}
+        if validate_result:
+            result["validate"] = validate_result
+        return result
 
     except GateFailure as e:
         log.error("gate failure: %s", e)

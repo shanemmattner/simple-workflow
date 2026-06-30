@@ -56,6 +56,10 @@ phases:
   - name: review
     model: m3
     max_turns: 5
+  - name: validate
+    model: sonnet
+    max_turns: 10
+    optional: true  # skipped when no UI changes or no preview URL
   - name: improve
     model: m27hs
     max_turns: 5
