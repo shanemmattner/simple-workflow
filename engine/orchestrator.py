@@ -4,11 +4,12 @@ Wires source -> storage -> workspace -> runtime -> destination.
 Reads workflow.yaml for phase config (models, max_turns).
 
 Usage:
-    python -m engines.github_claude.orchestrator owner/repo 123 [--budget 2.00] [--model opus]
+    python -m engine owner/repo 123 [--budget 2.00] [--model opus]
 """
 from __future__ import annotations
 
-import argparse, glob, json, logging, os, sqlite3, subprocess, sys
+import argparse, glob, json, logging, os, re, sqlite3, subprocess, sys
+from datetime import date
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_EXCEPTION
 from pathlib import Path
 from typing import Any
@@ -18,8 +19,8 @@ from . import source, runtime, storage, workspace, destination, gates, validate
 from .learnings import capture_learnings, get_recent_learnings, format_learnings_for_prompt
 
 log = logging.getLogger(__name__)
-WORKFLOW_DIR = Path(__file__).resolve().parent.parent.parent / "workflows" / "issue-to-pr"
-WORKFLOWS_ROOT = Path(__file__).resolve().parent.parent.parent / "workflows"
+WORKFLOW_DIR = Path(__file__).resolve().parent.parent / "workflows" / "issue-to-pr"
+WORKFLOWS_ROOT = Path(__file__).resolve().parent.parent / "workflows"
 
 
 def _load_repo_context(worktree_path: str) -> str:
@@ -75,14 +76,31 @@ def _resolve_workflow_dir(workflow: str | None) -> Path:
 def _parse_triage_signal(text: str) -> str:
     """Parse triage output for PROCEED/SKIP/ESCALATE keywords.
 
-    Returns the first signal found (checked in priority order: ESCALATE, SKIP, PROCEED).
+    Strategy (priority order):
+    1. Look for the signal on its own line immediately after a '## Decision' header
+       (case-insensitive). This is the canonical structured format.
+    2. Fall back to the signal appearing as the sole word on its own line
+       (not embedded mid-sentence). Prevents "this will FAIL in CI" false-matches.
+
+    Returns the first signal found (ESCALATE > SKIP > PROCEED).
     Defaults to PROCEED if none found.
     """
-    text_upper = text.upper()
+    # Strategy 1: structured header match — "## Decision\nPROCEED"
+    header_match = re.search(
+        r"^##\s*decision\s*\n+\s*(PROCEED|SKIP|ESCALATE)\s*$",
+        text, re.IGNORECASE | re.MULTILINE,
+    )
+    if header_match:
+        signal = header_match.group(1).upper()
+        log.info("_parse_triage_signal: header match signal=%s", signal)
+        return signal
+
+    # Strategy 2: signal as sole word on its own line (priority: ESCALATE > SKIP > PROCEED)
     for signal in ("ESCALATE", "SKIP", "PROCEED"):
-        if signal in text_upper:
-            log.info("_parse_triage_signal: found signal=%s", signal)
+        if re.search(rf"^\s*{signal}\s*$", text, re.IGNORECASE | re.MULTILINE):
+            log.info("_parse_triage_signal: standalone-line match signal=%s", signal)
             return signal
+
     log.info("_parse_triage_signal: no explicit signal found — defaulting to PROCEED")
     return "PROCEED"
 
@@ -90,14 +108,31 @@ def _parse_triage_signal(text: str) -> str:
 def _parse_review_signal(text: str) -> str:
     """Parse review output for FAIL/WARN/PASS keywords.
 
-    Returns the first signal found (checked in priority order: FAIL, WARN, PASS).
+    Strategy (priority order):
+    1. Look for the signal on its own line immediately after a '## Verdict' header
+       (case-insensitive). This is the canonical structured format.
+    2. Fall back to the signal appearing as the sole word on its own line
+       (not embedded mid-sentence). Prevents "this will FAIL in CI" false-matches.
+
+    Returns the first signal found (FAIL > WARN > PASS).
     Defaults to PASS if none found.
     """
-    text_upper = text.upper()
+    # Strategy 1: structured header match — "## Verdict\nPASS"
+    header_match = re.search(
+        r"^##\s*verdict\s*\n+\s*(PASS|WARN|FAIL)\s*$",
+        text, re.IGNORECASE | re.MULTILINE,
+    )
+    if header_match:
+        signal = header_match.group(1).upper()
+        log.info("_parse_review_signal: header match signal=%s", signal)
+        return signal
+
+    # Strategy 2: signal as sole word on its own line (priority: FAIL > WARN > PASS)
     for signal in ("FAIL", "WARN", "PASS"):
-        if signal in text_upper:
-            log.info("_parse_review_signal: found signal=%s", signal)
+        if re.search(rf"^\s*{signal}\s*$", text, re.IGNORECASE | re.MULTILINE):
+            log.info("_parse_review_signal: standalone-line match signal=%s", signal)
             return signal
+
     log.info("_parse_review_signal: no explicit signal found — defaulting to PASS")
     return "PASS"
 
@@ -771,6 +806,11 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
         out = out.replace("{repo_context}", repo_context)
         out = out.replace("{prior_phases}", build_prior_text(prior))
         out = out.replace("{recent_learnings}", recent_learnings or "No prior learnings available.")
+        # Individual phase outputs for prompts that need to distinguish them
+        # e.g. {triage_output}, {execute_output}, {review_output}
+        if prior:
+            for phase_name, phase_text in prior.items():
+                out = out.replace(f"{{{phase_name}_output}}", phase_text)
         if extra:
             for k, v in extra.items():
                 out = out.replace(f"{{{k}}}", str(v))
@@ -1051,34 +1091,233 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
         conn.close()
 
 
+def run_ops_pipeline(workflow: str, task_description: str, *,
+                     model_override: str | None = None) -> dict:
+    """3-phase pipeline for operational (non-code) workflows that produce markdown deliverables.
+
+    Unlike run_domain_pipeline(), this function:
+    - Has no git worktree — agents run with cwd set to the workflow directory itself
+    - Uses {task_description} instead of {issue_body} in prompt templates
+    - Writes the execute phase output to work/outputs/<workflow>/<date>-<task_slug>.md
+    - No PR, no branch creation, no GitHub interaction
+    - No budget guard (ops tasks are typically cheap)
+    """
+    wf_dir = _resolve_workflow_dir(workflow)
+    pa_root = Path(__file__).resolve().parents[2]
+    log.info("run_ops_pipeline start workflow=%s wf_dir=%s task=%r pa_root=%s",
+             workflow, wf_dir, task_description[:80], pa_root)
+
+    wf_yaml = wf_dir / "workflow.yaml"
+    if wf_yaml.is_file():
+        wf = yaml.safe_load(wf_yaml.read_text())
+        log.info("loaded workflow.yaml from %s", wf_yaml)
+    else:
+        log.warning("no workflow.yaml in %s — using empty config", wf_dir)
+        wf = {}
+    pcfg = _phase_cfg(wf)
+
+    def load_prompt(phase: str) -> str:
+        prompt_path = wf_dir / "prompts" / f"{phase}.md"
+        if not prompt_path.is_file():
+            raise FileNotFoundError(
+                f"Prompt not found for phase '{phase}': {prompt_path}"
+            )
+        return prompt_path.read_text()
+
+    def build_prior_text(prior: dict) -> str:
+        if not prior:
+            return ""
+        return "\n\n---\n\n".join(
+            f"## {name} phase output\n\n{text}" for name, text in prior.items()
+        )
+
+    def render_ops(template: str, prior: dict, extra: dict | None = None) -> str:
+        out = template.replace("{task_description}", task_description)
+        # Also replace {issue_body} in case a shared template uses it
+        out = out.replace("{issue_body}", task_description)
+        out = out.replace("{prior_phases}", build_prior_text(prior))
+        # Individual phase outputs for prompts that need to distinguish them
+        # e.g. {triage_output}, {execute_output}, {review_output}
+        if prior:
+            for phase_name, phase_text in prior.items():
+                out = out.replace(f"{{{phase_name}_output}}", phase_text)
+        if extra:
+            for k, v in extra.items():
+                out = out.replace(f"{{{k}}}", str(v))
+        return out
+
+    # Slugify the task description for use in the output filename
+    task_slug = re.sub(r"[^a-z0-9]+", "-", task_description.lower()).strip("-")[:60]
+    today = date.today().isoformat()
+
+    # Fake repo/issue for storage compatibility (ops runs have no GitHub issue)
+    fake_repo = f"ops/{workflow}"
+    fake_issue = 0
+
+    db_path, conn = storage.create_run_db(fake_repo, fake_issue, model=model_override)
+    run_id = db_path.stem if hasattr(db_path, "stem") else str(db_path)
+    log.info("run_ops_pipeline run_id=%s", run_id)
+
+    prior: dict[str, str] = {}
+    spent: float = 0.0
+    cwd = str(wf_dir)
+
+    try:
+        # ---- Triage phase -------------------------------------------------------
+        triage_cfg = pcfg.get("triage", {"model": "sonnet", "max_turns": 10})
+        triage_model = _resolve_model(triage_cfg, model_override)
+        pid = _start_phase(conn, "triage", model=triage_model)
+        log.info("[ops/triage] start model=%s", triage_model)
+
+        triage_prompt = render_ops(load_prompt("triage"), prior)
+        triage_resp = runtime.call_agent(
+            triage_prompt, model=triage_model, cwd=cwd,
+            max_turns=triage_cfg.get("max_turns", 10),
+        )
+        triage_resp["_prompt"] = triage_prompt
+        _check_resp("triage", triage_resp)
+        _finish_phase(conn, pid, triage_resp)
+        spent += triage_resp["cost"]
+        triage_text = _content(triage_resp)
+        prior["triage"] = triage_text
+        storage.log_event(conn, "triage_complete", {
+            "cost": triage_resp["cost"], "content_len": len(triage_text),
+        })
+
+        triage_signal = _parse_triage_signal(triage_text)
+        log.info("[ops/triage] signal=%s spent=%.4f", triage_signal, spent)
+        storage.log_event(conn, "triage_signal", {"signal": triage_signal})
+
+        if triage_signal in ("SKIP", "ESCALATE"):
+            log.info("[ops/triage] early exit signal=%s", triage_signal)
+            storage.finish_run(conn, f"triage_{triage_signal.lower()}", total_cost=spent)
+            return {"status": f"triage_{triage_signal.lower()}", "spent_usd": spent, "run_id": run_id}
+
+        # ---- Execute phase -------------------------------------------------------
+        execute_cfg = pcfg.get("execute", {"model": "sonnet", "max_turns": 30})
+        execute_model = _resolve_model(execute_cfg, model_override)
+        pid = _start_phase(conn, "execute", model=execute_model)
+        log.info("[ops/execute] start model=%s prior_phases=%s", execute_model, list(prior.keys()))
+
+        execute_prompt = render_ops(load_prompt("execute"), prior)
+        execute_resp = runtime.call_agent(
+            execute_prompt, model=execute_model, cwd=cwd,
+            max_turns=execute_cfg.get("max_turns", 30),
+        )
+        execute_resp["_prompt"] = execute_prompt
+        _check_resp("execute", execute_resp)
+        _finish_phase(conn, pid, execute_resp)
+        spent += execute_resp["cost"]
+        execute_text = _content(execute_resp)
+        prior["execute"] = execute_text
+        storage.log_event(conn, "execute_complete", {
+            "cost": execute_resp["cost"], "content_len": len(execute_text),
+        })
+        log.info("[ops/execute] complete spent=%.4f content_len=%d", spent, len(execute_text))
+
+        # ---- Review phase -------------------------------------------------------
+        review_cfg = pcfg.get("review", {"model": "sonnet", "max_turns": 10})
+        review_model = _resolve_model(review_cfg, model_override)
+        pid = _start_phase(conn, "review", model=review_model)
+        log.info("[ops/review] start model=%s", review_model)
+
+        review_prompt = render_ops(load_prompt("review"), prior)
+        review_resp = runtime.call_agent(
+            review_prompt, model=review_model, cwd=cwd,
+            max_turns=review_cfg.get("max_turns", 10),
+        )
+        review_resp["_prompt"] = review_prompt
+        _finish_phase(conn, pid, review_resp)
+        spent += review_resp["cost"]
+        review_text = _content(review_resp)
+        prior["review"] = review_text
+        storage.log_event(conn, "review_complete", {
+            "cost": review_resp["cost"], "content_len": len(review_text),
+        })
+
+        review_signal = _parse_review_signal(review_text)
+        log.info("[ops/review] signal=%s spent=%.4f", review_signal, spent)
+        storage.log_event(conn, "review_signal", {"signal": review_signal})
+
+        # ---- Write output to file -----------------------------------------------
+        out_dir = pa_root / "work" / "outputs" / workflow
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{today}-{task_slug}.md"
+        out_path.write_text(execute_text)
+        log.info("[ops] output written to %s", out_path)
+        storage.log_event(conn, "output_written", {"path": str(out_path), "bytes": len(execute_text)})
+
+        storage.finish_run(conn, "ok", total_cost=spent)
+        result: dict = {
+            "status": "ok",
+            "output_path": str(out_path),
+            "spent_usd": spent,
+            "run_id": run_id,
+            "review_signal": review_signal,
+        }
+        log.info("run_ops_pipeline complete status=ok output=%s spent=%.4f review_signal=%s",
+                 out_path, spent, review_signal)
+        return result
+
+    except Exception as e:
+        log.exception("[ops] pipeline failed")
+        storage.finish_run(conn, "error", total_cost=spent)
+        storage.log_event(conn, "pipeline_error", {"error": str(e)})
+        return {"status": "error", "error": str(e), "spent_usd": spent, "run_id": run_id}
+    finally:
+        conn.close()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="github_claude: issue -> PR pipeline")
-    ap.add_argument("repo", help="owner/repo")
-    ap.add_argument("issue", type=int, help="Issue number")
+    ap.add_argument("repo", nargs="?", help="owner/repo (required for code workflows, optional for ops)")
+    ap.add_argument("issue", nargs="?", type=int, help="Issue number (required for code workflows)")
     ap.add_argument("--budget", type=float, default=None,
                     help="Max spend USD (default: 10.00 for domain workflows, 1.00 for generic)")
     ap.add_argument("--model", default=None, help="Override model for all phases")
     ap.add_argument("--repo-path", default=None, help="Local filesystem path to the repo (default: cwd)")
     ap.add_argument("--resume", default=None, help="Resume from a prior run DB path or run ID")
     ap.add_argument("--workflow", default=None,
-                    help="Domain workflow name (e.g., shftty-web, shftty-ios). "
-                         "If set, uses run_domain_pipeline() instead of run_pipeline().")
+                    help="Workflow name (e.g., shftty-web, cody-business). "
+                         "If the workflow.yaml has type: ops, uses run_ops_pipeline().")
+    ap.add_argument("--task", default=None,
+                    help="Task description for ops workflows (replaces GitHub issue number).")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 
+    # Detect ops workflow
     if args.workflow:
-        effective_budget = args.budget if args.budget is not None else 10.00
-        print(f"github_claude (domain): {args.repo}#{args.issue}  "
-              f"workflow={args.workflow}  budget=${effective_budget:.2f}")
-        result = run_domain_pipeline(
-            args.repo, args.issue,
-            workflow=args.workflow,
-            budget=effective_budget,
-            model_override=args.model,
-            repo_path=args.repo_path,
-        )
+        wf_yaml = _resolve_workflow_dir(args.workflow) / "workflow.yaml"
+        wf_type = None
+        if wf_yaml.is_file():
+            wf_cfg = yaml.safe_load(wf_yaml.read_text()) or {}
+            wf_type = wf_cfg.get("type")
+
+        if wf_type == "ops" or args.task:
+            if not args.task:
+                ap.error("--task is required for ops workflows")
+            print(f"github_claude (ops): workflow={args.workflow}  task={args.task!r}")
+            result = run_ops_pipeline(
+                args.workflow, args.task,
+                model_override=args.model,
+            )
+        else:
+            if args.repo is None or args.issue is None:
+                ap.error("repo and issue are required for code workflows")
+            effective_budget = args.budget if args.budget is not None else 10.00
+            print(f"github_claude (domain): {args.repo}#{args.issue}  "
+                  f"workflow={args.workflow}  budget=${effective_budget:.2f}")
+            result = run_domain_pipeline(
+                args.repo, args.issue,
+                workflow=args.workflow,
+                budget=effective_budget,
+                model_override=args.model,
+                repo_path=args.repo_path,
+            )
     else:
+        if args.repo is None or args.issue is None:
+            ap.error("repo and issue are required")
         effective_budget = args.budget if args.budget is not None else 1.00
         print(f"github_claude: {args.repo}#{args.issue}  budget=${effective_budget:.2f}")
         result = run_pipeline(args.repo, args.issue, budget=effective_budget,
@@ -1087,7 +1326,7 @@ def main() -> None:
 
     print(f"\n{'='*50}")
     for k, label in [("status","Status"), ("spent_usd","Cost"), ("pr_url","PR"),
-                     ("review_signal","Review"), ("error","Error")]:
+                     ("output_path","Output"), ("review_signal","Review"), ("error","Error")]:
         v = result.get(k)
         if v is not None:
             print(f"  {label}: {'${:.4f}'.format(v) if k == 'spent_usd' else v}")

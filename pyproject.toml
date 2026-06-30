@@ -14,7 +14,7 @@ openhands = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["engines*"]
+include = ["engines*", "engine*"]
 
 [project.scripts]
 sw = "engines.github_claude.orchestrator:main"

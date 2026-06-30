@@ -1,0 +1,58 @@
+name: shftty-web
+description: Domain-specific workflow for the shftty healthcare staffing web app. 5 phases with markdown output and keyword-based decision signals.
+
+budget:
+  max_per_run_usd: 10.00
+
+phases:
+  - name: triage
+    model: sonnet
+    max_turns: 30
+    prompt: prompts/triage.md
+    decision_signal:
+      section: "## Decision"
+      keywords:
+        proceed: "PROCEED"
+        skip: "SKIP:"
+        escalate: "ESCALATE:"
+    on_skip: post_issue_comment
+    on_escalate: post_issue_comment
+
+  - name: execute
+    model: sonnet
+    max_turns: 50
+    prompt: prompts/execute.md
+    requires: [triage]
+
+  - name: review
+    model: sonnet
+    max_turns: 20
+    prompt: prompts/review.md
+    requires: [triage, execute]
+    verdict_signal:
+      section: "## Verdict"
+      keywords:
+        pass: "PASS"
+        warn: "WARN"
+        fail: "FAIL"
+
+  - name: validate
+    model: sonnet
+    max_turns: 10
+    prompt: prompts/validate.md
+    optional: true
+    requires: [execute, review]
+
+  - name: improve
+    model: opus
+    max_turns: 30
+    prompt: prompts/improve.md
+    optional: true
+    requires: [triage, execute, review]
+
+template_variables:
+  - repo_context
+  - issue_body
+  - issue_number
+  - recent_learnings
+  - prior_phases

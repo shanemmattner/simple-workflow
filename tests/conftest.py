@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from engines.github_claude import storage
+from engine import storage
 
 
 @pytest.fixture()

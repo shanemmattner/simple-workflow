@@ -8,7 +8,7 @@ Pipeline that transforms GitHub issues into tested, reviewed PRs. Reads an issue
 # Claude engine (default)
 ./scripts/run.sh owner/repo#123
 ./scripts/run.sh owner/repo#123 --budget 2.00 --model opus
-python -m engines.github_claude owner/repo#123
+python -m engine owner/repo#123
 
 # Three-step engine (Claude subscription via CLI)
 ./scripts/run.sh owner/repo#123 --engine three-step
@@ -32,15 +32,15 @@ python3 -m pytest tests/
 
 ## Key Files
 
-- `engines/github_claude/orchestrator.py` -- CLI entry point, phase sequencing, context assembly
-- `engines/github_claude/source.py` -- fetches GitHub issues via `gh` CLI, posts status comments
-- `engines/github_claude/runtime.py` -- calls Claude CLI as subprocess, parses response JSON, tracks tokens/cost
-- `engines/github_claude/storage.py` -- per-run SQLite .db file (tables: run, phase, message, tool_call, event)
-- `engines/github_claude/workspace.py` -- git worktree lifecycle management
-- `engines/github_claude/destination.py` -- pushes branch and creates GitHub PR via `gh`
-- `engines/github_claude/gates.py` -- validation gates and post-phase checks
-- `engines/github_claude/eval.py` -- LLM-as-judge scoring, failure categorization (stubs)
-- `engines/github_claude/__main__.py` -- package entry point for `python -m engines.github_claude`
+- `engine/orchestrator.py` -- CLI entry point, phase sequencing, context assembly
+- `engine/source.py` -- fetches GitHub issues via `gh` CLI, posts status comments
+- `engine/runtime.py` -- calls Claude CLI as subprocess, parses response JSON, tracks tokens/cost
+- `engine/storage.py` -- per-run SQLite .db file (tables: run, phase, message, tool_call, event)
+- `engine/workspace.py` -- git worktree lifecycle management
+- `engine/destination.py` -- pushes branch and creates GitHub PR via `gh`
+- `engine/gates.py` -- validation gates and post-phase checks
+- `engine/eval.py` -- LLM-as-judge scoring, failure categorization (stubs)
+- `engine/__main__.py` -- package entry point for `python -m engine`
 - `engines/shared/` -- shared modules (source, storage, workspace, destination) used by three_step and github_minimax
 - `engines/three_step/claude_runtime.py` -- Claude CLI subscription runtime (wraps `claude` with --output-format json)
 - `engines/three_step/runtime.py` -- legacy OpenAI SDK agent loop against Z.ai (retained for reference, unused)
@@ -75,7 +75,7 @@ Three layers protect against hung `claude -p` processes:
 
 ## Important
 
-- `engines/github_claude/runs/` holds per-run `.db` files (gitignored). Each `.db` is self-contained -- full replay of every phase, message, tool call, and event.
+- `engine/runs/` holds per-run `.db` files (gitignored). Each `.db` is self-contained -- full replay of every phase, message, tool call, and event.
 - Prompts are frozen templates in `workflows/issue-to-pr/prompts/`. Change them deliberately. `system_prompt_hash` in phase logs links runs to exact prompt versions.
 - Target repos provide context via `.workflows/` (context.md, testing.md, knowledge/).
 - Three-step engine uses Claude CLI subscription (no API key needed — uses logged-in `claude` CLI). Default models: haiku (investigate/review), sonnet (implement). Override with `--model`.

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from engines.github_claude.gates import (
+from engine.gates import (
     check_test_command_allowed,
     run_phase_gates,
     validate_plan,

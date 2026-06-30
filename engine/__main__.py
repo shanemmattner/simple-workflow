@@ -1,8 +1,8 @@
 """CLI entry point for the github_claude engine.
 
 Usage:
-    python -m engines.github_claude owner/repo#123
-    python -m engines.github_claude owner/repo#123 --budget 2.00 --model opus
+    python -m engine owner/repo#123
+    python -m engine owner/repo#123 --budget 2.00 --model opus
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from pathlib import Path
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        prog="engines.github_claude",
+        prog="engine",
         description="GitHub issue -> tested PR pipeline (Claude engine)",
     )
     parser.add_argument("issue", help="Issue ref: owner/repo#NNN")
@@ -52,7 +52,7 @@ def main() -> None:
     owner, repo = parts
 
     # Import here to avoid top-level side effects
-    from engines.github_claude.orchestrator import run_pipeline, run_domain_pipeline
+    from engine.orchestrator import run_pipeline, run_domain_pipeline
 
     print(f"github_claude: {owner}/{repo}#{issue_number}")
     print(f"  budget: ${args.budget:.2f}  model: {args.model}")

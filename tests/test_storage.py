@@ -6,7 +6,7 @@ import sqlite3
 
 import pytest
 
-from engines.github_claude import storage
+from engine import storage
 
 
 # ---------------------------------------------------------------------------

@@ -24,7 +24,7 @@ done
 
 case "$ENGINE" in
     claude)
-        MODULE="engines.github_claude.__main__"
+        MODULE="engine.__main__"
         ;;
     three-step)
         MODULE="engines.three_step.__main__"
