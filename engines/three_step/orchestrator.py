@@ -1142,40 +1142,15 @@ def _create_lesson_issue(
 """
 
     try:
-        result = subprocess.run(
-            [
-                "gh", "issue", "create",
-                "--repo", target_repo,
-                "--title", f"[pipeline-learning] {title}",
-                "--body", body,
-                "--label", "auto-generated",
-                "--label", "pipeline-learning",
-            ],
-            capture_output=True, text=True, timeout=30,
+        url = source.create_issue(
+            target_repo,
+            f"[pipeline-learning] {title}",
+            body,
+            labels=["auto-generated", "pipeline-learning"],
         )
-        if result.returncode == 0:
-            url = result.stdout.strip()
-            log.info("[learn] created issue: %s", url)
-            return url
-        else:
-            # Labels might not exist — retry without labels
-            log.warning("[learn] issue create failed (labels?), retrying without labels: %s", result.stderr.strip())
-            result = subprocess.run(
-                [
-                    "gh", "issue", "create",
-                    "--repo", target_repo,
-                    "--title", f"[pipeline-learning] {title}",
-                    "--body", body,
-                ],
-                capture_output=True, text=True, timeout=30,
-            )
-            if result.returncode == 0:
-                url = result.stdout.strip()
-                log.info("[learn] created issue (no labels): %s", url)
-                return url
-            log.warning("[learn] issue create failed: %s", result.stderr.strip())
-            return None
-    except Exception:
+        log.info("[learn] created issue: %s", url)
+        return url
+    except source.GitHubCLIError:
         log.exception("[learn] failed to create issue for lesson: %s", title)
         return None
 
@@ -1390,20 +1365,12 @@ def run_pipeline(
     run_id = os.path.splitext(os.path.basename(db_path))[0]
 
     # Check for existing PR on this issue before doing any work
-    try:
-        pr_check = subprocess.run(
-            ["gh", "pr", "list", "--repo", repo, "--search", f"issue {issue_number}", "--state", "open", "--json", "number,title,url"],
-            capture_output=True, text=True, timeout=15,
-        )
-        if pr_check.returncode == 0 and pr_check.stdout.strip() not in ("", "[]"):
-            existing_prs = json.loads(pr_check.stdout)
-            if existing_prs:
-                urls = ", ".join(p.get("url", "") for p in existing_prs)
-                log.warning("[pre-check] open PR(s) already exist for issue #%d: %s — aborting", issue_number, urls)
-                conn.close()
-                return {"status": "skipped", "error": f"Open PR already exists: {urls}", "spent_usd": 0.0, "run_id": run_id}
-    except Exception:
-        log.warning("[pre-check] failed to check for existing PRs, continuing anyway")
+    existing_prs = source.find_open_prs_for_issue(repo, issue_number)
+    if existing_prs:
+        urls = ", ".join(p.get("url", "") for p in existing_prs)
+        log.warning("[pre-check] open PR(s) already exist for issue #%d: %s — aborting", issue_number, urls)
+        conn.close()
+        return {"status": "skipped", "error": f"Open PR already exists: {urls}", "spent_usd": 0.0, "run_id": run_id}
 
     # Set up workspace
     run_start = datetime.now()

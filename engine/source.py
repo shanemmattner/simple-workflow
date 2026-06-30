@@ -152,3 +152,63 @@ def update_labels(
             "--repo", repo,
             "--remove-label", ",".join(remove),
         ])
+
+
+def create_issue(
+    repo: str,
+    title: str,
+    body: str,
+    labels: list[str] | None = None,
+) -> str:
+    """Create a new GitHub issue via ``gh issue create``.
+
+    If creation with labels fails (e.g. the labels don't exist on the
+    target repo), retries once without labels before giving up.
+
+    Returns the new issue's URL.
+
+    Raises GitHubCLIError if both attempts fail.
+    """
+    args = ["issue", "create", "--repo", repo, "--title", title, "--body", body]
+    for label in labels or []:
+        args += ["--label", label]
+
+    try:
+        result = _run_gh(args, timeout=30)
+        return result.stdout.strip()
+    except GitHubCLIError as exc:
+        if not labels:
+            raise
+        log.warning(
+            "issue create failed for %s (labels=%s), retrying without labels: %s",
+            repo, labels, exc,
+        )
+        result = _run_gh(
+            ["issue", "create", "--repo", repo, "--title", title, "--body", body],
+            timeout=30,
+        )
+        return result.stdout.strip()
+
+
+def find_open_prs_for_issue(repo: str, issue_number: int) -> list[dict]:
+    """Search for open PRs referencing *issue_number* in *repo*.
+
+    Returns a list of dicts with keys: number, title, url. Empty list if
+    none found or the search itself fails (treated as "no PR found").
+    """
+    try:
+        result = _run_gh([
+            "pr", "list",
+            "--repo", repo,
+            "--search", f"issue {issue_number}",
+            "--state", "open",
+            "--json", "number,title,url",
+        ], timeout=15)
+    except GitHubCLIError:
+        log.warning("Failed to search for existing PRs on %s issue #%d", repo, issue_number)
+        return []
+
+    try:
+        return json.loads(result.stdout) or []
+    except json.JSONDecodeError:
+        return []
