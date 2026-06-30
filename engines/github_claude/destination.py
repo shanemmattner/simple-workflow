@@ -56,7 +56,7 @@ def create_pr(
     branch: str,
     title: str,
     body: str,
-    base: str = "dev",
+    base: str = "main",
 ) -> dict:
     """Create a GitHub PR via ``gh pr create``.
 
