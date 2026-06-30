@@ -32,8 +32,10 @@ python -m engines.three_step owner/repo#123 --model opus  # override all phases
 ## Test
 
 ```bash
-python3 -m pytest tests/
+uv run --no-project pytest tests/
 ```
+
+The system Python may have a broken `embedded-agent-bridge` pytest plugin installed. `uv run --no-project` creates an isolated environment that avoids it.
 
 ## Key Files
 
