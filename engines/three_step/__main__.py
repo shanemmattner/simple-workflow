@@ -22,7 +22,19 @@ def main() -> None:
                         help="Override model for all phases (default: haiku for investigate/review, sonnet for implement)")
     parser.add_argument("--repo-path", default=None,
                         help="Local filesystem path to the repo (default: auto-detect)")
+    parser.add_argument("--phase-models", default=None,
+                        help="Per-phase model overrides, comma-separated: investigate=glm,implement=sonnet,review=haiku")
     args = parser.parse_args()
+
+    # Parse --phase-models into a dict
+    phase_models: dict[str, str] = {}
+    if args.phase_models:
+        for pair in args.phase_models.split(","):
+            pair = pair.strip()
+            if "=" not in pair:
+                parser.error(f"--phase-models: expected key=value pair, got {pair!r}")
+            k, v = pair.split("=", 1)
+            phase_models[k.strip()] = v.strip()
 
     # Parse repo#issue format
     if "#" not in args.issue:
@@ -42,13 +54,15 @@ def main() -> None:
 
     repo = f"{parts[0]}/{parts[1]}"
     print(f"three_step: {repo}#{issue_number}")
-    print(f"  budget: ${args.budget:.2f}  model: {args.model or 'default'}")
+    print(f"  budget: ${args.budget:.2f}  model: {args.model or 'default'}"
+          + (f"  phase-models: {phase_models}" if phase_models else ""))
 
     result = run_pipeline(
         repo, issue_number,
         budget=args.budget,
         model_override=args.model,
         repo_path=args.repo_path,
+        phase_models=phase_models,
     )
 
     print(f"\n{'=' * 60}")

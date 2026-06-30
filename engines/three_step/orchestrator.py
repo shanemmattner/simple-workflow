@@ -768,6 +768,13 @@ def _finish_phase(conn, phase_id: int, resp: dict | None, failed: bool = False) 
     )
 
 
+def _resolve_model(phase: str, model_override: str | None, phase_models: dict[str, str]) -> str | None:
+    """Return the effective model for a phase, applying priority:
+    phase_models[phase] > model_override > PHASE_MODELS default.
+    """
+    return phase_models.get(phase) or model_override
+
+
 def _call_agent(prompt: str, *, phase: str, cwd: str, model: str | None = None) -> dict:
     """Route to the correct backend based on model string."""
     effective_model = model or PHASE_MODELS.get(phase, "sonnet")
@@ -1360,11 +1367,16 @@ def run_pipeline(
     model_override: str | None = None,
     repo_path: str | None = None,
     review_retries: int = 1,
+    phase_models: dict[str, str] | None = None,
 ) -> dict:
     """Run the 3-step pipeline: investigate -> implement -> review+PR.
 
     Returns dict with keys: status, pr_url, spent_usd, run_id, error.
+
+    Model priority per phase:
+      phase_models[phase] > model_override > PHASE_MODELS default.
     """
+    phase_models = phase_models or {}
     model = model_override or "sonnet"
 
     # Fetch issue
@@ -1444,13 +1456,14 @@ def run_pipeline(
         # ---- Phase 1: Investigate ----
         current_phase = "investigate"
         log.info("[investigate] starting (max_turns=%d, model=%s)",
-                 PHASE_MAX_TURNS["investigate"], model_override or PHASE_MODELS["investigate"])
+                 PHASE_MAX_TURNS["investigate"],
+                 _resolve_model("investigate", model_override, phase_models) or PHASE_MODELS["investigate"])
         pid = _start_phase(conn, "investigate")
         prompt = INVESTIGATE_PROMPT.format(
             issue_number=issue_number, issue_body=issue_body,
         )
         resp = _call_agent(prompt, phase="investigate", cwd=wt,
-                          model=model_override)
+                          model=_resolve_model("investigate", model_override, phase_models))
         resp["_prompt"] = prompt
         spent += resp["cost"]
         _finish_phase(conn, pid, resp,
@@ -1511,7 +1524,8 @@ def run_pipeline(
         # ---- Phase 2: Implement ----
         current_phase = "implement"
         log.info("[implement] starting (max_turns=%d, model=%s)",
-                 PHASE_MAX_TURNS["implement"], model_override or PHASE_MODELS["implement"])
+                 PHASE_MAX_TURNS["implement"],
+                 _resolve_model("implement", model_override, phase_models) or PHASE_MODELS["implement"])
         pid = _start_phase(conn, "implement")
         prompt = IMPLEMENT_PROMPT.format(
             issue_number=issue_number,
@@ -1519,7 +1533,7 @@ def run_pipeline(
             investigation_report=investigation_report,
         )
         resp = _call_agent(prompt, phase="implement", cwd=wt,
-                          model=model_override)
+                          model=_resolve_model("implement", model_override, phase_models))
         resp["_prompt"] = prompt
         spent += resp["cost"]
         phase_stats["implement"] = {
@@ -1571,7 +1585,8 @@ def run_pipeline(
         current_phase = "review"
         diff = workspace.get_diff(wt)[:50_000]
         log.info("[review] starting (max_turns=%d, model=%s)",
-                 PHASE_MAX_TURNS["review"], model_override or PHASE_MODELS["review"])
+                 PHASE_MAX_TURNS["review"],
+                 _resolve_model("review", model_override, phase_models) or PHASE_MODELS["review"])
         pid = _start_phase(conn, "review")
         prompt = REVIEW_PROMPT.format(
             issue_number=issue_number,
@@ -1580,7 +1595,7 @@ def run_pipeline(
             diff=diff,
         )
         resp = _call_agent(prompt, phase="review", cwd=wt,
-                          model=model_override)
+                          model=_resolve_model("review", model_override, phase_models))
         resp["_prompt"] = prompt
         spent += resp["cost"]
         phase_stats["review"] = {
@@ -1652,7 +1667,7 @@ def run_pipeline(
                 rejected_diff=rejected_diff,
             )
             resp = _call_agent(retry_prompt, phase="implement", cwd=wt,
-                              model=model_override)
+                              model=_resolve_model("implement", model_override, phase_models))
             resp["_prompt"] = retry_prompt
             spent += resp["cost"]
             phase_stats[f"implement_retry_{review_attempt}"] = {
@@ -1697,7 +1712,7 @@ def run_pipeline(
                 diff=diff,
             )
             resp = _call_agent(prompt, phase="review", cwd=wt,
-                              model=model_override)
+                              model=_resolve_model("review", model_override, phase_models))
             resp["_prompt"] = prompt
             spent += resp["cost"]
             phase_stats[f"review_retry_{review_attempt}"] = {
