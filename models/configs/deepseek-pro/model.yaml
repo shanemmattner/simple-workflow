@@ -1,0 +1,13 @@
+# DeepSeek V4 Pro — via OpenRouter
+adapter: openrouter
+model_id: "deepseek/deepseek-v4-pro"
+base_url: "https://openrouter.ai/api/v1"
+api_key_env: OPENROUTER_API_KEY
+
+aliases:
+  - deepseek-pro
+
+pricing:
+  input_per_mtok: 2.00
+  output_per_mtok: 8.00
+  notes: "50% off during 16:30-00:30 UTC."

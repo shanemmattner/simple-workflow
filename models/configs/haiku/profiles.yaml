@@ -1,0 +1,27 @@
+# Claude Haiku sampling profiles
+default:
+  temperature: 1.0
+  max_tokens: 8192
+  strip_think_tags: false
+  checkpoint_interval: 5
+  budget_warning_turns: 7
+  budget_critical_turns: 3
+  max_turns:
+    investigate: 40
+    implement: 30
+    review: 25
+  system_prompt_suffix: ""
+
+coding:
+  max_tokens: 4096
+  max_turns:
+    investigate: 20
+    implement: 20
+    review: 15
+
+fast:
+  max_tokens: 2048
+  max_turns:
+    investigate: 10
+    implement: 15
+    review: 8

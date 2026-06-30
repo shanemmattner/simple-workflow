@@ -1,0 +1,15 @@
+# Claude Sonnet — Claude CLI subscription (no API key, uses logged-in `claude`)
+adapter: anthropic_cli
+model_id: sonnet
+# No base_url or api_key — anthropic_cli adapter wraps `claude -p` subprocess
+
+aliases:
+  - sonnet
+  - claude-sonnet
+  - claude
+
+pricing:
+  subscription: true
+  input_per_mtok: 3.00         # nominal; real cost is Claude Max subscription
+  output_per_mtok: 15.00
+  notes: "Claude Max $200/mo subscription. Reserve for interactive sessions and high-quality pipeline phases."

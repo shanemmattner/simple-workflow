@@ -1,0 +1,30 @@
+# Base profile defaults — inherited by all model profiles unless overridden.
+# Merge order: _base/default → <model>/default → <model>/<named_profile>
+default:
+  temperature: 0.7
+  top_p: 1.0
+  max_tokens: null              # let API decide
+  strip_think_tags: false
+  system_prompt_suffix: ""
+  checkpoint_interval: 5
+  budget_warning_turns: 7
+  budget_critical_turns: 3
+  max_turns: {}                 # empty = use orchestrator defaults
+
+coding:
+  # Designed for code generation and editing. Lower temperature for precision.
+  temperature: 0.2
+  top_p: 0.95
+
+creative:
+  # For tasks where variety and open-ended output is desired.
+  temperature: 0.9
+  top_p: 0.95
+
+fast:
+  # Minimal token budget. For triage, classification, simple lookups.
+  max_tokens: 4096
+  max_turns:
+    investigate: 10
+    implement: 15
+    review: 8

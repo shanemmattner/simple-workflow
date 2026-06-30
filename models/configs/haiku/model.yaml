@@ -1,0 +1,14 @@
+# Claude Haiku — Claude CLI subscription (no API key, uses logged-in `claude`)
+adapter: anthropic_cli
+model_id: haiku
+# No base_url or api_key — anthropic_cli adapter wraps `claude -p` subprocess
+
+aliases:
+  - haiku
+  - claude-haiku
+
+pricing:
+  subscription: true
+  input_per_mtok: 0.80         # nominal; real cost is Claude Max subscription
+  output_per_mtok: 4.00
+  notes: "Claude Max subscription. Use for quick lookups, triage, classification, bulk scouts."

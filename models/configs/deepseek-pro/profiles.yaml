@@ -1,0 +1,34 @@
+# DeepSeek V4 Pro sampling profiles
+# Same think-tag behavior as Flash but more capable — gets slightly more turns.
+default:
+  temperature: 0.3
+  top_p: 0.95
+  max_tokens: 8192
+  strip_think_tags: true
+  checkpoint_interval: 5
+  budget_warning_turns: 8
+  budget_critical_turns: 4
+  max_turns:
+    investigate: 25
+    implement: 30
+    review: 20
+  system_prompt_suffix: |
+    IMPORTANT CONSTRAINTS:
+    - Output plain text only. Do NOT wrap your reasoning in <think> or any XML tags.
+    - Be concise. Read only the files you need.
+    - When you have enough information, STOP and write your answer.
+
+coding:
+  temperature: 0.1
+  max_turns:
+    investigate: 20
+    implement: 25
+    review: 15
+
+fast:
+  temperature: 0.3
+  max_tokens: 4096
+  max_turns:
+    investigate: 15
+    implement: 20
+    review: 10

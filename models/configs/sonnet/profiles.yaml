@@ -1,0 +1,27 @@
+# Claude Sonnet sampling profiles
+default:
+  temperature: 1.0             # Claude ignores temperature when thinking is enabled
+  max_tokens: 16384
+  strip_think_tags: false      # Claude thinking blocks are structured, not leaked
+  checkpoint_interval: 5
+  budget_warning_turns: 7
+  budget_critical_turns: 3
+  max_turns:
+    investigate: 40
+    implement: 30
+    review: 25
+  system_prompt_suffix: ""     # Claude follows instructions well; no suppression needed
+
+coding:
+  max_tokens: 8192
+  max_turns:
+    investigate: 25
+    implement: 25
+    review: 20
+
+fast:
+  max_tokens: 4096
+  max_turns:
+    investigate: 15
+    implement: 20
+    review: 10

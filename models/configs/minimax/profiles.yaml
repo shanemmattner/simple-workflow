@@ -1,0 +1,31 @@
+# MiniMax M3 sampling profiles
+# Note: MINIMAX_STRIP_THINK_TAGS env var (default true) controls strip_think_tags at runtime
+default:
+  temperature: 0.0             # Required for stable tool use
+  top_p: 0.95
+  max_tokens: 16384
+  strip_think_tags: true       # env MINIMAX_STRIP_THINK_TAGS=false to disable
+  checkpoint_interval: 4
+  budget_warning_turns: 8
+  budget_critical_turns: 4
+  max_turns:
+    investigate: 20
+    implement: 25
+    review: 15
+  system_prompt_suffix: ""
+
+coding:
+  temperature: 0.0
+  max_tokens: 8192
+  max_turns:
+    investigate: 15
+    implement: 20
+    review: 12
+
+fast:
+  temperature: 0.0
+  max_tokens: 4096
+  max_turns:
+    investigate: 10
+    implement: 15
+    review: 8

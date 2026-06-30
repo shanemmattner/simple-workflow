@@ -1,0 +1,19 @@
+# GLM 5.2 — Z.ai Coding Plan subscription endpoint
+adapter: zai
+model_id: glm-5.2
+base_url: "https://api.z.ai/api/coding/paas/v4"
+api_key_env: ZAI_API_KEY
+api_key_env_fallbacks:
+  - GLM_API_KEY
+api_key_zshrc_fallback: true   # parse ~/.zshrc if env var unset
+
+aliases:
+  - glm
+  - glm-5.2
+  - glm-4.7
+
+pricing:
+  subscription: true           # use-it-or-lose-it quota — not pay-as-you-go
+  input_per_mtok: 1.40         # nominal; real cost is subscription floor
+  output_per_mtok: 4.40
+  notes: "Z.ai Coding Plan. 5-hr window + weekly quota. Use aggressively."

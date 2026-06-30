@@ -1,0 +1,26 @@
+# Qwen3.6-35B — local MLX server on Mac Studio
+adapter: openai
+model_id: qwen3.6-35b-mlx
+base_url: "http://localhost:8803/v1"
+api_key: "local"              # MLX server accepts any non-empty string
+api_key_env: null             # no env var needed
+
+aliases:
+  - qwen
+  - qwen-local
+  - qwen3.6
+
+pricing:
+  input_per_mtok: 0.00        # free — local hardware
+  output_per_mtok: 0.00
+  notes: "On-demand only. Start: launchctl bootstrap ~/Library/LaunchAgents/com.shanemmattner.rapid-mlx-8803.plist. Check: curl http://localhost:8803/v1/models"
+
+availability:
+  on_demand: true             # not auto-started — must be launched manually
+  check_url: "http://localhost:8803/v1/models"
+
+thinking:
+  supported: true
+  mechanism: chat_template_kwargs
+  enable_key: enable_thinking
+  notes: "Qwen3 hybrid mode. Pass chat_template_kwargs={enable_thinking: false} to disable."

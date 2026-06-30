@@ -1,0 +1,14 @@
+# Claude Opus — Claude CLI subscription (no API key, uses logged-in `claude`)
+adapter: anthropic_cli
+model_id: opus
+# No base_url or api_key — anthropic_cli adapter wraps `claude -p` subprocess
+
+aliases:
+  - opus
+  - claude-opus
+
+pricing:
+  subscription: true
+  input_per_mtok: 15.00        # nominal; real cost is Claude Max subscription
+  output_per_mtok: 75.00
+  notes: "Claude Max subscription. Reserve for complex multi-step tasks and architecture decisions."

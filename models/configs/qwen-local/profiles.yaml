@@ -1,0 +1,43 @@
+# Qwen3.6-35B local MLX sampling profiles
+# WARNING: temperature=0 causes repetition loops on Qwen3 MoE — keep >= 0.3
+default:
+  temperature: 0.6            # Qwen3 MoE: avoid greedy decoding (causes repetition loops)
+  top_p: 0.95
+  max_tokens: 8192
+  strip_think_tags: true      # Qwen3 emits <think> blocks in hybrid mode
+  checkpoint_interval: 5
+  budget_warning_turns: 8
+  budget_critical_turns: 4
+  max_turns:
+    investigate: 20
+    implement: 25
+    review: 15
+  system_prompt_suffix: |
+    IMPORTANT CONSTRAINTS:
+    - Output plain text only. Do NOT wrap your reasoning in <think> or any XML tags.
+    - Be concise. Read only the files you need.
+    - When you have enough information, STOP and write your answer.
+    - You have a strict turn budget. Do not waste turns.
+
+no_thinking:
+  # For tasks where think-block overhead is not wanted
+  temperature: 0.6
+  chat_template_kwargs:
+    enable_thinking: false
+  strip_think_tags: false     # nothing to strip when thinking is off
+
+coding:
+  temperature: 0.3            # More deterministic for code generation (floor — do not go lower)
+  max_tokens: 8192
+  max_turns:
+    investigate: 15
+    implement: 20
+    review: 12
+
+fast:
+  temperature: 0.6
+  max_tokens: 4096
+  max_turns:
+    investigate: 10
+    implement: 15
+    review: 8

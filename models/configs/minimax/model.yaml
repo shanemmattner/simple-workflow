@@ -1,0 +1,20 @@
+# MiniMax M3 (primary) and M2.7-highspeed (via resolve_auto in adapter)
+adapter: minimax
+model_id: MiniMax-M3
+base_url: "https://api.minimax.io/v1"
+api_key_env: MINIMAX_API_KEY
+api_key_zshrc_fallback: true
+
+aliases:
+  - minimax
+  - m3
+  - minimax-m3
+  - m27hs
+  - minimax-m2.7-highspeed
+
+pricing:
+  input_per_mtok: 0.30
+  output_per_mtok: 1.20
+  notes: "Standard tier (<=512k context). >512k tier: $0.60/$2.40. M2.7-highspeed: $0.20/$0.80."
+
+task_routing_supported: true   # adapter resolve_auto() picks M3 vs M2.7-highspeed by task type

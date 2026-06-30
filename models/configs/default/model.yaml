@@ -1,0 +1,12 @@
+# Default model config — used as fallback when no specific model config exists.
+# No specific adapter — the orchestrator falls through to openrouter for unknowns.
+adapter: openrouter
+model_id: default
+
+aliases:
+  - default
+
+pricing:
+  input_per_mtok: 1.40
+  output_per_mtok: 4.40
+  notes: "Nominal pricing for unknown models. Actual cost depends on resolved model."
