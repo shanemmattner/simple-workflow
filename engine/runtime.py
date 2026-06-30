@@ -180,17 +180,17 @@ def call_agent(
                 system_prompt=effective_system_prompt,
             )
         else:
+            # MINIMAX_API_KEY missing: the scripts/minimax.py text-only fallback
+            # ALSO requires this key (and the script itself isn't shipped — see
+            # _MINIMAX_SCRIPT), so it cannot rescue this call. Fall back to
+            # sonnet with full tool use rather than crashing the phase outright.
             log.warning(
-                "call_agent: MINIMAX_API_KEY not set — falling back to scripts/minimax.py "
-                "(text-only, no tool use). Set MINIMAX_API_KEY to enable full tool use."
+                "call_agent: MINIMAX_API_KEY not set — model %r requires it and "
+                "has no working fallback. Falling back to sonnet for this call. "
+                "Set MINIMAX_API_KEY to enable MiniMax routing.",
+                model,
             )
-            return _call_minimax(
-                prompt,
-                model=resolved_model,
-                cwd=cwd,
-                timeout=timeout,
-                system_prompt=effective_system_prompt,
-            )
+            model = "sonnet"
 
     cmd = [
         "claude",
