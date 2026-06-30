@@ -3,8 +3,8 @@ name: shftty-ios
 description: Domain-specific workflow for the shftty iOS app (Swift/SwiftUI healthcare staffing)
 type: code
 
-repo: shanemmattner/shftty
-repo_path: repos/shftty
+repo: shanemmattner/shftty-ios
+repo_path: repos/shftty-ios
 
 budget:
   max_per_run_usd: 10.00

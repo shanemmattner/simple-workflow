@@ -3,8 +3,8 @@ name: shftty-android
 description: Domain-specific 5-phase workflow for the shftty Android app (Kotlin/Jetpack Compose healthcare staffing)
 type: code
 
-repo: shanemmattner/shftty
-repo_path: repos/shftty
+repo: shanemmattner/shftty-android
+repo_path: repos/shftty-android
 
 budget:
   max_per_run_usd: 10.00
