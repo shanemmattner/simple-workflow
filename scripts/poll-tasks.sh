@@ -22,7 +22,6 @@ LOG_FILE="$LOG_DIR/poll-tasks-${DATE_TAG}.log"
 PA_ROOT="${SW_PA_ROOT:-$HOME/pa/main}"
 BUDGET="${SW_BUDGET:-3.00}"
 INTERVAL="${SW_INTERVAL:-600}"
-DAILY_CAP="${SW_DAILY_CAP:-15.00}"
 ONCE=false
 
 [[ "${1:-}" == "--once" ]] && ONCE=true
@@ -64,14 +63,6 @@ frontmatter_get() {
 
 poll_once() {
     local found=0 skipped=0 processed=0
-
-    # Daily budget cap check
-    PROCESSED_TODAY="$(grep -c "pipeline exit_code" "$LOG_FILE" 2>/dev/null || true)"
-    SPENT_TODAY="$(echo "$PROCESSED_TODAY * $BUDGET" | bc 2>/dev/null || echo 0)"
-    if (( $(echo "$SPENT_TODAY >= $DAILY_CAP" | bc -l 2>/dev/null || echo 0) )); then
-        log "Daily budget cap reached (\$$SPENT_TODAY of \$$DAILY_CAP) — skipping remaining tasks"
-        return 0
-    fi
 
     log "Pulling latest PA repo at $PA_ROOT..."
     if ! git -C "$PA_ROOT" pull --ff-only >> "$LOG_FILE" 2>&1; then
