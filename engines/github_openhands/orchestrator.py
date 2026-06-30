@@ -86,16 +86,20 @@ def _content(resp: dict) -> str:
     """Extract content string from agent response (agents respond in prose)."""
     return resp["content"] if isinstance(resp["content"], str) else json.dumps(resp["content"])
 
-def _extract_json(prose: str, schema_hint: str, cwd: str) -> dict:
+def _extract_json(prose: str, schema_hint: str, cwd: str,
+                  model: str | None = None) -> dict:
     """Direct LLM call to extract structured data from prose. No agent needed."""
     from openhands.sdk import LLM
     from openhands.sdk.llm import Message, TextContent
 
     api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("LLM_API_KEY", "")
     base_url = os.environ.get("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
+    extract_model = model or os.environ.get("EXTRACT_JSON_MODEL", "deepseek/deepseek-v4-flash")
+
+    log.info("[_extract_json] model=%s input_len=%d", extract_model, len(prose))
 
     llm = LLM(
-        model="deepseek/deepseek-v4-flash",
+        model=extract_model,
         api_key=api_key,
         base_url=base_url,
     )
@@ -119,13 +123,18 @@ def _extract_json(prose: str, schema_hint: str, cwd: str) -> dict:
     if raw.strip().startswith("```"):
         raw = raw.strip().split("\n", 1)[1].rsplit("```", 1)[0]
     try:
-        return json.loads(raw)
+        result = json.loads(raw)
+        log.info("[_extract_json] extraction succeeded, keys=%s", list(result.keys()) if isinstance(result, dict) else type(result).__name__)
+        return result
     except json.JSONDecodeError:
         # Try to find JSON object in the text
         start = raw.find('{')
         end = raw.rfind('}')
         if start != -1 and end != -1:
-            return json.loads(raw[start:end + 1])
+            result = json.loads(raw[start:end + 1])
+            log.info("[_extract_json] extraction succeeded (fallback), keys=%s", list(result.keys()))
+            return result
+        log.warning("[_extract_json] extraction FAILED, raw[:200]=%s", raw[:200])
         raise
 
 def _start_phase(conn, name):
@@ -239,7 +248,7 @@ def run_pipeline(repo: str, issue_number: int, *,
         triage = _extract_json(triage_text, (
             '{"tasks": [{"id": 1, "title": "...", "target_files": [...], "depends_on": []}], '
             '"proof_type": "test_passes", "escalate": false}'
-        ), cwd=wt)
+        ), cwd=wt, model=model_override)
         log.info("extracted triage: %s", json.dumps(triage, indent=2)[:500])
         _run_gates(conn, "triage", triage, worktree_path=wt)
         tasks = triage.get("tasks", [])
@@ -258,7 +267,7 @@ def run_pipeline(repo: str, issue_number: int, *,
             '"files_checked": [...], "lines": "...", "current_state": "..."}], '
             '"buildable_count": 1, "refuted_count": 0, "stale_count": 0, '
             '"recommendation": "proceed"}'
-        ), cwd=wt)
+        ), cwd=wt, model=model_override)
         _run_gates(conn, "verify", verify)
         storage.log_event(conn, "verify_result", {
             "buildable": verify.get("buildable_count", 0),
@@ -325,7 +334,7 @@ def run_pipeline(repo: str, issue_number: int, *,
 
         wave_plan = _extract_json(wave_text, (
             '{"waves": [[1, 2], [3, 4]]}  -- list of lists, each inner list is task IDs in that wave'
-        ), cwd=wt)
+        ), cwd=wt, model=model_override)
         task_ids = [t["id"] for t in tasks]
         _run_gates(conn, "wave-planner", wave_plan,
                    task_ids=task_ids, max_parallel=max_par)
@@ -363,7 +372,7 @@ def run_pipeline(repo: str, issue_number: int, *,
             ["git", "status", "--porcelain"], cwd=wt, capture_output=True, text=True,
         ).stdout.strip()
         _commits = subprocess.run(
-            ["git", "log", "origin/dev..HEAD", "--oneline"], cwd=wt, capture_output=True, text=True,
+            ["git", "log", "origin/main..HEAD", "--oneline"], cwd=wt, capture_output=True, text=True,
         ).stdout.strip()
         if _porcelain:
             log.warning("execute phase left uncommitted changes — committing as safety net")
@@ -415,7 +424,7 @@ def run_pipeline(repo: str, issue_number: int, *,
                         '{"stale_claims": [], "missing_knowledge": [], "tool_suggestions": [], '
                         '"prompt_improvements": [], "preservations": [], '
                         '"score": {"triage": 0, "plan": 0, "execute": 0, "review": 0, "overall": 0}}'
-                    ), cwd=wt)
+                    ), cwd=wt, model=model_override)
                 storage.log_event(conn, "improvement_suggestions", improve_data)
                 log.info("[improve] score=%s", improve_data.get("score", {}))
             except (json.JSONDecodeError, Exception) as je:

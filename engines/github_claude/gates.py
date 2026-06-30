@@ -54,60 +54,88 @@ def check_test_command_allowed(command: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def validate_triage(output: dict, worktree_path: str) -> dict:
-    """Check triage output: task count, target-file existence (warning only)."""
+    """Check triage output: task count, target-file existence (warning only).
+
+    File existence below 50% is a WARNING, not a gate failure — create-file
+    tasks produce target_files that don't exist yet by design.
+    """
     tasks = output.get("tasks", [])
+    log.info("[gate/triage] checking %d task(s)", len(tasks))
 
     if len(tasks) > 5:
-        return {
-            "passed": False,
-            "reason": f"task count {len(tasks)} exceeds maximum of 5",
-        }
+        reason = f"task count {len(tasks)} exceeds maximum of 5"
+        log.warning("[gate/triage] FAIL: %s", reason)
+        return {"passed": False, "reason": reason}
 
     all_files: list[str] = []
     for task in tasks:
-        all_files.extend(task.get("target_files", []))
+        tf = task.get("target_files", [])
+        log.debug("[gate/triage] task %s target_files: %s", task.get("id"), tf)
+        all_files.extend(tf)
 
     if all_files:
         wt = Path(worktree_path)
-        existing = sum(1 for f in all_files if _file_exists_fuzzy(f, wt))
+        file_checks: list[tuple[str, bool]] = [
+            (f, _file_exists_fuzzy(f, wt)) for f in all_files
+        ]
+        existing = sum(1 for _, exists in file_checks if exists)
         ratio = existing / len(all_files)
+        log.info(
+            "[gate/triage] file existence: %d/%d (%.0f%%) — %s",
+            existing, len(all_files), ratio * 100,
+            "OK" if ratio >= 0.5 else "LOW (create-file tasks expected — warning only)",
+        )
+        for filepath, exists in file_checks:
+            log.debug("[gate/triage]   %s %s", "EXISTS" if exists else "ABSENT", filepath)
         if ratio < 0.5:
             log.warning(
-                "triage file existence low: %d/%d (%.0f%%) — verify phase will check claims",
+                "[gate/triage] triage file existence low: %d/%d (%.0f%%) — "
+                "this is normal for create-file issues; verify phase will confirm claims",
                 existing, len(all_files), ratio * 100,
             )
+    else:
+        log.info("[gate/triage] no target_files listed — skipping file existence check")
 
+    log.info("[gate/triage] PASS: triage output valid")
     return {"passed": True, "reason": "triage output valid"}
 
 
 def validate_verify(output: dict) -> dict:
     """Check verify output: verified_tasks present, valid statuses."""
     tasks = output.get("verified_tasks", [])
+    log.info("[gate/verify] checking %d verified_task(s)", len(tasks))
+
     if not tasks:
+        log.warning("[gate/verify] FAIL: verified_tasks is empty")
         return {"passed": False, "reason": "verified_tasks is empty"}
 
     valid_statuses = {"CONFIRMED", "REFUTED", "STALE", "PARTIAL"}
     for t in tasks:
         status = t.get("status", "").upper()
+        log.info(
+            "[gate/verify] task %s status=%s evidence=%r",
+            t.get("task_id"), status, t.get("evidence", "")[:120],
+        )
         if status not in valid_statuses:
-            return {
-                "passed": False,
-                "reason": f"task {t.get('task_id')} has invalid status: {t.get('status')!r}",
-            }
+            reason = f"task {t.get('task_id')} has invalid status: {t.get('status')!r}"
+            log.warning("[gate/verify] FAIL: %s", reason)
+            return {"passed": False, "reason": reason}
 
     recommendation = output.get("recommendation", "")
+    log.info("[gate/verify] recommendation=%r", recommendation)
     if recommendation not in ("proceed", "already_fixed", "needs_clarification"):
-        return {
-            "passed": False,
-            "reason": f"invalid recommendation: {recommendation!r}",
-        }
+        reason = f"invalid recommendation: {recommendation!r}"
+        log.warning("[gate/verify] FAIL: %s", reason)
+        return {"passed": False, "reason": reason}
 
+    log.info("[gate/verify] PASS: verify output valid")
     return {"passed": True, "reason": "verify output valid"}
 
 
 def validate_plan(output: dict, worktree_path: str) -> dict:
     """Check plan output: DAG acyclic, file paths plausible."""
     steps = output.get("steps", [])
+    log.info("[gate/plan] checking %d step(s)", len(steps))
 
     # DAG cycle detection (Kahn's algorithm)
     graph: dict[int, list[int]] = {}
@@ -138,8 +166,10 @@ def validate_plan(output: dict, worktree_path: str) -> dict:
                 queue.append(neighbor)
 
     if visited != len(step_ids):
+        log.warning("[gate/plan] FAIL: plan DAG contains a cycle (visited %d/%d nodes)", visited, len(step_ids))
         return {"passed": False, "reason": "plan DAG contains a cycle"}
 
+    log.info("[gate/plan] PASS: DAG acyclic (%d nodes)", len(step_ids))
     return {"passed": True, "reason": "plan output valid"}
 
 

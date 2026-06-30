@@ -53,20 +53,27 @@ _DEFAULT_MODEL = "MiniMax-M3"
 def _lookup_rc_env(var_names: list[str]) -> str | None:
     """Return the first matching var value from ~/.zshrc, or None.
 
-    Mirrors scripts/minimax.py lines 67-86 — some users store API keys in
-    ~/.zshrc rather than exporting them in their shell init. We parse that
-    file as a fallback when the env var is unset.
+    Canonical implementation — adapters/minimax.py imports this rather than
+    duplicating it. Some users store API keys in ~/.zshrc rather than
+    exporting them in their shell init. We parse that file as a fallback
+    when the env var is unset.
 
     Hardening (ENG-04): shell command-substitution markers (`$`, backticks,
-    parens) are rejected outright. See adapters/minimax.py for the full
-    rationale; the two regexes are intentionally identical.
+    parens) are rejected outright. A line whose value position contains any
+    of those characters is treated as not-a-key and skipped, even if the
+    regex would otherwise match. This blocks the attack where
+    `MINIMAX_API_KEY=$(cat ~/.ssh/id_rsa)` would have been captured
+    verbatim and forwarded as an HTTP Authorization header.
     """
     rcfile = Path.home() / ".zshrc"
+    log.debug("_lookup_rc_env: reading %s for vars %s", rcfile, var_names)
     if not rcfile.is_file():
+        log.debug("_lookup_rc_env: %s not found, skipping", rcfile)
         return None
     try:
         text = rcfile.read_text()
-    except OSError:
+    except OSError as e:
+        log.debug("_lookup_rc_env: could not read %s: %s", rcfile, e)
         return None
     # Match `export NAME=...` or bare `NAME=...` in a shell rcfile. Captures
     # the name in group 1 and the value in group 2 (strips surrounding quotes).
@@ -78,12 +85,15 @@ def _lookup_rc_env(var_names: list[str]) -> str | None:
     matches: dict[str, str] = {}
     for m in _RC_VAR_RE.finditer(text):
         name, value = m.group(1), m.group(2)
+        # Per-line hardening: reject shell substitution markers
         if any(ch in value for ch in ("$", "`", "(", ")")):
             continue
         matches[name] = value
     for name in var_names:
         if name in matches:
+            log.debug("_lookup_rc_env: found %s in %s (len=%d)", name, rcfile, len(matches[name]))
             return matches[name]
+    log.debug("_lookup_rc_env: none of %s found in %s", var_names, rcfile)
     return None
 
 

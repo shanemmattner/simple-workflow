@@ -3,59 +3,8 @@
 from __future__ import annotations
 
 import os
-import re
-from pathlib import Path
 
 BASE_URL = "https://api.minimax.io/v1"
-
-
-def _lookup_rc_env(var_names: list[str]) -> str | None:
-    """Return the first matching var value from ~/.zshrc, or None.
-
-    Mirrors engines/github_minimax/runtime.py — some users store API keys
-    in ~/.zshrc rather than exporting them in their shell init. We parse
-    that file as a fallback when the env var is unset.
-
-    Hardening (ENG-04): shell command-substitution markers (`$`, backticks,
-    unmatched parens) are rejected outright. A line whose value position
-    contains any of those characters is treated as not-a-key and skipped,
-    even if the regex would otherwise match. This blocks the attack where
-    `MINIMAX_API_KEY=$(cat ~/.ssh/id_rsa)` would have been captured
-    verbatim and forwarded as an HTTP Authorization header (benign for
-    OpenAI, dangerous if any caller interpolates the value into a shell
-    command).
-    """
-    rcfile = Path.home() / ".zshrc"
-    if not rcfile.is_file():
-        return None
-    try:
-        text = rcfile.read_text()
-    except OSError:
-        return None
-    # Match `export NAME=...` or bare `NAME=...` in a shell rcfile. Captures
-    # the name in group 1 and the value in group 2 (strips surrounding quotes).
-    # The value class explicitly excludes `$`, backticks, and parens to
-    # reject command substitution at the regex level (defense in depth on
-    # top of the explicit per-line check below).
-    _RC_VAR_RE = re.compile(
-        r"""^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)\s*=\s*['"]?([^'"\s$`()#]+)['"]?\s*(?:#.*)?$""",
-        re.MULTILINE,
-    )
-    matches: dict[str, str] = {}
-    for m in _RC_VAR_RE.finditer(text):
-        name, value = m.group(1), m.group(2)
-        # Per-line hardening: even if the regex's value class was bypassed,
-        # reject any value containing shell substitution markers. This
-        # catches values like `$(...)`, `${...}`, or backtick blocks that
-        # somehow squeak past the character class (e.g. via quoting that
-        # the regex ate).
-        if any(ch in value for ch in ("$", "`", "(", ")")):
-            continue
-        matches[name] = value
-    for name in var_names:
-        if name in matches:
-            return matches[name]
-    return None
 
 
 def _resolve_api_key() -> str | None:
@@ -63,6 +12,10 @@ def _resolve_api_key() -> str | None:
     key = os.environ.get("MINIMAX_API_KEY")
     if key:
         return key
+    # Canonical implementation lives in engines/github_minimax/runtime.py.
+    # Import lazily to avoid a top-level circular import (runtime imports
+    # MODELS and resolve_model from this module).
+    from engines.github_minimax.runtime import _lookup_rc_env
     return _lookup_rc_env(["MINIMAX_API_KEY"])
 
 AVAILABLE_MODELS: set[str] = {

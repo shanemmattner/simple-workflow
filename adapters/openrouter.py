@@ -15,6 +15,7 @@ AVAILABLE_MODELS: set[str] = {
     "xiaomi/mimo-v2-flash:free",
     "mistralai/devstral-2512:free",
     "openai/gpt-oss-120b",
+    "z-ai/glm-5.2",
 }
 
 _SHORT_NAMES: dict[str, str] = {
@@ -27,6 +28,7 @@ _SHORT_NAMES: dict[str, str] = {
     "mimo": "xiaomi/mimo-v2-flash:free",
     "devstral": "mistralai/devstral-2512:free",
     "gpt-oss": "openai/gpt-oss-120b",
+    "glm-openrouter": "z-ai/glm-5.2",
 }
 
 

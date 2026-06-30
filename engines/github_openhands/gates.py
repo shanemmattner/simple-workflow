@@ -51,7 +51,12 @@ def check_test_command_allowed(command: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def validate_triage(output: dict, worktree_path: str) -> dict:
-    """Check triage output: task count, target-file existence."""
+    """Check triage output: task count, target-file existence.
+
+    File-existence check only applies to tasks whose proof_type is NOT
+    manual_verify — those tasks are creating new files (docs, configs,
+    etc.) that don't exist yet by definition.
+    """
     tasks = output.get("tasks", [])
 
     if len(tasks) > 5:
@@ -60,19 +65,22 @@ def validate_triage(output: dict, worktree_path: str) -> dict:
             "reason": f"task count {len(tasks)} exceeds maximum of 5",
         }
 
-    all_files: list[str] = []
+    # Collect files only from tasks that are modifying existing content.
+    # manual_verify tasks typically create new files — skip the existence check.
+    modify_files: list[str] = []
     for task in tasks:
-        all_files.extend(task.get("target_files", []))
+        if task.get("proof_type", "").lower() != "manual_verify":
+            modify_files.extend(task.get("target_files", []))
 
-    if all_files:
+    if modify_files:
         wt = Path(worktree_path)
-        existing = sum(1 for f in all_files if _file_exists_fuzzy(f, wt))
-        ratio = existing / len(all_files)
+        existing = sum(1 for f in modify_files if _file_exists_fuzzy(f, wt))
+        ratio = existing / len(modify_files)
         if ratio < 0.5:
             return {
                 "passed": False,
                 "reason": (
-                    f"only {existing}/{len(all_files)} target files exist "
+                    f"only {existing}/{len(modify_files)} target files exist "
                     f"({ratio:.0%} < 50% threshold)"
                 ),
             }

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 
 log = logging.getLogger(__name__)
@@ -101,6 +102,7 @@ def _run_openhands(
 
     # Late imports so the module loads even if openhands-sdk is not installed
     # (allows import-time checks and better error messages).
+    log.info("step 1/6: importing openhands-sdk")
     try:
         from openhands.sdk import LLM, Agent, Conversation, Tool
         from openhands.tools.file_editor import FileEditorTool
@@ -112,6 +114,7 @@ def _run_openhands(
             "Run: pip install -U openhands-sdk openhands-tools",
             elapsed,
         )
+    log.info("step 1/6: openhands-sdk imported OK (sdk present)")
 
     # --- Resolve API key ---
     # Prefer explicitly passed api_key (typically from adapter); fall back to env vars.
@@ -124,6 +127,7 @@ def _run_openhands(
             "or use the adapters layer",
             elapsed,
         )
+    log.info("step 2/6: API key resolved (len=%d)", len(api_key))
 
     # --- Determine base_url ---
     # Prefer explicitly passed base_url (typically from adapter); fall back to env vars.
@@ -143,6 +147,8 @@ def _run_openhands(
         model = "openai/" + model.removeprefix("anthropic/")
         log.info("LLM_BASE_URL set — rewrote model to %s for OpenAI-compat routing", model)
 
+    log.info("step 3/6: building LLM — model=%s base_url=%s", model, base_url)
+
     # --- Build LLM ---
     llm_kwargs: dict = {
         "model": model,
@@ -151,8 +157,10 @@ def _run_openhands(
     }
 
     llm = LLM(**llm_kwargs)
+    log.info("step 3/6: LLM built OK")
 
     # --- Build Agent ---
+    log.info("step 4/6: building Agent with tools=[terminal, file_editor]")
     agent = Agent(
         llm=llm,
         system_prompt=system_prompt,
@@ -161,8 +169,10 @@ def _run_openhands(
             Tool(name=FileEditorTool.name),
         ],
     )
+    log.info("step 4/6: Agent built OK")
 
     # --- Run Conversation ---
+    log.info("step 5/6: creating Conversation (workspace=%s, max_turns=%d)", cwd, max_turns)
     conversation = Conversation(
         agent=agent,
         workspace=cwd,
@@ -170,18 +180,52 @@ def _run_openhands(
     )
 
     conversation.send_message(prompt)
+    log.info("step 5/6: Conversation created, initial message sent (prompt_len=%d)", len(prompt))
 
     # Run the agent loop.  The SDK's run() may or may not accept a timeout
     # kwarg depending on version — handle both gracefully.
+    # For SDK versions that don't support timeout, we enforce it via threading.
     effective_timeout = float(timeout if timeout is not None else 600)
+    log.info("step 6/6: starting conversation.run() — timeout=%.0fs", effective_timeout)
+
+    # Threading-based timeout: works regardless of SDK version.
+    # The timer fires after effective_timeout seconds and raises in the main thread.
+    _timeout_hit = threading.Event()
+
+    def _timeout_cb() -> None:
+        _timeout_hit.set()
+        log.error(
+            "conversation.run() exceeded %.0fs timeout — raising in main thread", effective_timeout
+        )
+        import _thread
+        _thread.interrupt_main()  # sends KeyboardInterrupt to the main thread
+
+    _timer = threading.Timer(effective_timeout, _timeout_cb)
+    _timer.daemon = True
     try:
-        conversation.run(timeout=effective_timeout)
-    except TypeError:
-        # Older SDK versions don't accept timeout on run()
-        log.warning("conversation.run() does not accept timeout param, running without")
-        conversation.run()
+        _timer.start()
+        try:
+            conversation.run(timeout=effective_timeout)
+        except TypeError:
+            # Older SDK versions don't accept timeout on run() — use our timer instead
+            log.info(
+                "SDK v%s does not accept timeout param; using threading.Timer (%.0fs)",
+                getattr(__import__("openhands.sdk", fromlist=["__version__"]), "__version__", "?"),
+                effective_timeout,
+            )
+            conversation.run()
+        except KeyboardInterrupt:
+            if _timeout_hit.is_set():
+                elapsed = time.monotonic() - start
+                return _error_response(
+                    f"conversation.run() timed out after {effective_timeout:.0f}s", elapsed
+                )
+            raise
+    finally:
+        _timer.cancel()
 
     elapsed = time.monotonic() - start
+    log.info("step 6/6: conversation.run() completed in %.1fs", elapsed)
 
     # --- Extract results ---
     return _extract_response(conversation, llm, elapsed)

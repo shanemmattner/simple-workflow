@@ -7,6 +7,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -28,6 +29,13 @@ def main() -> None:
     parser.add_argument("--resume", default=None,
                         help="Resume from a prior run DB path or run ID")
     args = parser.parse_args()
+
+    # Configure logging so gate decisions and phase transitions appear on stdout
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        stream=sys.stdout,
+    )
 
     # Parse repo#issue format
     if "#" not in args.issue:

@@ -1531,6 +1531,46 @@ def run_pipeline(
                 log.warning("[investigate] finished with %s but has %d chars of content — continuing",
                             resp.get("finish_reason"), len(investigation_report))
 
+            # Guard: investigate is read-only. If the model committed during
+            # investigate (violating the "Do NOT make changes" instruction),
+            # reset those commits now so implement starts from a clean baseline.
+            # This prevents the implement gate from seeing investigate's commits
+            # as evidence that implement did work.
+            inv_commits_result = subprocess.run(
+                ["git", "log", "origin/main..HEAD", "--oneline"], cwd=wt,
+                capture_output=True, text=True,
+            )
+            inv_commits = inv_commits_result.stdout.strip()
+            inv_porcelain = subprocess.run(
+                ["git", "status", "--porcelain"], cwd=wt,
+                capture_output=True, text=True,
+            ).stdout.strip()
+
+            if inv_commits:
+                log.warning(
+                    "[investigate-guard] investigate phase made %d commit(s) — resetting to origin/main "
+                    "(prompt says 'Do NOT make changes'). Commits were: %s",
+                    len(inv_commits.splitlines()), inv_commits[:300],
+                )
+                storage.log_event(conn, "investigate_commits_reset", {
+                    "commits": inv_commits,
+                    "porcelain": inv_porcelain,
+                })
+                subprocess.run(
+                    ["git", "reset", "--hard", "origin/main"], cwd=wt, check=True,
+                )
+                log.info("[investigate-guard] reset complete — branch is now at origin/main")
+            elif inv_porcelain:
+                log.warning(
+                    "[investigate-guard] investigate left uncommitted changes — discarding: %r", inv_porcelain
+                )
+                storage.log_event(conn, "investigate_changes_discarded", {"porcelain": inv_porcelain})
+                subprocess.run(["git", "checkout", "--", "."], cwd=wt, check=True)
+                subprocess.run(["git", "clean", "-fd"], cwd=wt, check=True)
+                log.info("[investigate-guard] working tree cleaned")
+            else:
+                log.info("[investigate-guard] clean — no commits or changes from investigate phase")
+
         # ---- Phase 2: Implement ----
         current_phase = "implement"
         if not _phase_allowed("implement"):
@@ -1569,20 +1609,38 @@ def run_pipeline(
                 ["git", "status", "--porcelain"], cwd=wt,
                 capture_output=True, text=True,
             ).stdout.strip()
-            commits = subprocess.run(
-                ["git", "log", "origin/dev..HEAD", "--oneline"], cwd=wt,
+            log.info("[implement-gate] git status --porcelain: %r", porcelain)
+
+            # Check commits relative to origin/main (the true base branch set in
+            # workspace.create_workspace). Using origin/dev was a bug — it would
+            # miss commits that exist on main (including any made during investigate).
+            commits_result = subprocess.run(
+                ["git", "log", "origin/main..HEAD", "--oneline"], cwd=wt,
                 capture_output=True, text=True,
-            ).stdout.strip()
+            )
+            commits = commits_result.stdout.strip()
+            log.info("[implement-gate] git log origin/main..HEAD: %r (rc=%d stderr=%r)",
+                     commits, commits_result.returncode, commits_result.stderr.strip())
 
             if porcelain:
-                log.warning("implement phase left uncommitted changes -- safety-net commit")
+                log.warning("[implement-gate] uncommitted changes detected — safety-net commit: %r", porcelain)
                 subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
                 subprocess.run(
                     ["git", "commit", "-m", f"fix: resolve #{issue_number}"],
                     cwd=wt, check=True,
                 )
                 storage.log_event(conn, "safety_net_commit", {"files": porcelain})
-            elif not commits:
+                # Re-read commits after the safety-net commit
+                commits = subprocess.run(
+                    ["git", "log", "origin/main..HEAD", "--oneline"], cwd=wt,
+                    capture_output=True, text=True,
+                ).stdout.strip()
+                log.info("[implement-gate] commits after safety-net: %r", commits)
+            elif commits:
+                log.info("[implement-gate] PASS — %d commit(s) on branch: %s",
+                         len(commits.splitlines()), commits[:200])
+            else:
+                log.error("[implement-gate] FAIL — no commits on branch and no uncommitted files")
                 pipeline_outcome = "implement_failed"
                 pipeline_outcome_detail = (
                     "Implement phase produced no changes — "
