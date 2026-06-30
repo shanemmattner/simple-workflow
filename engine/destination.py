@@ -37,13 +37,30 @@ def push_branch(workspace_path: str, branch: str) -> None:
     Raises PushFailed on auth/network errors, BranchNotFound if the
     branch doesn't exist locally.
     """
-    # Verify the branch exists locally
-    check = subprocess.run(
-        ["git", "rev-parse", "--verify", branch],
+    # Verify we're on the expected branch.
+    # Use branch --show-current as the primary check (reliable in worktrees).
+    # Fall back to rev-parse --verify only when show-current disagrees.
+    # Log git stderr on failure so transient errors are diagnosable.
+    current_branch = subprocess.run(
+        ["git", "branch", "--show-current"],
         capture_output=True, text=True, cwd=workspace_path, timeout=10,
-    )
-    if check.returncode != 0:
-        raise BranchNotFound(f"branch {branch!r} not found in {workspace_path}")
+    ).stdout.strip()
+
+    if current_branch != branch:
+        check = subprocess.run(
+            ["git", "rev-parse", "--verify", branch],
+            capture_output=True, text=True, cwd=workspace_path, timeout=10,
+        )
+        if check.returncode != 0:
+            log.error(
+                "branch %r not found in %s: branch --show-current=%r rev-parse stderr=%s",
+                branch, workspace_path, current_branch, check.stderr.strip(),
+            )
+            raise BranchNotFound(f"branch {branch!r} not found in {workspace_path}")
+        log.warning(
+            "branch --show-current=%r but rev-parse --verify %r succeeded — proceeding with push",
+            current_branch, branch,
+        )
 
     result = subprocess.run(
         ["git", "push", "-u", "origin", branch],
