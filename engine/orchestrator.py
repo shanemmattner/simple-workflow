@@ -9,6 +9,7 @@ Usage:
 from __future__ import annotations
 
 import argparse, glob, json, logging, os, re, sqlite3, subprocess, sys
+from dataclasses import dataclass, field
 from datetime import date
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_EXCEPTION
 from pathlib import Path
@@ -21,6 +22,405 @@ from .learnings import capture_learnings, get_recent_learnings, format_learnings
 log = logging.getLogger(__name__)
 WORKFLOW_DIR = Path(__file__).resolve().parent.parent / "workflows" / "issue-to-pr"
 WORKFLOWS_ROOT = Path(__file__).resolve().parent.parent / "workflows"
+
+
+# ---------------------------------------------------------------------------
+# Step-by-step execution: dataclass, parser, helpers
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TriageStep:
+    number: int
+    title: str
+    files: list[str]
+    changes: str
+    verify: str
+    depends_on: list[int]
+    raw_text: str  # full markdown block for this step
+
+
+# Primary regex: match ### Step N: Title
+_STEP_HEADER_RE = re.compile(
+    r"^###\s+Step\s+(\d+)\s*:\s*(.+)$",
+    re.MULTILINE,
+)
+
+# Field extractors (within a step block)
+_FILES_RE = re.compile(r"^\*\*Files?:\*\*\s*(.+)$", re.MULTILINE)
+_CHANGES_RE = re.compile(r"^\*\*Changes?:\*\*\s*(.+(?:\n(?!\*\*).+)*)$", re.MULTILINE)
+_VERIFY_RE = re.compile(r"^\*\*Verify:\*\*\s*(.+(?:\n(?!\*\*).+)*)$", re.MULTILINE)
+_DEPENDS_RE = re.compile(r"^\*\*Depends?\s*on:\*\*\s*(.+)$", re.MULTILINE)
+
+
+def _parse_triage_steps(triage_text: str) -> list[TriageStep]:
+    """Parse numbered steps from triage output.
+
+    Returns an empty list if no steps found (single-step issue or
+    triage didn't use the step format). The orchestrator falls back
+    to monolithic execute in that case.
+    """
+    headers = list(_STEP_HEADER_RE.finditer(triage_text))
+    if not headers:
+        return []
+
+    steps: list[TriageStep] = []
+    for i, match in enumerate(headers):
+        number = int(match.group(1))
+        title = match.group(2).strip()
+
+        # Extract the block between this header and the next (or end)
+        start = match.end()
+        end = headers[i + 1].start() if i + 1 < len(headers) else len(triage_text)
+        block = triage_text[start:end]
+
+        # Parse fields
+        files_match = _FILES_RE.search(block)
+        files: list[str] = []
+        if files_match:
+            raw_files = files_match.group(1).strip()
+            # Handle comma-separated and newline-separated file lists
+            files = [f.strip().strip("`") for f in re.split(r"[,\n]", raw_files) if f.strip()]
+
+        changes_match = _CHANGES_RE.search(block)
+        changes = changes_match.group(1).strip() if changes_match else ""
+
+        verify_match = _VERIFY_RE.search(block)
+        verify = verify_match.group(1).strip() if verify_match else ""
+
+        depends_match = _DEPENDS_RE.search(block)
+        depends_on: list[int] = []
+        if depends_match:
+            dep_text = depends_match.group(1).strip().lower()
+            if dep_text not in ("none", "n/a", "-", ""):
+                # Extract step numbers: "Step 1", "Step 1, Step 2", "1, 2"
+                depends_on = [int(d) for d in re.findall(r"\d+", dep_text)]
+
+        steps.append(TriageStep(
+            number=number,
+            title=title,
+            files=files,
+            changes=changes,
+            verify=verify,
+            depends_on=depends_on,
+            raw_text=triage_text[match.start():end].strip(),
+        ))
+
+    log.info("_parse_triage_steps: found %d steps", len(steps))
+    return steps
+
+
+def _load_step_prompt(wf_dir: Path) -> str:
+    """Load the per-step execute prompt. Falls back to execute.md if absent."""
+    step_path = wf_dir / "prompts" / "execute-step.md"
+    if step_path.is_file():
+        return step_path.read_text()
+    # Fallback: wrap the monolithic execute.md with step context header
+    log.warning("no execute-step.md found in %s — using execute.md with step header", wf_dir)
+    execute_prompt = (wf_dir / "prompts" / "execute.md").read_text()
+    header = (
+        "## IMPORTANT: You are executing step {step_number} of {total_steps} ONLY.\n\n"
+        "**This step:** {step_title}\n"
+        "**Target files:** {step_files}\n"
+        "**What to change:** {step_changes}\n\n"
+        "Focus on this step only. Do not implement other steps.\n\n---\n\n"
+    )
+    return header + execute_prompt
+
+
+def _commit_step(
+    wt: str,
+    step_num: int,
+    step_title: str,
+    issue_number: int,
+    workflow: str,
+) -> list[str]:
+    """Git add + commit changes from a single step. Returns list of changed files.
+
+    Returns empty list if the step made no changes (no-op step).
+    """
+    porcelain = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=wt, capture_output=True, text=True,
+    ).stdout.strip()
+
+    if not porcelain:
+        log.info("[commit] step %d made no changes", step_num)
+        return []
+
+    # Parse changed files from porcelain output
+    files = [line[3:].strip().strip('"') for line in porcelain.splitlines() if line.strip()]
+
+    subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
+
+    # Sanitize title for commit message (no issue refs from triage)
+    safe_title = step_title[:60]
+    msg = f"feat(step-{step_num}): {safe_title} (#{issue_number})"
+
+    result = subprocess.run(
+        ["git", "commit", "-m", msg],
+        cwd=wt, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        # Commit failed — likely pre-commit hook
+        log.warning("[commit] step %d commit failed: %s", step_num, result.stderr[:300])
+        return []
+
+    log.info("[commit] step %d committed: %d files", step_num, len(files))
+    return files
+
+
+def _execute_steps(
+    steps: list[TriageStep],
+    *,
+    conn: sqlite3.Connection,
+    wf_dir: Path,
+    wt: str,
+    execute_cfg: dict,
+    execute_model: str,
+    issue_number: int,
+    issue_body: str,
+    triage_text: str,
+    repo_context: str,
+    recent_learnings: str,
+    workflow: str,
+    budget: float,
+    spent: float,
+) -> tuple[float, list[dict]]:
+    """Execute triage steps one at a time, committing after each.
+
+    Returns (updated_spent, step_results).
+    Raises on unrecoverable failure.
+    """
+    step_prompt_template = _load_step_prompt(wf_dir)
+    step_results: list[dict] = []
+
+    for step in steps:
+        step_num = step.number
+        phase_name = f"execute-step-{step_num}"
+
+        log.info("[domain/execute] step %d/%d start: %s",
+                 step_num, len(steps), step.title)
+
+        # Build per-step context: prior steps' summaries (not full triage)
+        prior_step_summaries = ""
+        for prev in step_results:
+            prior_step_summaries += (
+                f"\n### Step {prev['step_number']} result: {prev['status']}\n"
+                f"Files changed: {', '.join(prev.get('files_changed', []))}\n"
+                f"Summary: {prev.get('summary', 'completed')}\n"
+            )
+
+        # Render per-step prompt
+        step_prompt = step_prompt_template.replace("{step_number}", str(step_num))
+        step_prompt = step_prompt.replace("{step_title}", step.title)
+        step_prompt = step_prompt.replace("{step_files}", ", ".join(step.files) or "as needed")
+        step_prompt = step_prompt.replace("{step_changes}", step.changes)
+        step_prompt = step_prompt.replace("{step_verify}", step.verify)
+        step_prompt = step_prompt.replace("{prior_steps}", prior_step_summaries or "This is the first step.")
+        step_prompt = step_prompt.replace("{issue_number}", str(issue_number))
+        step_prompt = step_prompt.replace("{issue_body}", issue_body)
+        step_prompt = step_prompt.replace("{repo_context}", repo_context)
+        step_prompt = step_prompt.replace("{recent_learnings}", recent_learnings or "No prior learnings available.")
+        step_prompt = step_prompt.replace("{total_steps}", str(len(steps)))
+
+        # SQLite: start phase
+        pid = _start_phase(conn, phase_name, model=execute_model)
+
+        # Call agent with per-step timeout (300s = 5 min)
+        resp = runtime.call_agent(
+            step_prompt,
+            model=execute_model,
+            cwd=wt,
+            max_turns=execute_cfg.get("max_turns", 15),
+            timeout=300,
+        )
+        resp["_prompt"] = step_prompt
+
+        finish = resp.get("finish_reason", "unknown")
+        step_cost = resp.get("cost", 0)
+        step_duration = resp.get("duration_s", 0)
+        spent += step_cost
+
+        # Commit changes from this step
+        files_changed = _commit_step(wt, step_num, step.title, issue_number, workflow)
+
+        # Determine step status
+        if finish == "error":
+            status = "failed"
+            log.error("[domain/execute] step %d failed: %s",
+                      step_num, str(resp.get("content", ""))[:300])
+        elif finish == "timeout":
+            status = "timeout"
+            log.warning("[domain/execute] step %d timed out", step_num)
+        else:
+            status = "completed" if files_changed else "no_changes"
+
+        _finish_phase(conn, pid, resp, failed=(status == "failed"))
+
+        # Log step event
+        step_result = {
+            "step_number": step_num,
+            "title": step.title,
+            "status": status,
+            "cost": step_cost,
+            "duration_s": step_duration,
+            "files_changed": files_changed,
+            "summary": _content(resp)[:500] if resp.get("content") else "",
+        }
+        storage.log_event(conn, "step_complete", step_result)
+        step_results.append(step_result)
+
+        log.info("[domain/execute] step %d/%d %s cost=$%.4f duration=%.1fs files=%d",
+                 step_num, len(steps), status, step_cost, step_duration, len(files_changed))
+
+        # Failure handling
+        if status == "failed":
+            # Retry once
+            log.info("[domain/execute] retrying step %d", step_num)
+            pid2 = _start_phase(conn, f"{phase_name}-retry", model=execute_model)
+            retry_resp = runtime.call_agent(
+                step_prompt,
+                model=execute_model,
+                cwd=wt,
+                max_turns=execute_cfg.get("max_turns", 15),
+                timeout=300,
+            )
+            retry_resp["_prompt"] = step_prompt
+            retry_cost = retry_resp.get("cost", 0)
+            spent += retry_cost
+
+            retry_files = _commit_step(wt, step_num, step.title, issue_number, workflow)
+            retry_finish = retry_resp.get("finish_reason", "unknown")
+            retry_status = "completed" if retry_files else ("failed" if retry_finish == "error" else "no_changes")
+
+            _finish_phase(conn, pid2, retry_resp, failed=(retry_status == "failed"))
+
+            if retry_status == "failed":
+                # Halt pipeline — prior steps' commits are preserved
+                storage.log_event(conn, "step_halt", {
+                    "step_number": step_num,
+                    "reason": "retry_failed",
+                })
+                raise RuntimeError(
+                    f"Step {step_num} failed after retry: {step.title}. "
+                    f"Prior {len(step_results)-1} steps committed successfully."
+                )
+            else:
+                step_results[-1] = {
+                    **step_results[-1],
+                    "status": retry_status,
+                    "cost": step_cost + retry_cost,
+                    "files_changed": retry_files,
+                    "retried": True,
+                }
+
+        elif status == "timeout":
+            # Timeout: halt (do not retry — stall likely to recur)
+            storage.log_event(conn, "step_halt", {
+                "step_number": step_num,
+                "reason": "timeout",
+            })
+            raise RuntimeError(
+                f"Step {step_num} timed out: {step.title}. "
+                f"Prior {len(step_results)-1} steps committed successfully."
+            )
+
+        # Budget check after each step
+        if spent > budget:
+            log.warning("budget exceeded after step %d ($%.2f > $%.2f) — continuing to review",
+                        step_num, spent, budget)
+            break
+
+    return spent, step_results
+
+
+def _execute_ops_steps(
+    steps: list[TriageStep],
+    *,
+    conn: sqlite3.Connection,
+    wf_dir: Path,
+    cwd: str,
+    execute_cfg: dict,
+    execute_model: str,
+    task_description: str,
+    triage_text: str,
+    out_path: Path,
+) -> tuple[float, list[dict]]:
+    """Execute ops steps one at a time, appending to the output file.
+
+    Each step appends its output to out_path (the final deliverable).
+    """
+    step_prompt_template = _load_step_prompt(wf_dir)
+    step_results: list[dict] = []
+    spent = 0.0
+
+    # Initialize the output file
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(f"# {task_description}\n\n")
+
+    for step in steps:
+        step_num = step.number
+        phase_name = f"execute-step-{step_num}"
+
+        # Build per-step context
+        prior_step_summaries = ""
+        for prev in step_results:
+            prior_step_summaries += (
+                f"\n### Step {prev['step_number']} result: {prev['status']}\n"
+                f"Summary: {prev.get('summary', 'completed')}\n"
+            )
+
+        # Render prompt (ops steps use {task_description} instead of {issue_body})
+        step_prompt = step_prompt_template.replace("{step_number}", str(step_num))
+        step_prompt = step_prompt.replace("{step_title}", step.title)
+        step_prompt = step_prompt.replace("{step_files}", ", ".join(step.files) or "as needed")
+        step_prompt = step_prompt.replace("{step_changes}", step.changes)
+        step_prompt = step_prompt.replace("{step_verify}", step.verify)
+        step_prompt = step_prompt.replace("{prior_steps}", prior_step_summaries or "This is the first step.")
+        step_prompt = step_prompt.replace("{issue_body}", task_description)
+        step_prompt = step_prompt.replace("{issue_number}", "0")
+        step_prompt = step_prompt.replace("{repo_context}", "")
+        step_prompt = step_prompt.replace("{recent_learnings}", "No prior learnings available.")
+        step_prompt = step_prompt.replace("{total_steps}", str(len(steps)))
+
+        pid = _start_phase(conn, phase_name, model=execute_model)
+
+        resp = runtime.call_agent(
+            step_prompt,
+            model=execute_model,
+            cwd=cwd,
+            max_turns=execute_cfg.get("max_turns", 15),
+            timeout=300,
+        )
+        resp["_prompt"] = step_prompt
+
+        step_cost = resp.get("cost", 0)
+        spent += step_cost
+        step_text = _content(resp)
+
+        # Append step output to the deliverable file
+        with open(out_path, "a") as f:
+            f.write(f"\n\n## Step {step_num}: {step.title}\n\n{step_text}\n")
+
+        status = "completed" if resp.get("finish_reason") == "end_turn" else resp.get("finish_reason", "unknown")
+        _finish_phase(conn, pid, resp, failed=(status == "failed"))
+
+        step_result = {
+            "step_number": step_num,
+            "title": step.title,
+            "status": status,
+            "cost": step_cost,
+            "duration_s": resp.get("duration_s", 0),
+            "output_len": len(step_text),
+            "summary": step_text[:500],
+        }
+        storage.log_event(conn, "step_complete", step_result)
+        step_results.append(step_result)
+
+        log.info("[ops/execute] step %d/%d %s cost=$%.4f",
+                 step_num, len(steps), status, step_cost)
+
+    return spent, step_results
 
 
 def _load_repo_context(worktree_path: str) -> str:
@@ -881,27 +1281,62 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
         # ---- Execute phase -------------------------------------------------------
         execute_cfg = pcfg.get("execute", {"model": "sonnet", "max_turns": 30})
         execute_model = _resolve_model(execute_cfg, model_override)
-        pid = _start_phase(conn, "execute", model=execute_model)
-        log.info("[domain/execute] start model=%s prior_phases=%s", execute_model, list(prior.keys()))
 
-        execute_prompt = render_domain(
-            load_prompt("execute"), prior,
-            repo_context=repo_context, recent_learnings=recent_learnings_text,
-        )
-        execute_resp = runtime.call_agent(
-            execute_prompt, model=execute_model, cwd=wt,
-            max_turns=execute_cfg.get("max_turns", 30),
-        )
-        execute_resp["_prompt"] = execute_prompt
-        _check_resp("execute", execute_resp)
-        _finish_phase(conn, pid, execute_resp)
-        spent += execute_resp["cost"]
-        execute_text = _content(execute_resp)
-        prior["execute"] = execute_text
-        storage.log_event(conn, "execute_complete", {
-            "cost": execute_resp["cost"], "content_len": len(execute_text),
-        })
-        log.info("[domain/execute] complete spent=%.4f content_len=%d", spent, len(execute_text))
+        # Parse steps from triage output
+        steps = _parse_triage_steps(triage_text)
+
+        if steps:
+            log.info("[domain/execute] step mode: %d steps parsed from triage", len(steps))
+            spent, step_results = _execute_steps(
+                steps,
+                conn=conn,
+                wf_dir=wf_dir,
+                wt=wt,
+                execute_cfg=execute_cfg,
+                execute_model=execute_model,
+                issue_number=issue_number,
+                issue_body=issue_body,
+                triage_text=triage_text,
+                repo_context=repo_context,
+                recent_learnings=recent_learnings_text,
+                workflow=workflow,
+                budget=budget,
+                spent=spent,
+            )
+            prior["execute"] = json.dumps(step_results, indent=2)
+            storage.log_event(conn, "execute_complete", {
+                "mode": "step",
+                "total_steps": len(steps),
+                "completed_steps": sum(1 for r in step_results if r["status"] == "completed"),
+                "total_cost": sum(r["cost"] for r in step_results),
+            })
+        else:
+            # Fallback: monolithic execute (no steps parsed from triage)
+            log.warning("[domain/execute] no steps found in triage — falling back to monolithic execute")
+            pid = _start_phase(conn, "execute", model=execute_model)
+            log.info("[domain/execute] start model=%s prior_phases=%s", execute_model, list(prior.keys()))
+
+            execute_prompt = render_domain(
+                load_prompt("execute"), prior,
+                repo_context=repo_context, recent_learnings=recent_learnings_text,
+            )
+            execute_resp = runtime.call_agent(
+                execute_prompt, model=execute_model, cwd=wt,
+                max_turns=execute_cfg.get("max_turns", 30),
+            )
+            execute_resp["_prompt"] = execute_prompt
+            _check_resp("execute", execute_resp)
+            _finish_phase(conn, pid, execute_resp)
+            spent += execute_resp["cost"]
+            prior["execute"] = _content(execute_resp)
+            storage.log_event(conn, "execute_complete", {
+                "mode": "monolithic",
+                "cost": execute_resp["cost"],
+                "content_len": len(prior["execute"]),
+            })
+            log.info("[domain/execute] monolithic complete spent=%.4f content_len=%d",
+                     spent, len(prior["execute"]))
+
         _guard(spent, budget)
 
         # ---- Safety-net commit ---------------------------------------------------
@@ -1196,24 +1631,61 @@ def run_ops_pipeline(workflow: str, task_description: str, *,
         # ---- Execute phase -------------------------------------------------------
         execute_cfg = pcfg.get("execute", {"model": "sonnet", "max_turns": 30})
         execute_model = _resolve_model(execute_cfg, model_override)
-        pid = _start_phase(conn, "execute", model=execute_model)
-        log.info("[ops/execute] start model=%s prior_phases=%s", execute_model, list(prior.keys()))
 
-        execute_prompt = render_ops(load_prompt("execute"), prior)
-        execute_resp = runtime.call_agent(
-            execute_prompt, model=execute_model, cwd=cwd,
-            max_turns=execute_cfg.get("max_turns", 30),
-        )
-        execute_resp["_prompt"] = execute_prompt
-        _check_resp("execute", execute_resp)
-        _finish_phase(conn, pid, execute_resp)
-        spent += execute_resp["cost"]
-        execute_text = _content(execute_resp)
-        prior["execute"] = execute_text
-        storage.log_event(conn, "execute_complete", {
-            "cost": execute_resp["cost"], "content_len": len(execute_text),
-        })
-        log.info("[ops/execute] complete spent=%.4f content_len=%d", spent, len(execute_text))
+        # Parse steps from triage output
+        steps = _parse_triage_steps(triage_text)
+
+        # Pre-compute output path for ops step execution
+        out_dir = pa_root / "work" / "outputs" / workflow
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{today}-{task_slug}.md"
+
+        if steps:
+            log.info("[ops/execute] step mode: %d steps parsed from triage", len(steps))
+            ops_step_spent, step_results = _execute_ops_steps(
+                steps,
+                conn=conn,
+                wf_dir=wf_dir,
+                cwd=cwd,
+                execute_cfg=execute_cfg,
+                execute_model=execute_model,
+                task_description=task_description,
+                triage_text=triage_text,
+                out_path=out_path,
+            )
+            spent += ops_step_spent
+            prior["execute"] = json.dumps(step_results, indent=2)
+            storage.log_event(conn, "execute_complete", {
+                "mode": "step",
+                "total_steps": len(steps),
+                "completed_steps": sum(1 for r in step_results if r["status"] == "completed"),
+                "total_cost": ops_step_spent,
+            })
+        else:
+            # Fallback: monolithic execute (no steps parsed from triage)
+            log.warning("[ops/execute] no steps found in triage — falling back to monolithic execute")
+            pid = _start_phase(conn, "execute", model=execute_model)
+            log.info("[ops/execute] start model=%s prior_phases=%s", execute_model, list(prior.keys()))
+
+            execute_prompt = render_ops(load_prompt("execute"), prior)
+            execute_resp = runtime.call_agent(
+                execute_prompt, model=execute_model, cwd=cwd,
+                max_turns=execute_cfg.get("max_turns", 30),
+            )
+            execute_resp["_prompt"] = execute_prompt
+            _check_resp("execute", execute_resp)
+            _finish_phase(conn, pid, execute_resp)
+            spent += execute_resp["cost"]
+            execute_text = _content(execute_resp)
+            prior["execute"] = execute_text
+            # Write monolithic output to file
+            out_path.write_text(execute_text)
+            storage.log_event(conn, "execute_complete", {
+                "mode": "monolithic",
+                "cost": execute_resp["cost"],
+                "content_len": len(execute_text),
+            })
+            log.info("[ops/execute] monolithic complete spent=%.4f content_len=%d", spent, len(execute_text))
 
         # ---- Review phase -------------------------------------------------------
         review_cfg = pcfg.get("review", {"model": "sonnet", "max_turns": 10})
@@ -1239,13 +1711,11 @@ def run_ops_pipeline(workflow: str, task_description: str, *,
         log.info("[ops/review] signal=%s spent=%.4f", review_signal, spent)
         storage.log_event(conn, "review_signal", {"signal": review_signal})
 
-        # ---- Write output to file -----------------------------------------------
-        out_dir = pa_root / "work" / "outputs" / workflow
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"{today}-{task_slug}.md"
-        out_path.write_text(execute_text)
-        log.info("[ops] output written to %s", out_path)
-        storage.log_event(conn, "output_written", {"path": str(out_path), "bytes": len(execute_text)})
+        # ---- Log output path -----------------------------------------------
+        # (output file already written — by _execute_ops_steps in step mode,
+        # or by monolithic fallback above)
+        log.info("[ops] output at %s", out_path)
+        storage.log_event(conn, "output_written", {"path": str(out_path)})
 
         storage.finish_run(conn, "ok", total_cost=spent)
         result: dict = {

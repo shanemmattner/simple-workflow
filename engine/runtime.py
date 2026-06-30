@@ -37,6 +37,8 @@ _MINIMAX_MODEL_PREFIXES = ("MiniMax-",)
 _MINIMAX_SHORT_ALIASES = {"m3", "m27hs", "minimax", "minimax-m3",
                           "minimax-m2.7-highspeed"}
 
+_MINIMAX_ANTHROPIC_BASE_URL = "https://api.minimax.io/anthropic"
+
 _THINK_TAG_RE = re.compile(r"\s*<\s*think\s*>.*?<\s*/\s*think\s*>", re.DOTALL | re.IGNORECASE)
 
 _MAX_RETRIES = 3
@@ -109,13 +111,36 @@ def call_agent(
         model = resolve_auto("search")
 
     if _is_minimax_model(model):
-        return _call_minimax(
-            prompt,
-            model=model,
-            cwd=cwd,
-            timeout=timeout,
-            system_prompt=effective_system_prompt,
-        )
+        # Resolve short aliases to full model name before dispatching.
+        resolved_model = _resolve_minimax_model(model)
+        api_key = _get_minimax_api_key()
+        if api_key:
+            # Route MiniMax through claude -p with Anthropic-compat endpoint.
+            # This gives full tool use (file read/write, bash) — same as native Claude.
+            log.debug(
+                "_call_agent: MiniMax via claude -p (ANTHROPIC_BASE_URL=%s model=%s)",
+                _MINIMAX_ANTHROPIC_BASE_URL, resolved_model,
+            )
+            return _call_minimax_via_claude_cli(
+                prompt,
+                model=resolved_model,
+                api_key=api_key,
+                cwd=cwd,
+                timeout=timeout,
+                system_prompt=effective_system_prompt,
+            )
+        else:
+            log.warning(
+                "call_agent: MINIMAX_API_KEY not set — falling back to scripts/minimax.py "
+                "(text-only, no tool use). Set MINIMAX_API_KEY to enable full tool use."
+            )
+            return _call_minimax(
+                prompt,
+                model=resolved_model,
+                cwd=cwd,
+                timeout=timeout,
+                system_prompt=effective_system_prompt,
+            )
 
     cmd = [
         "claude",
@@ -268,12 +293,19 @@ def _run_claude_with_watchdog(
     cwd: str | None,
     timeout: int,
     stdin_text: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[int, str, str, str | None]:
     """Run a claude -p subprocess with three-phase stall detection.
 
     Layer 1 env vars bake Claude's own byte-level idle timeout into the env.
     Layer 3 watchdog thread monitors stdout events and kills on phase-specific
     thresholds, handling the case where Claude's self-timeout fails.
+
+    Args:
+        extra_env: Optional additional env vars to set (or override) in the
+            subprocess environment. Used by MiniMax routing to inject
+            ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY without modifying the
+            calling process's environment.
 
     Returns:
         (returncode, stdout, stderr, stall_info)
@@ -286,6 +318,8 @@ def _run_claude_with_watchdog(
     env.pop("CLAUDECODE", None)  # prevent nested-session deadlock when running inside Claude Code
     env["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] = "600000"   # 10 min byte-level watchdog
     env["API_TIMEOUT_MS"] = "1200000"                   # 20 min per-request timeout
+    if extra_env:
+        env.update(extra_env)
 
     lines: list[str] = []
     stderr_lines: list[str] = []
@@ -443,8 +477,149 @@ def _error_response(message: str, elapsed: float) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# MiniMax backend (scripts/minimax.py)
+# MiniMax backend
+#
+# Primary path: claude -p with ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic
+#   → full tool use (Bash, Read, Write, etc.), same as native Claude
+#   → requires MINIMAX_API_KEY env var
+#
+# Fallback path: scripts/minimax.py (text-only, no tool use)
+#   → used when MINIMAX_API_KEY is not in env
 # ---------------------------------------------------------------------------
+
+_RC_VAR_RE = re.compile(
+    r"""^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)\s*=\s*['"]?([^'"\s#]+)['"]?\s*(?:#.*)?$""",
+    re.MULTILINE,
+)
+
+_MINIMAX_SHORT_TO_FULL: dict[str, str] = {
+    "m3": "MiniMax-M3",
+    "minimax": "MiniMax-M3",
+    "minimax-m3": "MiniMax-M3",
+    "m27hs": "MiniMax-M2.7-highspeed",
+    "minimax-m2.7-highspeed": "MiniMax-M2.7-highspeed",
+}
+
+
+def _resolve_minimax_model(model: str) -> str:
+    """Map short aliases (m3, m27hs, minimax) to full MiniMax model IDs."""
+    return _MINIMAX_SHORT_TO_FULL.get(model.lower(), model)
+
+
+def _get_minimax_api_key() -> str | None:
+    """Return MINIMAX_API_KEY from env, with ~/.zshrc fallback."""
+    key = os.environ.get("MINIMAX_API_KEY")
+    if key:
+        return key
+    # Fallback: parse ~/.zshrc for uncommented export MINIMAX_API_KEY=...
+    rcfile = Path.home() / ".zshrc"
+    if rcfile.is_file():
+        try:
+            text = rcfile.read_text()
+            for m in _RC_VAR_RE.finditer(text):
+                if m.group(1) == "MINIMAX_API_KEY":
+                    return m.group(2)
+        except OSError:
+            pass
+    return None
+
+
+def _call_minimax_via_claude_cli(
+    prompt: str,
+    *,
+    model: str,
+    api_key: str,
+    cwd: str,
+    timeout: int | None = None,
+    system_prompt: str | None = None,
+) -> dict:
+    """Route MiniMax through claude -p using Anthropic-compat endpoint.
+
+    Sets ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY env overrides so the Claude
+    CLI hits api.minimax.io/anthropic instead of Anthropic's servers. The
+    model name (MiniMax-M3, MiniMax-M2.7-highspeed) is passed as-is — MiniMax
+    accepts these names on their Anthropic-compat endpoint.
+
+    Returns the same dict shape as call_agent().
+    """
+    effective_timeout = timeout if timeout is not None else 600
+    effective_system = system_prompt or _DEFAULT_SYSTEM_PROMPT
+
+    cmd = [
+        "claude",
+        "-p",
+        "--output-format", "stream-json",
+        "--model", model,
+        "--dangerously-skip-permissions",
+        "--system-prompt", effective_system,
+        "--no-session-persistence",
+        "--strict-mcp-config",
+    ]
+
+    start = time.monotonic()
+
+    for attempt in range(_MAX_RETRIES):
+        try:
+            returncode, stdout, stderr, stall_info = _run_claude_with_watchdog(
+                cmd, cwd or None, effective_timeout,
+                stdin_text=prompt,
+                extra_env={
+                    "ANTHROPIC_BASE_URL": _MINIMAX_ANTHROPIC_BASE_URL,
+                    "ANTHROPIC_API_KEY": api_key,
+                },
+            )
+            elapsed = time.monotonic() - start
+
+            if stall_info:
+                log.warning(
+                    "_call_minimax_via_claude_cli: watchdog killed: %s", stall_info
+                )
+                return {
+                    "content": stdout,
+                    "tokens_in": 0,
+                    "tokens_out": 0,
+                    "cost": 0.0,
+                    "duration_s": elapsed,
+                    "finish_reason": "timeout",
+                }
+
+            if returncode != 0:
+                stderr_str = stderr.strip()
+                if (
+                    attempt < _MAX_RETRIES - 1
+                    and _RETRYABLE_PATTERNS.search(stderr_str)
+                ):
+                    delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                    log.warning(
+                        "_call_minimax_via_claude_cli retryable error "
+                        "(attempt %d/%d), retrying in %.0fs: %s",
+                        attempt + 1, _MAX_RETRIES, delay, stderr_str[:200],
+                    )
+                    time.sleep(delay)
+                    continue
+                return _error_response(stderr_str, elapsed)
+
+            result = parse_response(stdout, _elapsed=elapsed)
+            if stderr.strip():
+                log.warning("minimax claude-cli stderr: %s", stderr.strip()[:500])
+            if result.get("cost", 0) == 0 and result.get("finish_reason") != "error":
+                log.warning(
+                    "_call_minimax_via_claude_cli: zero-cost response "
+                    "(possible auth/endpoint issue): content=%s",
+                    str(result.get("content", ""))[:300],
+                )
+            return result
+
+        except FileNotFoundError:
+            elapsed = time.monotonic() - start
+            return _error_response("claude CLI not found in PATH", elapsed)
+        except Exception as exc:
+            elapsed = time.monotonic() - start
+            return _error_response(str(exc), elapsed)
+
+    elapsed = time.monotonic() - start
+    return _error_response("_call_minimax_via_claude_cli: all retries exhausted", elapsed)
+
 
 def _is_minimax_model(model: str) -> bool:
     m = model.lower()
