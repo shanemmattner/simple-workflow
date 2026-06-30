@@ -80,6 +80,9 @@ def main() -> None:
     print(f"  Cost:    ${result.get('spent_usd', 0):.4f}")
     if result.get("pr_url"):
         print(f"  PR:      {result['pr_url']}")
+    if result.get("branch"):
+        print(f"  Branch:  {result['branch']}")
+        print(f"  Review:  {result.get('review_signal', 'n/a')}")
     if result.get("error"):
         print(f"  Error:   {result['error']}")
     print(f"  Run ID:  {result['run_id']}")

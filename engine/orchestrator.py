@@ -1274,11 +1274,14 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
 
     Unlike run_pipeline(), this function:
     - Loads prompts from a domain workflow dir (e.g. workflows/shftty-web/prompts/)
-    - Runs only 3 core phases: triage → execute → review (plus optional validate + improve)
+    - Runs only 3 core phases: triage → execute → review
     - Passes phase outputs as formatted markdown text via {prior_phases} (no JSON extraction)
     - Exits early on SKIP/ESCALATE triage signal
-    - Creates PR even on review FAIL, but marks it as needing fixes
-    - No wave planning, no parallel task execution, no JSON gates
+    - Pushes the reviewed branch and stops — it does NOT create a PR. The branch
+      with commits is the output of this pipeline; a separate `pr.sh` step
+      (see destination.py) opens the PR from that branch when desired.
+    - No wave planning, no parallel task execution, no JSON gates, no validate
+      or improve phases (those were post-PR polish and preview-URL polling).
     """
     healthy, detail = runtime._check_cli_health()
     if not healthy:
@@ -1555,144 +1558,30 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
         log.info("[domain/review] signal=%s spent=%.4f", review_signal, spent)
         storage.log_event(conn, "review_signal", {"signal": review_signal})
 
-        # ---- Push + PR ----------------------------------------------------------
+        # ---- Push ------------------------------------------------------------
         diff_ok, diff_reason = gates.validate_pr_diff(wt, base="main")
         storage.log_event(conn, "pr_diff_gate", {"passed": diff_ok, "reason": diff_reason})
         if not diff_ok:
             log.error("[domain/pr-diff-gate] FAIL: %s", diff_reason)
             raise GateFailure(f"pr-diff gate failed: {diff_reason}")
         destination.push_branch(wt, branch)
-        pr_title = f"fix: resolve #{issue_number} ({workflow})"
-        if review_signal == "FAIL":
-            pr_title = f"[NEEDS FIXES] fix: resolve #{issue_number} ({workflow})"
-            log.warning("[domain/review] FAIL signal — PR will be marked as needing fixes")
-        phases_summary = _build_phases_summary(
-            triage_cost=triage_resp["cost"],
-            triage_signal=triage_signal,
-            step_results=step_results,
-            review_cost=review_resp["cost"],
-            review_signal=review_signal,
-        )
-        discoveries = _extract_discoveries(step_results)
-        if discoveries:
-            log.info("[domain/execute] %d discovered-issue excerpt(s) found across steps", len(discoveries))
-        pr_body = destination.format_pr_body(
-            issue_number, review_text, db_path, phases_summary,
-            notes=discoveries, total_cost_usd=spent,
-        )
-        if review_signal == "FAIL":
-            pr_body = "**Review flagged issues that need addressing before merge.**\n\n" + pr_body
-        pr = destination.create_pr(repo, branch, pr_title, pr_body, provider=provider, total_cost_usd=spent)
-        log.info("[domain] PR created url=%s review_signal=%s", pr.get("url"), review_signal)
-        storage.log_event(conn, "pr_created", {"url": pr.get("url"), "review_signal": review_signal})
-
-        # ---- Validate phase (optional) ------------------------------------------
-        validate_result = None
-        validate_prompt_path = wf_dir / "prompts" / "validate.md"
-        if validate_prompt_path.is_file() and validate.check_has_ui_changes(prior.get("triage", ""), issue_body):
-            try:
-                pr_number = pr.get("number", issue_number)
-                log.info("[domain/validate] UI changes detected — polling for preview URL")
-                preview_url = validate.get_preview_url(repo, pr_number)
-                if preview_url:
-                    log.info("[domain/validate] preview ready: %s", preview_url)
-                    validate_cfg = pcfg.get("validate", {"model": "sonnet", "max_turns": 10})
-                    validate_model = _resolve_model(validate_cfg, model_override)
-                    pid = _start_phase(conn, "validate", model=validate_model)
-                    validate_prompt = render_domain(
-                        validate_prompt_path.read_text(), prior,
-                        repo_context=repo_context, recent_learnings=recent_learnings_text,
-                        extra={"pr_number": str(pr_number), "repo": repo, "preview_url": preview_url},
-                    )
-                    validate_resp = runtime.call_agent(
-                        validate_prompt, model=validate_model, cwd=wt,
-                        max_turns=validate_cfg.get("max_turns", 10),
-                    )
-                    validate_resp["_prompt"] = validate_prompt
-                    _finish_phase(conn, pid, validate_resp)
-                    spent += validate_resp["cost"]
-                    validate_text = _content(validate_resp)
-                    prior["validate"] = validate_text
-                    validate_result = validate_text
-                    storage.log_event(conn, "validate_result", {
-                        "preview_url": preview_url, "raw_len": len(validate_text),
-                    })
-                    log.info("[domain/validate] complete chars=%d", len(validate_text))
-                else:
-                    log.warning("[domain/validate] preview URL not available — skipping")
-                    storage.log_event(conn, "validate_skipped", {"reason": "preview_url_timeout"})
-            except Exception as ve:
-                log.warning("[domain/validate] phase failed (non-blocking): %s", ve)
-                storage.log_event(conn, "validate_error", {"error": str(ve)})
-        else:
-            log.info("[domain/validate] skipped — no validate.md or no UI changes")
-            storage.log_event(conn, "validate_skipped", {"reason": "no_ui_changes_or_no_prompt"})
-
-        # ---- Improve phase (optional) -------------------------------------------
-        improve_prompt_path = wf_dir / "prompts" / "improve.md"
-        if improve_prompt_path.is_file():
-            try:
-                cost_summary = json.dumps({
-                    "total_spent_usd": round(spent, 4),
-                    "budget_usd": budget,
-                    "utilization_pct": round(spent / budget * 100, 1) if budget else 0,
-                })
-                improve_cfg = pcfg.get("improve", {"model": "opus", "max_turns": 10})
-                improve_model = model_override or improve_cfg.get("model", "opus")
-                pid = _start_phase(conn, "improve", model=_resolve_model(improve_cfg, model_override))
-                log.info("[domain/improve] start model=%s", improve_model)
-                improve_prompt = render_domain(
-                    improve_prompt_path.read_text(), prior,
-                    repo_context=repo_context, recent_learnings=recent_learnings_text,
-                    extra={"cost_summary": cost_summary, "combined_diff": diff[:30_000]},
-                )
-                improve_resp = runtime.call_agent(
-                    improve_prompt, model=improve_model, cwd=wt,
-                    max_turns=improve_cfg.get("max_turns", 10),
-                )
-                improve_resp["_prompt"] = improve_prompt
-                _finish_phase(conn, pid, improve_resp)
-                spent += improve_resp["cost"]
-                improve_text = _content(improve_resp)
-                prior["improve"] = improve_text
-                storage.log_event(conn, "improve_complete", {"content_len": len(improve_text)})
-                log.info("[domain/improve] complete chars=%d", len(improve_text))
-                try:
-                    improve_data = (
-                        json.loads(improve_text)
-                        if improve_text.strip().startswith("{")
-                        else {"raw": improve_text}
-                    )
-                    storage.log_event(conn, "improvement_suggestions", improve_data)
-                    try:
-                        n_learnings = capture_learnings(
-                            improve_output=improve_data,
-                            run_id=run_id,
-                            repo=repo,
-                            issue_number=issue_number,
-                        )
-                        log.info("[domain/improve] learning_capture count=%d", n_learnings)
-                    except Exception as le:
-                        log.warning("[domain/improve] learning_capture_failed error=%s", le)
-                except Exception as je:
-                    log.warning("[domain/improve] could not parse improve output: %s", je)
-            except Exception as ie:
-                log.warning("[domain/improve] phase failed (non-blocking): %s", ie)
-        else:
-            log.info("[domain/improve] skipped — no improve.md in workflow dir")
+        log.info("[domain] branch pushed branch=%s review_signal=%s", branch, review_signal)
+        storage.log_event(conn, "branch_pushed", {"branch": branch, "review_signal": review_signal})
 
         storage.finish_run(conn, "ok", total_cost=spent, branch=branch)
         result: dict = {
             "status": "ok",
-            "pr_url": pr["url"],
+            "branch": branch,
+            "review_signal": review_signal,
             "spent_usd": spent,
             "run_id": run_id,
-            "review_signal": review_signal,
         }
-        if validate_result:
-            result["validate"] = validate_result
-        log.info("run_domain_pipeline complete status=ok pr=%s spent=%.4f review_signal=%s",
-                 pr.get("url"), spent, review_signal)
+        source.post_comment(
+            repo, issue_number,
+            f"Branch pushed: {branch}, review: {review_signal}",
+            provider=provider,
+        )
+        log.info("[domain] complete branch=%s review=%s spent=$%.2f", branch, review_signal, spent)
         return result
 
     except BudgetExceeded as e:
