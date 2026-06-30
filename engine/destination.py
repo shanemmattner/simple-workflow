@@ -102,7 +102,7 @@ def _create_pr_github(repo: str, branch: str, title: str, body: str, base: str) 
     if result.returncode != 0:
         stderr = result.stderr.strip()
         if "already exists" in stderr.lower():
-            raise PRAlreadyExists(f"PR already exists for branch {branch!r}: {stderr}")
+            return _reopen_or_raise_github(repo, branch, title, body, stderr)
         raise RuntimeError(f"gh pr create failed: {stderr}")
 
     url = result.stdout.strip()
@@ -114,6 +114,56 @@ def _create_pr_github(repo: str, branch: str, title: str, body: str, base: str) 
         number = int(parts[-1])
 
     return {"number": number, "url": url}
+
+
+def _reopen_or_raise_github(repo: str, branch: str, title: str, body: str, create_stderr: str) -> dict:
+    """Handle ``gh pr create`` failing because a PR for *branch* already exists.
+
+    If the existing PR is OPEN, that's a real conflict — raise PRAlreadyExists
+    as before. If it's CLOSED (a previous failed/abandoned run), it's safe to
+    reopen and update it with the new title/body rather than erroring out.
+    """
+    view = subprocess.run(
+        ["gh", "pr", "view", branch, "-R", repo, "--json", "state,url,number"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if view.returncode != 0:
+        log.warning(
+            "gh pr view failed while checking existing PR for branch %s: %s",
+            branch, view.stderr.strip(),
+        )
+        raise PRAlreadyExists(f"PR already exists for branch {branch!r}: {create_stderr}")
+
+    try:
+        info = json.loads(view.stdout)
+    except json.JSONDecodeError:
+        log.warning("gh pr view returned unparseable JSON for branch %s: %s", branch, view.stdout)
+        raise PRAlreadyExists(f"PR already exists for branch {branch!r}: {create_stderr}")
+
+    state = info.get("state", "").upper()
+    number = info.get("number")
+
+    if state != "CLOSED":
+        # OPEN (or unknown state) — real conflict, preserve existing behavior.
+        raise PRAlreadyExists(f"PR already exists for branch {branch!r}: {create_stderr}")
+
+    log.info("Existing PR #%s for branch %s is CLOSED — reopening with new content", number, branch)
+
+    reopen = subprocess.run(
+        ["gh", "pr", "reopen", str(number), "-R", repo],
+        capture_output=True, text=True, timeout=30,
+    )
+    if reopen.returncode != 0:
+        raise RuntimeError(f"gh pr reopen failed for PR #{number}: {reopen.stderr.strip()}")
+
+    edit = subprocess.run(
+        ["gh", "pr", "edit", str(number), "-R", repo, "--title", title, "--body", body],
+        capture_output=True, text=True, timeout=30,
+    )
+    if edit.returncode != 0:
+        raise RuntimeError(f"gh pr edit failed for PR #{number}: {edit.stderr.strip()}")
+
+    return {"number": number, "url": info.get("url", "")}
 
 
 def _create_pr_gitlab(repo: str, branch: str, title: str, body: str, base: str) -> dict:
