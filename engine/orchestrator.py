@@ -781,6 +781,10 @@ def run_pipeline(repo: str, issue_number: int, *,
                  budget: float = 1.00, model_override: str | None = None,
                  repo_path: str | None = None,
                  resume_from: str | None = None) -> dict:
+    healthy, detail = runtime._check_cli_health()
+    if not healthy:
+        log.error("aborting run_pipeline: claude CLI health check failed: %s", detail)
+        raise RuntimeError(f"claude CLI health check failed before run start: {detail}")
     wf = _load_workflow()
     budget = budget or wf.get("budget", {}).get("max_per_run_usd", 1.00)
     max_par = wf.get("max_parallel_workers", 5)
@@ -1190,6 +1194,10 @@ def run_domain_pipeline(repo: str, issue_number: int, *,
     - Creates PR even on review FAIL, but marks it as needing fixes
     - No wave planning, no parallel task execution, no JSON gates
     """
+    healthy, detail = runtime._check_cli_health()
+    if not healthy:
+        log.error("aborting run_domain_pipeline: claude CLI health check failed: %s", detail)
+        raise RuntimeError(f"claude CLI health check failed before run start: {detail}")
     wf_dir = _resolve_workflow_dir(workflow)
     log.info("run_domain_pipeline start repo=%s issue=%d workflow=%s wf_dir=%s budget=%.2f",
              repo, issue_number, workflow, wf_dir, budget)
@@ -1565,6 +1573,10 @@ def run_ops_pipeline(workflow: str, task_description: str, *,
     - No PR, no branch creation, no GitHub interaction
     - No budget guard (ops tasks are typically cheap)
     """
+    healthy, detail = runtime._check_cli_health()
+    if not healthy:
+        log.error("aborting run_ops_pipeline: claude CLI health check failed: %s", detail)
+        raise RuntimeError(f"claude CLI health check failed before run start: {detail}")
     wf_dir = _resolve_workflow_dir(workflow)
     pa_root = Path(__file__).resolve().parents[2]
     log.info("run_ops_pipeline start workflow=%s wf_dir=%s task=%r pa_root=%s",

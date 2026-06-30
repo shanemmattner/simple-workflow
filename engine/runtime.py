@@ -47,6 +47,13 @@ _RETRYABLE_PATTERNS = re.compile(
     r"rate limit|429|500|503|overloaded", re.IGNORECASE
 )
 
+# Stall retry: how many times to re-run a CLI invocation that the watchdog
+# killed for stalling (not the same as the request-level retry above, which
+# only fires on a clean process exit with a retryable stderr message).
+_STALL_MAX_RETRIES = 2
+_STALL_RETRY_DELAYS = (30, 90)  # seconds, exponential-ish backoff
+_CLI_HEALTH_TIMEOUT_S = 5
+
 # ---------------------------------------------------------------------------
 # Subprocess watchdog constants (battle-tested values — do not change)
 # ---------------------------------------------------------------------------
@@ -67,6 +74,47 @@ _DEFAULT_SYSTEM_PROMPT = (
 )
 
 
+def _check_cli_health() -> tuple[bool, str]:
+    """Run `claude --version` with a short timeout to confirm the CLI is alive.
+
+    Call this once before the first phase of a pipeline run so a dead/hung
+    CLI fails fast (≤5s) instead of burning a full watchdog cycle (≤300s)
+    on the first real call.
+
+    Returns (healthy, detail) where detail is the version string on success
+    or an error description on failure.
+    """
+    start = time.monotonic()
+    try:
+        proc = subprocess.run(
+            ["claude", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=_CLI_HEALTH_TIMEOUT_S,
+        )
+        elapsed = time.monotonic() - start
+        if proc.returncode == 0:
+            detail = proc.stdout.strip() or "ok"
+            log.info("CLI health check passed in %.2fs: %s", elapsed, detail)
+            return True, detail
+        detail = f"exit={proc.returncode} stderr={proc.stderr.strip()[:200]}"
+        log.error("CLI health check failed in %.2fs: %s", elapsed, detail)
+        return False, detail
+    except subprocess.TimeoutExpired:
+        elapsed = time.monotonic() - start
+        detail = f"timed out after {elapsed:.1f}s (limit={_CLI_HEALTH_TIMEOUT_S}s)"
+        log.error("CLI health check timed out: %s", detail)
+        return False, detail
+    except FileNotFoundError:
+        log.error("CLI health check failed: claude not found in PATH")
+        return False, "claude CLI not found in PATH"
+    except Exception as exc:
+        elapsed = time.monotonic() - start
+        detail = f"unexpected error after {elapsed:.2f}s: {exc}"
+        log.error("CLI health check failed: %s", detail)
+        return False, detail
+
+
 def call_agent(
     prompt: str,
     *,
@@ -83,8 +131,9 @@ def call_agent(
     multi-turn tool-use loop without prompting.
 
     Args:
-        max_turns: Retained for API compatibility; the CLI has no
-            ``--max-turns`` flag.  Use *timeout* to bound execution.
+        max_turns: Forwarded to the CLI as ``--max-turns N`` — a circuit
+            breaker that caps how many agentic tool-use turns a single
+            invocation may take before the CLI itself stops it.
 
     Returns a dict with keys:
         content       - text body of the assistant response
@@ -126,6 +175,7 @@ def call_agent(
                 model=resolved_model,
                 api_key=api_key,
                 cwd=cwd,
+                max_turns=max_turns,
                 timeout=timeout,
                 system_prompt=effective_system_prompt,
             )
@@ -147,6 +197,7 @@ def call_agent(
         "-p",
         "--output-format", "stream-json",
         "--model", model,
+        "--max-turns", str(max_turns),
         "--dangerously-skip-permissions",
         "--system-prompt", effective_system_prompt,
         "--no-session-persistence",
@@ -158,15 +209,18 @@ def call_agent(
 
     for attempt in range(_MAX_RETRIES):
         try:
-            returncode, stdout, stderr, stall_info = _run_claude_with_watchdog(
+            returncode, stdout, stderr, stall_info = _run_claude_with_watchdog_retry(
                 cmd, cwd or None, effective_timeout, stdin_text=prompt
             )
             elapsed = time.monotonic() - start
 
             if stall_info:
-                # Process killed by watchdog — return as timeout, no retry
+                # Stall retries (with backoff) already exhausted inside
+                # _run_claude_with_watchdog_retry — return as timeout, no
+                # further request-level retry.
                 log.warning(
-                    "call_agent: subprocess killed by watchdog: %s", stall_info
+                    "call_agent: subprocess killed by watchdog after stall "
+                    "retries exhausted: %s", stall_info
                 )
                 return {
                     "content": stdout,  # partial output with sentinel appended
@@ -288,6 +342,92 @@ def parse_response(raw_json: str, *, _elapsed: float = 0.0) -> dict:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _log_retry_event(line: str) -> None:
+    """Parse a single stream-json line and log it if it's an api_retry event.
+
+    The CLI emits ``{"type":"system","subtype":"api_retry",...}`` when it
+    internally retries a request (rate limit, transient 5xx, etc). These are
+    invisible unless we parse stream-json — surface them so retries show up
+    in the run log instead of looking like silent idle time.
+    """
+    if '"subtype":"api_retry"' not in line and '"subtype": "api_retry"' not in line:
+        return
+    try:
+        event = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        log.info("api_retry event (unparsed): %s", line.strip()[:300])
+        return
+    attempt = event.get("attempt", event.get("retry_count", "?"))
+    error = event.get("error", event.get("error_type", "?"))
+    delay = event.get("delay_ms", event.get("delay", "?"))
+    log.warning(
+        "api_retry: attempt=%s error=%s delay=%s", attempt, error, delay
+    )
+
+
+def _run_claude_with_watchdog_retry(
+    cmd: list[str],
+    cwd: str | None,
+    timeout: int,
+    stdin_text: str | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> tuple[int, str, str, str | None]:
+    """Wrap _run_claude_with_watchdog with stall-retry + exponential backoff.
+
+    A "stall" (watchdog killed the process for going idle) is distinct from
+    a clean process exit with a retryable stderr message — that's handled
+    by the caller's own _MAX_RETRIES loop. A stall usually means the CLI
+    itself hung (not an API-level error), so we retry the whole invocation
+    up to _STALL_MAX_RETRIES times with backoff, running a quick health
+    check first to fail fast if the CLI binary itself is broken.
+
+    Returns the same (returncode, stdout, stderr, stall_info) tuple as
+    _run_claude_with_watchdog. stall_info is non-None only once all
+    retries are exhausted.
+    """
+    last_result: tuple[int, str, str, str | None] | None = None
+
+    for stall_attempt in range(_STALL_MAX_RETRIES + 1):
+        result = _run_claude_with_watchdog(
+            cmd, cwd, timeout, stdin_text=stdin_text, extra_env=extra_env
+        )
+        returncode, stdout, stderr, stall_info = result
+        last_result = result
+
+        if not stall_info:
+            return result
+
+        log.warning(
+            "stall detected (retry %d/%d): %s",
+            stall_attempt, _STALL_MAX_RETRIES, stall_info,
+        )
+
+        if stall_attempt >= _STALL_MAX_RETRIES:
+            log.error(
+                "stall retries exhausted (%d attempts) — giving up: %s",
+                _STALL_MAX_RETRIES, stall_info,
+            )
+            break
+
+        healthy, detail = _check_cli_health()
+        if not healthy:
+            log.error(
+                "CLI health check failed after stall — not retrying "
+                "(CLI appears broken): %s", detail,
+            )
+            break
+
+        delay = _STALL_RETRY_DELAYS[min(stall_attempt, len(_STALL_RETRY_DELAYS) - 1)]
+        log.warning(
+            "CLI healthy (%s) — retrying stalled call in %ds "
+            "(attempt %d/%d)",
+            detail, delay, stall_attempt + 1, _STALL_MAX_RETRIES,
+        )
+        time.sleep(delay)
+
+    return last_result
+
+
 def _run_claude_with_watchdog(
     cmd: list[str],
     cwd: str | None,
@@ -356,12 +496,20 @@ def _run_claude_with_watchdog(
                 ts = time.monotonic()
                 lines.append(line)
                 last_stdout_ts[0] = ts
-                # Detect content events to distinguish real-work from preamble
-                if '"type":"assistant"' in line or '"type":"thinking"' in line:
+                # Detect content events to distinguish real-work from preamble.
+                # assistant/thinking/user(tool-result) events all indicate the
+                # CLI is actively producing turns — any of them resets the
+                # content-stall idle timer for the watchdog.
+                if (
+                    '"type":"assistant"' in line
+                    or '"type":"thinking"' in line
+                    or '"type":"user"' in line
+                ):
                     last_content_ts[0] = ts
                     first_assistant_token.set()
                 if '"type":"result"' in line:
                     result_received.set()
+                _log_retry_event(line)
         except Exception:
             pass
 
@@ -530,6 +678,7 @@ def _call_minimax_via_claude_cli(
     model: str,
     api_key: str,
     cwd: str,
+    max_turns: int = 30,
     timeout: int | None = None,
     system_prompt: str | None = None,
 ) -> dict:
@@ -550,6 +699,7 @@ def _call_minimax_via_claude_cli(
         "-p",
         "--output-format", "stream-json",
         "--model", model,
+        "--max-turns", str(max_turns),
         "--dangerously-skip-permissions",
         "--system-prompt", effective_system,
         "--no-session-persistence",
@@ -560,7 +710,7 @@ def _call_minimax_via_claude_cli(
 
     for attempt in range(_MAX_RETRIES):
         try:
-            returncode, stdout, stderr, stall_info = _run_claude_with_watchdog(
+            returncode, stdout, stderr, stall_info = _run_claude_with_watchdog_retry(
                 cmd, cwd or None, effective_timeout,
                 stdin_text=prompt,
                 extra_env={
@@ -572,7 +722,8 @@ def _call_minimax_via_claude_cli(
 
             if stall_info:
                 log.warning(
-                    "_call_minimax_via_claude_cli: watchdog killed: %s", stall_info
+                    "_call_minimax_via_claude_cli: watchdog killed after stall "
+                    "retries exhausted: %s", stall_info
                 )
                 return {
                     "content": stdout,
