@@ -275,6 +275,7 @@ def run_phase_agent(
         "--model", model,
         "--max-turns", str(max_turns),
         "--permission-mode", "bypassPermissions",
+        "--bare",  # skip hooks, LSP, plugins, CLAUDE.md auto-discovery, auto-memory
     ]
 
     # Hide target repo's CLAUDE.md and .claude/ to prevent them from
@@ -304,6 +305,7 @@ def run_phase_agent(
 
     # Layer 1: env vars — Claude's own byte-level and request-level timeouts.
     env = os.environ.copy()
+    env.pop("CLAUDECODE", None)  # prevent nested-session deadlock when running inside Claude Code
     env["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] = "600000"   # 10 min byte-level watchdog
     env["API_TIMEOUT_MS"] = "1200000"                   # 20 min per-request timeout
 

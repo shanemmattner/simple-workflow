@@ -125,6 +125,7 @@ def call_agent(
         "--model", model,
         "--dangerously-skip-permissions",
         "--system-prompt", effective_system_prompt,
+        "--bare",  # skip hooks, LSP, plugins, CLAUDE.md auto-discovery, auto-memory
     ]
 
     effective_timeout = timeout if timeout is not None else 600
@@ -269,6 +270,7 @@ def _run_claude_with_watchdog(
     """
     # Layer 1: env vars — Claude's own byte-level and request-level timeouts.
     env = os.environ.copy()
+    env.pop("CLAUDECODE", None)  # prevent nested-session deadlock when running inside Claude Code
     env["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] = "600000"   # 10 min byte-level watchdog
     env["API_TIMEOUT_MS"] = "1200000"                   # 20 min per-request timeout
 
