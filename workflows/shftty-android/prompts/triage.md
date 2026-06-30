@@ -111,6 +111,27 @@ Write a clear, actionable plan for the execute agent. The plan must be specific 
 - The correct Gradle test command to verify the fix
 - Known gotchas or non-obvious patterns to follow
 
+## Steps (required when PROCEED)
+
+When your decision is PROCEED, you MUST include a `## Steps` section with numbered implementation steps. Each step must be small enough to implement in under 5 minutes.
+
+Format each step as:
+
+### Step N: <short title>
+**Files:** <comma-separated file paths>
+**Changes:** <specific description of what to change>
+**Verify:** <command or check to confirm the step worked>
+**Depends on:** <"none" or "Step N">
+
+Rules:
+- Each step should touch at most 5 files
+- Order by dependency (step 2 can depend on step 1)
+- Tests count as steps — "Write failing test for X" is a step
+- If the issue is trivially simple (1 file, 1 change), a single step is fine
+- Do not create steps for "read the code" or "understand the problem" — those are your job in triage, not the executor's
+
+---
+
 ## Decision
 
 End your investigation with a `## Decision` section containing exactly one of:

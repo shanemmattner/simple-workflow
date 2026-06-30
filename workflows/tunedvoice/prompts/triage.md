@@ -121,6 +121,27 @@ Write a clear, actionable plan. Include:
 
 ---
 
+## Steps (required when PROCEED)
+
+When your decision is PROCEED, you MUST include a `## Steps` section with numbered implementation steps. Each step must be small enough to implement in under 5 minutes.
+
+Format each step as:
+
+### Step N: <short title>
+**Files:** <comma-separated file paths>
+**Changes:** <specific description of what to change>
+**Verify:** <command or check to confirm the step worked>
+**Depends on:** <"none" or "Step N">
+
+Rules:
+- Each step should touch at most 5 files
+- Order by dependency (step 2 can depend on step 1)
+- Tests count as steps — "Write failing test for X" is a step
+- If the issue is trivially simple (1 file, 1 change), a single step is fine
+- Do not create steps for "read the code" or "understand the problem" — those are your job in triage, not the executor's
+
+---
+
 ## Decision
 
 End your investigation with a `## Decision` section containing exactly one of:
@@ -177,6 +198,20 @@ Single file change in `Services/Transcription/ParakeetStreamingService.swift`. N
 - Do NOT use `RecordingEncryption(keychainService:)` in tests — it fails in CI with -25308. Use `RecordingEncryption(testKey: SymmetricKey(size: .bits256))` if encryption is needed.
 - Do NOT use `.timeLimit(.seconds(N))` in Swift Testing — minimum is `.timeLimit(.minutes(1))`.
 - The mock engine is in `Tests/TunedVoiceTests/Mocks/MockParakeetStreamingEngine.swift` — mirror its existing usage.
+
+## Steps
+
+### Step 1: Add trailing-token deduplication
+**Files:** `apps/mac_os/TunedVoice/Sources/TunedVoice/Services/Transcription/ParakeetStreamingService.swift`
+**Changes:** In lines 127-152, add logic to strip tokens from the new pass that overlap with the last N tokens of the previous emission.
+**Verify:** `cd apps/mac_os && ./scripts/test-unit.sh --filter ParakeetStreamingServiceTests`
+**Depends on:** none
+
+### Step 2: Add 30s buffer regression test
+**Files:** `apps/mac_os/TunedVoice/Tests/TunedVoiceTests/ParakeetStreamingServiceTests.swift`
+**Changes:** Add test case using MockParakeetStreamingEngine simulating 30 transcription passes, asserting no repeated trailing tokens.
+**Verify:** `cd apps/mac_os && ./scripts/test-unit.sh --filter ParakeetStreamingServiceTests`
+**Depends on:** Step 1
 
 ## Decision
 
