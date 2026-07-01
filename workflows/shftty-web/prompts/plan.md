@@ -56,7 +56,7 @@ If this is a feature, identify the sibling files to mirror. Read them if triage 
 
 ### 3. Produce numbered tasks
 
-Write a `## Steps` section with numbered implementation steps. Each step must be small enough to implement in under 5 minutes.
+Write a `## Steps` section with numbered implementation steps. Each step should be one logical unit of work — something a developer would do in one sitting and commit together.
 
 Format each step as:
 
@@ -67,12 +67,14 @@ Format each step as:
 **Depends on:** <"none" or "Step N">
 
 Rules:
-- Each step should touch at most 5 files
+- Group same-pattern changes into one step. If 10 files need the same kind of edit (e.g., replacing an import path), that's one step, not 10.
+- Repeating the same change across multiple files is ONE step, not one step per file. The execute agent is smart enough to handle "apply this pattern to all matching files."
 - Order by dependency (step 2 can depend on step 1)
 - Tests count as steps — "Write failing test for X" is a step
 - If the issue is trivially simple (1 file, 1 change), a single step is fine
 - Do not create steps for "read the code" or "understand the problem" — triage already did that
 - Be specific: include file paths, function names, and what to change — not vague instructions
+- Target: a typical issue should produce 2-5 steps. Simple bug = 1-2. Multi-file feature = 3-5. If you are writing more than 5 steps, you are probably splitting same-pattern work that belongs in one step.
 
 ### 4. Define the test strategy
 
@@ -212,6 +214,17 @@ Add a date-range filter to the Workers listing page. The server action `getWorke
 - The `getWorkers` server action uses `requireSession()` for tenantId — do not change this. The date filter is additive to the existing WHERE clause.
 - The DateRangePicker component already exists in the shifts page — reuse it, do not create a duplicate.
 - Watch for the RSC serialization boundary: Date objects cannot be passed as props from server to client components. Map to ISO strings if needed.
+
+---
+
+### Example: BAD — over-decomposed (don't do this)
+
+### Step 1: Migrate api-smoke.spec.ts to use API constants
+### Step 2: Migrate edge-cases.spec.ts to use API constants
+### Step 3: Migrate chaos-tunnels.spec.ts to use API constants
+...
+
+This should be ONE step: "Migrate all E2E specs to use API path constants"
 
 ---
 
