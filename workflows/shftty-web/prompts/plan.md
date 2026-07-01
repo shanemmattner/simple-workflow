@@ -35,7 +35,7 @@ Shftty is a multi-tenant healthcare-staffing SaaS. Staffing agencies open shifts
 
 ### 1. Read the triage output
 
-The triage phase output is in `$prior_phases` below. It contains:
+The triage phase output is in `{{ prior_phases }}` below. It contains:
 - Localized files with paths, functions, and confidence levels
 - Root cause hypothesis
 - Test coverage assessment
@@ -230,18 +230,18 @@ This should be ONE step: "Migrate all E2E specs to use API path constants"
 
 ## Prior phases
 
-$prior_phases
+{{ prior_phases }}
 
 ## Repo context
 
-$repo_context
+{{ repo_context }}
 
 ## Prior run learnings
 
-$recent_learnings
+{{ recent_learnings }}
 
 ## Issue context
 
-Issue #$issue_number:
+Issue #{{ issue_number }}:
 
-$issue_body
+{{ issue_body }}

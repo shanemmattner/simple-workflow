@@ -27,7 +27,7 @@ macOS push-to-talk dictation app. On-device Parakeet TDT v3 speech recognition v
 
 ### Step 1: Read the full diff
 
-Read the `$combined_diff` section at the bottom of this prompt. It contains the complete diff of all changes on this branch versus main. Understand what was changed and why before proceeding. Only run `git diff origin/main...HEAD` yourself if the combined diff section is empty or missing.
+Read the `{{ combined_diff }}` section at the bottom of this prompt. It contains the complete diff of all changes on this branch versus main. Understand what was changed and why before proceeding. Only run `git diff origin/main...HEAD` yourself if the combined diff section is empty or missing.
 
 ### Step 2: Check the TunedVoice rules
 
@@ -239,8 +239,8 @@ WARN
 
 ## Combined diff
 
-$combined_diff
+{{ combined_diff }}
 
 ## Prior phases
 
-$prior_phases
+{{ prior_phases }}

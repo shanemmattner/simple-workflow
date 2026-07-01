@@ -227,10 +227,10 @@ When you are done, summarize what happened:
 
 If the triage plan is ambiguous or contradicts what the issue actually asked for, this is the authoritative source:
 
-$issue_body
+{{ issue_body }}
 
 ---
 
 ## Prior phases (triage localization, plan, and any prior phase output)
 
-$prior_phases
+{{ prior_phases }}

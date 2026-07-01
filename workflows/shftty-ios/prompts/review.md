@@ -262,14 +262,14 @@ WARN — 2 P1 findings: retain cycle in notification observer and no test for th
 
 Use this to verify scope creep in the diff. The triage plan may have added scope — this is the authoritative statement of what was asked for.
 
-$issue_body
+{{ issue_body }}
 
 ---
 
 ## Combined diff
 
-$combined_diff
+{{ combined_diff }}
 
 ## Prior phases (triage and execute summaries)
 
-$prior_phases
+{{ prior_phases }}

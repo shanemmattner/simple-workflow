@@ -267,8 +267,8 @@ PASS — Clean implementation. No P0 or P1 findings.
 
 ## Combined diff
 
-$combined_diff
+{{ combined_diff }}
 
 ## Prior phases
 
-$prior_phases
+{{ prior_phases }}

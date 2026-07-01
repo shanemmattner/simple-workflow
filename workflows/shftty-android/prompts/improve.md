@@ -183,4 +183,4 @@ Each recommendation must be specific and concrete:
 
 ## Prior phases
 
-$prior_phases
+{{ prior_phases }}

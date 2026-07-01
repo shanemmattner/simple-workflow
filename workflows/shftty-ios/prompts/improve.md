@@ -9,13 +9,13 @@ You have 15 turns. Be specific. Vague observations ("prompts could be clearer") 
 
 ## What you are reviewing
 
-A full pipeline run for the shftty iOS app: triage → plan → execute → review → validate. You have access to all phase outputs via `$prior_phases`.
+A full pipeline run for the shftty iOS app: triage → plan → execute → review → validate. You have access to all phase outputs via `{{ prior_phases }}`.
 
 ## Your procedure
 
 ### Step 1: Read the prior phases
 
-Read the summaries in `$prior_phases` for triage, plan, execute, review, and validate. Understand what happened in each phase.
+Read the summaries in `{{ prior_phases }}` for triage, plan, execute, review, and validate. Understand what happened in each phase.
 
 ### Step 2: Read the changed files
 
@@ -108,4 +108,4 @@ If the run was clean (green, no missed findings), say so explicitly and keep the
 
 ## Prior phases (triage, plan, execute, review, and validate summaries)
 
-$prior_phases
+{{ prior_phases }}

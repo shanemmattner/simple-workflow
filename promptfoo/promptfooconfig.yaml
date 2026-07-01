@@ -1,0 +1,133 @@
+# promptfoo configuration for simple-workflow pipeline prompts.
+# Run: npx promptfoo@latest eval
+# View: npx promptfoo@latest view
+
+description: simple-workflow prompt evaluation
+
+providers:
+  - id: exec:./run-claude.sh
+    label: claude-sonnet
+    config:
+      timeout: 120000
+
+prompts:
+  - id: triage
+    raw: |
+      You are the triage stage of an automated issue-to-PR pipeline for a healthcare staffing web app.
+
+      ## Repository context
+      Repo: /tmp/test-repo
+      Ref: main
+      Branch: sw/shftty-web-test-1
+
+      ## Issue #{{issue_number}}
+
+      {{issue_body}}
+
+      Decide whether this issue should proceed through the pipeline. Output one of:
+      - A triage analysis (the issue proceeds to planning)
+      - SKIP: <reason> (already fixed, duplicate, not actionable)
+      - ESCALATE: <reason> (too risky, ambiguous, or large for automation)
+
+  - id: review
+    raw: |
+      You are the review stage of an automated issue-to-PR pipeline.
+
+      Review this diff and emit a verdict:
+      - PASS: no critical findings, safe to merge
+      - WARN: non-critical findings present, safe to merge after fixes
+      - FAIL: critical findings, must not merge
+
+      ## Diff
+      {{combined_diff}}
+
+      End your response with a ## Verdict section containing exactly one of: PASS, WARN, or FAIL on its own line.
+
+tests:
+  # --- Triage tests ---
+  - description: "Triage: straightforward bug proceeds"
+    vars:
+      issue_number: "999"
+      issue_body: |
+        Bug: Login button is not visible on mobile viewport
+
+        Steps to reproduce:
+        1. Open the app on a phone (< 768px width)
+        2. Navigate to /login
+        3. The submit button is cut off below the fold
+
+        Expected: Button should be visible without scrolling.
+    assert:
+      - type: not-contains
+        value: "SKIP"
+      - type: not-contains
+        value: "ESCALATE"
+
+  - description: "Triage: already-fixed issue gets SKIP"
+    vars:
+      issue_number: "998"
+      issue_body: |
+        Bug: Missing dark mode support for settings page
+
+        UPDATE: This was fixed in PR #997, merged yesterday. The settings page now has full dark mode support. Closing.
+    assert:
+      - type: contains
+        value: "SKIP"
+
+  - description: "Triage: ambiguous issue gets ESCALATE"
+    vars:
+      issue_number: "997"
+      issue_body: |
+        Redesign the entire onboarding flow
+
+        We need to completely rethink how users sign up. This involves:
+        - New multi-step wizard (5+ screens)
+        - Integration with 3 external verification APIs
+        - New database schema for credential storage
+        - Migration of all existing users
+        - New notification system
+        - Compliance review needed for HIPAA
+    assert:
+      - type: contains
+        value: "ESCALATE"
+
+  # --- Review tests ---
+  - description: "Review: clean diff gets PASS"
+    vars:
+      combined_diff: |
+        diff --git a/apps/web/components/Button.tsx b/apps/web/components/Button.tsx
+        index abc1234..def5678 100644
+        --- a/apps/web/components/Button.tsx
+        +++ b/apps/web/components/Button.tsx
+        @@ -5,7 +5,7 @@ export function Button({ label, onClick }: ButtonProps) {
+           return (
+             <button
+        -      className="px-4 py-2 bg-blue-500 text-white rounded"
+        +      className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 transition-colors"
+               onClick={onClick}
+             >
+               {label}
+    assert:
+      - type: contains
+        value: "PASS"
+      - type: contains
+        value: "Verdict"
+
+  - description: "Review: dangerous diff gets FAIL or WARN"
+    vars:
+      combined_diff: |
+        diff --git a/apps/web/lib/auth.ts b/apps/web/lib/auth.ts
+        index abc1234..def5678 100644
+        --- a/apps/web/lib/auth.ts
+        +++ b/apps/web/lib/auth.ts
+        @@ -12,8 +12,6 @@ export async function verifySession(token: string) {
+        -  if (!token) throw new AuthError("No token provided");
+        -  const decoded = jwt.verify(token, process.env.JWT_SECRET!);
+        +  // TODO: add auth back later
+        +  const decoded = { userId: "any", role: "admin" };
+           return decoded;
+    assert:
+      - type: javascript
+        value: output.includes("FAIL") || output.includes("WARN")
+      - type: contains
+        value: "Verdict"

@@ -325,14 +325,14 @@ ESCALATE: This is a feature that requires product design decisions not specified
 
 If no repo context is available below, rely on codebase exploration — do not halt.
 
-$repo_context
+{{ repo_context }}
 
 ## Prior run learnings
 
-$recent_learnings
+{{ recent_learnings }}
 
 ## Issue to triage
 
-Issue #$issue_number:
+Issue #{{ issue_number }}:
 
-$issue_body
+{{ issue_body }}

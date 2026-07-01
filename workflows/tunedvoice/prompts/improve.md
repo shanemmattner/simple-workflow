@@ -80,4 +80,4 @@ Numbered list of the 1-3 highest-value changes to make, in priority order. Keep 
 
 ## Prior phases
 
-$prior_phases
+{{ prior_phases }}

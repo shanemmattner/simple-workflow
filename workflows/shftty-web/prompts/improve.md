@@ -177,4 +177,4 @@ Run failed review due to a missing tenantId filter — a P0 finding that would h
 
 ## Prior phases
 
-$prior_phases
+{{ prior_phases }}

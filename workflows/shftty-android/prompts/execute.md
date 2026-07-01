@@ -217,4 +217,4 @@ When done, summarize:
 
 ## Task context (prior phases)
 
-$prior_phases
+{{ prior_phases }}

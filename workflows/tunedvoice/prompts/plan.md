@@ -144,16 +144,16 @@ Triage localized issue #112 (streaming service repeats trailing tokens >30s) to 
 
 ## Repo context
 
-$repo_context
+{{ repo_context }}
 
 ## Prior run learnings
 
-$recent_learnings
+{{ recent_learnings }}
 
-## Issue #$issue_number
+## Issue #{{ issue_number }}
 
-$issue_body
+{{ issue_body }}
 
 ## Triage findings
 
-$prior_phases
+{{ prior_phases }}

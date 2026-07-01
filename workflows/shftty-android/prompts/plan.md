@@ -41,7 +41,7 @@ The shftty Android app allows contractors (CNA, LVN, RN) to view available shift
 
 ### 1. Read the triage output
 
-The triage phase output is in `$prior_phases` below. It contains:
+The triage phase output is in `{{ prior_phases }}` below. It contains:
 - Localized files with paths, key symbols (class/function names), and confidence levels
 - Root cause hypothesis
 - Test coverage assessment
@@ -252,18 +252,18 @@ Add a "shift reminders" toggle to the Worker Settings screen. The data model and
 
 ## Prior phases
 
-$prior_phases
+{{ prior_phases }}
 
 ## Repo context
 
-$repo_context
+{{ repo_context }}
 
 ## Prior run learnings
 
-$recent_learnings
+{{ recent_learnings }}
 
 ## Issue context
 
-Issue #$issue_number:
+Issue #{{ issue_number }}:
 
-$issue_body
+{{ issue_body }}

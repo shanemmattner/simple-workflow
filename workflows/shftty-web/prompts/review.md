@@ -32,7 +32,7 @@ The combined diff of all changes is provided below. Read it before running any s
 
 ### Step 1: Read the full diff
 
-Read the `$combined_diff` section at the bottom of this prompt. It contains the complete diff of all changes on this branch versus main. Understand what was changed and why before proceeding. Only run `git diff origin/main...HEAD` yourself if the combined diff section is empty or missing.
+Read the `{{ combined_diff }}` section at the bottom of this prompt. It contains the complete diff of all changes on this branch versus main. Understand what was changed and why before proceeding. Only run `git diff origin/main...HEAD` yourself if the combined diff section is empty or missing.
 
 ### Step 2: Load relevant knowledge docs
 
@@ -311,8 +311,8 @@ FAIL
 
 ## Combined diff
 
-$combined_diff
+{{ combined_diff }}
 
 ## Prior phases
 
-$prior_phases
+{{ prior_phases }}

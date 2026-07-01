@@ -273,14 +273,14 @@ ESCALATE: FluidAudio upgrade from 0.12.6 to 0.14.0 requires reconverting all Cor
 
 ## Repo context
 
-$repo_context
+{{ repo_context }}
 
 ## Prior run learnings
 
-$recent_learnings
+{{ recent_learnings }}
 
 ## Issue to triage
 
-Issue #$issue_number:
+Issue #{{ issue_number }}:
 
-$issue_body
+{{ issue_body }}

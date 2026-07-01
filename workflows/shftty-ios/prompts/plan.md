@@ -32,7 +32,7 @@ E2E command: `maestro test maestro/<flow>.yaml` or `scripts/maestro-test.sh`
 
 ### 1. Read the triage output
 
-The triage phase output is in `$prior_phases` below. It contains:
+The triage phase output is in `{{ prior_phases }}` below. It contains:
 - Localized files with paths, functions/types, and confidence levels
 - Root cause hypothesis
 - Test coverage assessment
@@ -235,18 +235,18 @@ Add a date-range filter (this week / this month / custom) to the Earnings screen
 
 ## Prior phases
 
-$prior_phases
+{{ prior_phases }}
 
 ## Repo context
 
-$repo_context
+{{ repo_context }}
 
 ## Prior run learnings
 
-$recent_learnings
+{{ recent_learnings }}
 
 ## Issue context
 
-Issue #$issue_number:
+Issue #{{ issue_number }}:
 
-$issue_body
+{{ issue_body }}

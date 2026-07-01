@@ -201,4 +201,4 @@ When you're done, summarize what happened:
 
 ## Task context
 
-$prior_phases
+{{ prior_phases }}

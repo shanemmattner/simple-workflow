@@ -264,4 +264,4 @@ When you're done, write a summary:
 
 The triage and plan phase outputs below contain the localization, analysis, and implementation plan for this issue. Follow the plan.
 
-$prior_phases
+{{ prior_phases }}

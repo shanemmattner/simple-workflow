@@ -19,6 +19,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from jinja2 import Template
+
 DIR = Path(__file__).parent
 
 
@@ -107,8 +109,7 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
 def load_prompt(name: str, **kwargs) -> tuple[dict, str]:
     raw = (DIR / "prompts" / f"{name}.md").read_text()
     meta, text = parse_frontmatter(raw)
-    for k, v in kwargs.items():
-        text = text.replace(f"${k}", str(v))
+    text = Template(text).render(**kwargs)
     return meta, text
 
 
