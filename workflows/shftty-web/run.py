@@ -22,7 +22,7 @@ DIR = Path(__file__).parent
 def call_claude(prompt: str, cwd: str, model: str, max_turns: int) -> dict:
     proc = subprocess.run(
         ["claude", "-p", "--model", model, "--output-format", "json",
-         "--max-turns", str(max_turns)],
+         "--max-turns", str(max_turns), "--dangerously-skip-permissions"],
         input=prompt, capture_output=True, text=True, cwd=cwd,
     )
     if proc.returncode != 0:
@@ -120,7 +120,6 @@ def main():
         model = meta.get("model", args.model)
         max_turns = int(meta.get("max_turns", 30))
         out_file = out_dir / f"{name}.md"
-        prompt += f"\n\nIMPORTANT: Write your full output to {out_file} as you work. This file is your notes — write findings as you discover them, not just at the end."
 
         print(f"--- {name} ---")
         resp = call_claude(prompt, wt, model, max_turns)
@@ -130,6 +129,7 @@ def main():
         spent += cost
 
         if not out_file.exists():
+            out_dir.mkdir(parents=True, exist_ok=True)
             out_file.write_text(result)
 
         print(f"  done: ${cost:.4f}  (total: ${spent:.4f})")
@@ -167,7 +167,7 @@ def main():
     exec_max_turns = int(exec_meta.get("max_turns", 30))
 
     for i, task in enumerate(tasks, 1):
-        task_prompt = f"{exec_prompt_template}\n\n---\n\n## Your task (task {i} of {len(tasks)})\n\n{task}\n\nFocus ONLY on this task. Make commits when done. Write progress to {out_dir}/3-execute-task-{i}.md"
+        task_prompt = f"{exec_prompt_template}\n\n---\n\n## Your task (task {i} of {len(tasks)})\n\n{task}\n\nFocus ONLY on this task. Make commits when done."
         print(f"  task {i}/{len(tasks)}: {task[:80]}...")
         resp = call_claude(task_prompt, wt, exec_model, exec_max_turns)
         cost = resp.get("total_cost_usd", resp.get("cost_usd", 0.0))
@@ -176,6 +176,7 @@ def main():
         result = resp.get("result", "")
         task_file = out_dir / f"3-execute-task-{i}.md"
         if not task_file.exists():
+            out_dir.mkdir(parents=True, exist_ok=True)
             task_file.write_text(result)
         print(f"  task {i} done: ${cost:.4f}  (total: ${spent:.4f})")
         if spent > args.budget:
