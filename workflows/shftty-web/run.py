@@ -40,11 +40,27 @@ def call_claude(prompt: str, cwd: str, model: str, max_turns: int) -> dict:
     sys.exit(1)
 
 
-def load_prompt(name: str, **kwargs) -> str:
-    text = (DIR / "prompts" / f"{name}.md").read_text()
+def parse_frontmatter(text: str) -> tuple[dict, str]:
+    """Parse simple key: value frontmatter between --- delimiters."""
+    if not text.startswith("---"):
+        return {}, text
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}, text
+    meta = {}
+    for line in parts[1].strip().splitlines():
+        if ": " in line:
+            k, v = line.split(": ", 1)
+            meta[k.strip()] = v.strip()
+    return meta, parts[2]
+
+
+def load_prompt(name: str, **kwargs) -> tuple[dict, str]:
+    raw = (DIR / "prompts" / f"{name}.md").read_text()
+    meta, text = parse_frontmatter(raw)
     for k, v in kwargs.items():
-        text = text.replace(f"{{{k}}}", str(v))
-    return text
+        text = text.replace(f"${k}", str(v))
+    return meta, text
 
 
 def fetch_issue_body(repo_path: str, issue: int) -> str:
@@ -87,13 +103,13 @@ def main():
     costs = {}
     spent = 0.0
 
-    def run_phase(name: str, prompt_name: str, max_turns: int, **extra) -> str:
+    def run_phase(name: str, prompt_name: str, **extra) -> str:
         nonlocal spent
         prior = ""
         for f in sorted(out_dir.glob("*.md")):
             prior += f"\n\n---\n## {f.stem}\n\n{f.read_text()}"
 
-        prompt = load_prompt(prompt_name,
+        meta, prompt = load_prompt(prompt_name,
             repo_context=f"Repo: {repo}\nRef: {args.git_ref}\nBranch: {branch}",
             issue_body=issue_body,
             issue_number=str(args.issue or "N/A"),
@@ -101,11 +117,13 @@ def main():
             prior_phases=prior,
             **extra,
         )
+        model = meta.get("model", args.model)
+        max_turns = int(meta.get("max_turns", 30))
         out_file = out_dir / f"{name}.md"
         prompt += f"\n\nIMPORTANT: Write your full output to {out_file} as you work. This file is your notes — write findings as you discover them, not just at the end."
 
         print(f"--- {name} ---")
-        resp = call_claude(prompt, wt, args.model, max_turns)
+        resp = call_claude(prompt, wt, model, max_turns)
         result = resp.get("result", "")
         cost = resp.get("total_cost_usd", resp.get("cost_usd", 0.0))
         costs[name] = cost
@@ -121,14 +139,14 @@ def main():
         return result
 
     # --- triage ---
-    triage = run_phase("1-triage", "triage", 30)
+    triage = run_phase("1-triage", "triage")
     if "SKIP" in triage or "ESCALATE" in triage:
         triage_file = out_dir / "1-triage.md"
         print(f"triage halted. notes: {triage_file}")
         sys.exit(0)
 
     # --- plan ---
-    plan_out = run_phase("2-plan", "plan", 20)
+    plan_out = run_phase("2-plan", "plan")
     plan_file = out_dir / "2-plan.md"
     plan_text = plan_file.read_text() if plan_file.exists() else plan_out
 
@@ -138,18 +156,20 @@ def main():
         tasks = [plan_text]
     print(f"  execute: {len(tasks)} tasks from plan")
 
-    exec_prompt_template = load_prompt("execute",
+    exec_meta, exec_prompt_template = load_prompt("execute",
         repo_context=f"Repo: {repo}\nRef: {args.git_ref}\nBranch: {branch}",
         issue_body=issue_body,
         issue_number=str(args.issue or "N/A"),
         recent_learnings="(none)",
         prior_phases=(out_dir / "1-triage.md").read_text() + "\n\n" + plan_text,
     )
+    exec_model = exec_meta.get("model", args.model)
+    exec_max_turns = int(exec_meta.get("max_turns", 30))
 
     for i, task in enumerate(tasks, 1):
         task_prompt = f"{exec_prompt_template}\n\n---\n\n## Your task (task {i} of {len(tasks)})\n\n{task}\n\nFocus ONLY on this task. Make commits when done. Write progress to {out_dir}/3-execute-task-{i}.md"
         print(f"  task {i}/{len(tasks)}: {task[:80]}...")
-        resp = call_claude(task_prompt, wt, args.model, 30)
+        resp = call_claude(task_prompt, wt, exec_model, exec_max_turns)
         cost = resp.get("total_cost_usd", resp.get("cost_usd", 0.0))
         costs[f"execute-{i}"] = cost
         spent += cost
@@ -165,10 +185,10 @@ def main():
     # --- review ---
     diff = subprocess.run(["git", "diff", f"{args.git_ref}...HEAD"],
                          cwd=wt, capture_output=True, text=True).stdout
-    run_phase("4-review", "review", 20, combined_diff=diff[:50_000])
+    run_phase("4-review", "review", combined_diff=diff[:50_000])
 
     # --- improve ---
-    run_phase("5-improve", "improve", 10)
+    run_phase("5-improve", "improve")
 
     # --- push ---
     push = subprocess.run(["git", "push", "origin", branch],
