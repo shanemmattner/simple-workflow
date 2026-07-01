@@ -19,6 +19,10 @@ from pathlib import Path
 DIR = Path(__file__).parent
 
 
+class ClaudeError(Exception):
+    pass
+
+
 def call_claude(prompt: str, cwd: str, model: str, max_turns: int) -> dict:
     proc = subprocess.run(
         ["claude", "-p", "--model", model, "--output-format", "json",
@@ -26,18 +30,15 @@ def call_claude(prompt: str, cwd: str, model: str, max_turns: int) -> dict:
         input=prompt, capture_output=True, text=True, cwd=cwd,
     )
     if proc.returncode != 0:
-        print(f"claude error (exit {proc.returncode}): {proc.stderr}", file=sys.stderr)
-        sys.exit(1)
+        raise ClaudeError(f"claude exit {proc.returncode}: {proc.stderr[:500]}")
     try:
         events = json.loads(proc.stdout)
     except json.JSONDecodeError:
-        print(f"could not parse claude output: {proc.stdout[:500]}", file=sys.stderr)
-        sys.exit(1)
+        raise ClaudeError(f"could not parse claude output: {proc.stdout[:500]}")
     for event in events:
         if event.get("type") == "result":
             return event
-    print("no result event in claude output", file=sys.stderr)
-    sys.exit(1)
+    raise ClaudeError("no result event in claude output")
 
 
 def parse_frontmatter(text: str) -> tuple[dict, str]:
@@ -81,6 +82,9 @@ def parse_tasks(plan_text: str) -> list[str]:
 
 
 def main():
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("repo_path", help="Path to the git repo")
     parser.add_argument("git_ref", help="Git ref to start from")
@@ -122,7 +126,11 @@ def main():
         out_file = out_dir / f"{name}.md"
 
         print(f"--- {name} ---")
-        resp = call_claude(prompt, wt, model, max_turns)
+        try:
+            resp = call_claude(prompt, wt, model, max_turns)
+        except ClaudeError as e:
+            print(f"  FAILED: {e}")
+            return None
         result = resp.get("result", "")
         cost = resp.get("total_cost_usd", resp.get("cost_usd", 0.0))
         costs[name] = cost
@@ -138,77 +146,91 @@ def main():
             sys.exit(1)
         return result
 
-    # --- triage ---
-    triage = run_phase("1-triage", "triage")
-    if "SKIP" in triage or "ESCALATE" in triage:
-        triage_file = out_dir / "1-triage.md"
-        print(f"triage halted. notes: {triage_file}")
-        sys.exit(0)
+    def print_summary():
+        review_file = out_dir / "4-review.md"
+        review_tail = review_file.read_text()[-300:] if review_file.exists() else ""
+        verdict = next((v for v in ("FAIL", "WARN", "PASS") if v in review_tail), "UNKNOWN")
 
-    # --- plan ---
-    plan_out = run_phase("2-plan", "plan")
-    plan_file = out_dir / "2-plan.md"
-    plan_text = plan_file.read_text() if plan_file.exists() else plan_out
+        print(f"\n=== summary ===")
+        for phase, cost in costs.items():
+            print(f"  {phase}: ${cost:.4f}")
+        print(f"  total: ${spent:.4f}")
+        print(f"  branch: {branch}")
+        print(f"  verdict: {verdict}")
+        print(f"  outputs: {out_dir}")
 
-    # --- execute: dispatch one sub-agent per task ---
-    tasks = parse_tasks(plan_text)
-    if not tasks:
-        tasks = [plan_text]
-    print(f"  execute: {len(tasks)} tasks from plan")
+    try:
+        # --- triage ---
+        triage = run_phase("1-triage", "triage")
+        if triage is None:
+            print("triage failed — nothing to execute, aborting.")
+            sys.exit(1)
+        if "SKIP" in triage or "ESCALATE" in triage:
+            triage_file = out_dir / "1-triage.md"
+            print(f"triage halted. notes: {triage_file}")
+            return
 
-    exec_meta, exec_prompt_template = load_prompt("execute",
-        repo_context=f"Repo: {repo}\nRef: {args.git_ref}\nBranch: {branch}",
-        issue_body=issue_body,
-        issue_number=str(args.issue or "N/A"),
-        recent_learnings="(none)",
-        prior_phases=(out_dir / "1-triage.md").read_text() + "\n\n" + plan_text,
-    )
-    exec_model = exec_meta.get("model", args.model)
-    exec_max_turns = int(exec_meta.get("max_turns", 30))
+        # --- plan ---
+        plan_out = run_phase("2-plan", "plan")
+        if plan_out is None:
+            print("plan failed — nothing to execute, aborting.")
+            sys.exit(1)
+        plan_file = out_dir / "2-plan.md"
+        plan_text = plan_file.read_text() if plan_file.exists() else plan_out
 
-    for i, task in enumerate(tasks, 1):
-        task_prompt = f"{exec_prompt_template}\n\n---\n\n## Your task (task {i} of {len(tasks)})\n\n{task}\n\nFocus ONLY on this task. Make commits when done."
-        print(f"  task {i}/{len(tasks)}: {task[:80]}...")
-        resp = call_claude(task_prompt, wt, exec_model, exec_max_turns)
-        cost = resp.get("total_cost_usd", resp.get("cost_usd", 0.0))
-        costs[f"execute-{i}"] = cost
-        spent += cost
-        result = resp.get("result", "")
-        task_file = out_dir / f"3-execute-task-{i}.md"
-        if not task_file.exists():
-            out_dir.mkdir(parents=True, exist_ok=True)
-            task_file.write_text(result)
-        print(f"  task {i} done: ${cost:.4f}  (total: ${spent:.4f})")
-        if spent > args.budget:
-            print(f"budget exceeded at task {i}", file=sys.stderr)
-            break
+        # --- execute: dispatch one sub-agent per task ---
+        tasks = parse_tasks(plan_text)
+        if not tasks:
+            tasks = [plan_text]
+        print(f"  execute: {len(tasks)} tasks from plan")
 
-    # --- review ---
-    diff = subprocess.run(["git", "diff", f"{args.git_ref}...HEAD"],
-                         cwd=wt, capture_output=True, text=True).stdout
-    run_phase("4-review", "review", combined_diff=diff[:50_000])
+        exec_meta, exec_prompt_template = load_prompt("execute",
+            repo_context=f"Repo: {repo}\nRef: {args.git_ref}\nBranch: {branch}",
+            issue_body=issue_body,
+            issue_number=str(args.issue or "N/A"),
+            recent_learnings="(none)",
+            prior_phases=(out_dir / "1-triage.md").read_text() + "\n\n" + plan_text,
+        )
+        exec_model = exec_meta.get("model", args.model)
+        exec_max_turns = int(exec_meta.get("max_turns", 30))
 
-    # --- improve ---
-    run_phase("5-improve", "improve")
+        for i, task in enumerate(tasks, 1):
+            task_prompt = f"{exec_prompt_template}\n\n---\n\n## Your task (task {i} of {len(tasks)})\n\n{task}\n\nFocus ONLY on this task. Make commits when done."
+            print(f"  task {i}/{len(tasks)}: {task[:80]}...")
+            try:
+                resp = call_claude(task_prompt, wt, exec_model, exec_max_turns)
+            except ClaudeError as e:
+                print(f"  task {i} FAILED: {e}")
+                costs[f"execute-{i}"] = 0
+                continue
+            cost = resp.get("total_cost_usd", resp.get("cost_usd", 0.0))
+            costs[f"execute-{i}"] = cost
+            spent += cost
+            result = resp.get("result", "")
+            task_file = out_dir / f"3-execute-task-{i}.md"
+            if not task_file.exists():
+                out_dir.mkdir(parents=True, exist_ok=True)
+                task_file.write_text(result)
+            print(f"  task {i} done: ${cost:.4f}  (total: ${spent:.4f})")
+            if spent > args.budget:
+                print(f"budget exceeded at task {i}", file=sys.stderr)
+                break
 
-    # --- push ---
-    push = subprocess.run(["git", "push", "origin", branch],
-                         cwd=wt, capture_output=True, text=True)
-    if push.returncode != 0:
-        print(f"push failed: {push.stderr}", file=sys.stderr)
+        # --- review ---
+        diff = subprocess.run(["git", "diff", f"{args.git_ref}...HEAD"],
+                             cwd=wt, capture_output=True, text=True).stdout
+        run_phase("4-review", "review", combined_diff=diff[:50_000])
 
-    # --- summary ---
-    review_file = out_dir / "4-review.md"
-    review_tail = review_file.read_text()[-300:] if review_file.exists() else ""
-    verdict = next((v for v in ("FAIL", "WARN", "PASS") if v in review_tail), "UNKNOWN")
+        # --- improve ---
+        run_phase("5-improve", "improve")
 
-    print(f"\n=== summary ===")
-    for phase, cost in costs.items():
-        print(f"  {phase}: ${cost:.4f}")
-    print(f"  total: ${spent:.4f}")
-    print(f"  branch: {branch}")
-    print(f"  verdict: {verdict}")
-    print(f"  outputs: {out_dir}")
+        # --- push ---
+        push = subprocess.run(["git", "push", "origin", branch],
+                             cwd=wt, capture_output=True, text=True)
+        if push.returncode != 0:
+            print(f"push failed: {push.stderr}", file=sys.stderr)
+    finally:
+        print_summary()
 
 
 if __name__ == "__main__":
